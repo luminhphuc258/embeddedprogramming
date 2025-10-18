@@ -73,7 +73,7 @@ app.post("/api/audio", async (req, res) => {
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: "alloy",
-      format: "wav", // ✅ Output as standard WAV
+      format: "mp3",
       input: text
     });
 
@@ -86,8 +86,7 @@ app.post("/api/audio", async (req, res) => {
       success: true,
       text,
       audio_url: fileURL,
-      format: "wav",
-      sample_rate: 24000
+      format: "mp3"
     });
 
     // 5️⃣ Clean up temp file
