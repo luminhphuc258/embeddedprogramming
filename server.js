@@ -1,6 +1,7 @@
 // server.js
-// Node 18+
+// Node 18+  (package.json: { "type": "module" })
 // npm i express multer openai cors
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -16,7 +17,14 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 app.use(cors());
-app.use(express.json());
+// Log mọi request để debug 404/prefix
+app.use((req, _res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
+// Chỉ bật JSON parser cho route không dùng multipart
+app.use(express.json({ limit: "10mb" }));
 
 // Serve file mp3 công khai
 const publicDir = path.join(__dirname, "public");
@@ -25,54 +33,59 @@ fs.mkdirSync(audioDir, { recursive: true });
 app.use("/audio", express.static(audioDir));
 
 // Multer nhận file từ ESP32 (multipart/form-data, field name: "audio")
+const uploadsDir = path.join(__dirname, "uploads");
+fs.mkdirSync(uploadsDir, { recursive: true });
 const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, path.join(__dirname, "uploads")),
-  filename: (_, file, cb) => cb(null, Date.now() + "_" + (file.originalname || "audio.bin")),
+  destination: (_, __, cb) => cb(null, uploadsDir),
+  filename: (_, file, cb) =>
+    cb(null, Date.now() + "_" + (file.originalname || "audio.bin")),
 });
-fs.mkdirSync(path.join(__dirname, "uploads"), { recursive: true });
 const upload = multer({ storage });
 
+// OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// === API chính: ESP32 POST file -> trả về mp3 url ===
-app.post("/ask", upload.single("audio"), async (req, res) => {
+// Một handler dùng chung cho /ask và /api/ask
+async function handleAsk(req, res) {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No file" });
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "No file (field name must be 'audio')" });
+    }
+    console.log(`[ASK] file=${req.file.originalname} size=${req.file.size} type=${req.file.mimetype}`);
 
-    const filePath = req.file.path; // đường dẫn file ESP32 upload (wav/pcm)
+    const filePath = req.file.path; // wav/pcm từ ESP32
 
-    // 1) STT (Speech-to-Text)
-    // Bạn có thể dùng 'gpt-4o-transcribe' (nếu enable) hoặc 'whisper-1'
+    // 1) STT
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
-      model: "gpt-4o-transcribe",  // nếu tài khoản bạn chưa có, tạm dùng "whisper-1"
-      // language: "vi"  // có thể chỉ định
+      // Nếu tài khoản bạn chưa có gpt-4o-transcribe thì dùng "whisper-1"
+      model: process.env.STT_MODEL || "whisper-1",
+      // language: "vi",
     });
-
     const userText = stt.text?.trim() || "";
     console.log("[STT] =>", userText);
 
-    // 2) LLM: sinh câu trả lời (ngắn, thân thiện)
+    // 2) LLM
     const prompt = `Người dùng hỏi (tiếng Việt): "${userText}"
 Trả lời ngắn gọn (1-2 câu), thân thiện.`;
 
     const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: process.env.CHAT_MODEL || "gpt-4o-mini",
       messages: [
         { role: "system", content: "Bạn là trợ lý hữu ích, trả lời tiếng Việt tự nhiên." },
-        { role: "user", content: prompt }
+        { role: "user", content: prompt },
       ],
       temperature: 0.6,
     });
     const answer = chat.choices?.[0]?.message?.content?.trim() || "Xin chào!";
 
-    // 3) TTS: tạo MP3
+    // 3) TTS (MP3)
     const mp3Name = `resp_${Date.now()}.mp3`;
     const mp3Path = path.join(audioDir, mp3Name);
 
     const speech = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: "alloy",
+      model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
+      voice: process.env.TTS_VOICE || "alloy",
       format: "mp3",
       input: answer,
     });
@@ -80,19 +93,32 @@ Trả lời ngắn gọn (1-2 câu), thân thiện.`;
     const buf = Buffer.from(await speech.arrayBuffer());
     fs.writeFileSync(mp3Path, buf);
 
-    // 4) Trả về link HTTPS đến MP3 (Railway sẽ là https://<app>.up.railway.app)
+    // 4) Trả về link HTTPS đến MP3
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
     const url = `${host}/audio/${mp3Name}`;
 
-    // (Tùy chọn) dọn file upload gốc
+    // Dọn file upload gốc
     try { fs.unlinkSync(filePath); } catch { }
 
     res.json({ success: true, text: answer, audio_url: url, format: "mp3" });
   } catch (err) {
-    console.error(err);
+    console.error("[ASK] error:", err);
     res.status(500).json({ success: false, error: String(err?.message || err) });
   }
+}
+
+// Chấp nhận cả /ask và /api/ask (để phòng proxy thêm prefix)
+app.post("/ask", upload.single("audio"), handleAsk);
+app.post("/api/ask", upload.single("audio"), handleAsk);
+
+// GET vào /ask → báo rõ method
+app.get("/ask", (_req, res) => res.status(405).type("text/plain").send("Use POST /ask (multipart: audio=<file>)"));
+
+app.get("/", (_req, res) => res.type("text/plain").send("OK. POST /ask (multipart: audio=<file>)"));
+
+app.use((req, res) => {
+  // 404 rõ ràng
+  res.status(404).json({ success: false, error: `Not found: ${req.method} ${req.path}` });
 });
 
-app.get("/", (_, res) => res.type("text/plain").send("OK. POST /ask (multipart: audio=<file>)"));
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
