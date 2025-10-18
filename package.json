@@ -1,27 +1,27 @@
 {
   "name": "embeddedprogramming",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "ESP32 Audio AI Server for OpenAI transcription + TTS",
+  "main": "server.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/luminhphuc258/embeddedprogramming.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["esp32", "audio", "openai", "express", "tts", "whisper"],
+  "author": "Your Name",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/luminhphuc258/embeddedprogramming/issues"
   },
   "homepage": "https://github.com/luminhphuc258/embeddedprogramming#readme",
-  "description": "",
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "multer": "^2.0.2",
-    "openai": "^6.5.0"
+    "dotenv": "^16.3.1",
+    "express": "^4.19.2",
+    "openai": "^4.57.0"
   }
 }
