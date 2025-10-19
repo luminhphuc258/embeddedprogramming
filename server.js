@@ -148,7 +148,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     try {
       const stt = await openai.audio.transcriptions.create({
         file: fs.createReadStream(wavPath),
-        model: "gpt-4o-transcribe",
+        model: "gpt-4o-mini-transcribe",
         language: langHint,
         prompt: biasPrompt
       });
