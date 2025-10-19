@@ -1,46 +1,29 @@
-// server.js
-// Node 18+ / 20+
-// npm i express multer openai cors node-fetch
-
 import express from "express";
-import cors from "cors";
 import multer from "multer";
+import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import fetch from "node-fetch";
-import { fileURLToPath } from "url";
+import cors from "cors";
 import OpenAI from "openai";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
+dotenv.config();
 const app = express();
-const port = process.env.PORT || 8080;
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.static("public"));
 
-// ==== Folders ====
-const publicDir = path.join(__dirname, "public");
-const audioDir = path.join(publicDir, "audio");
-fs.mkdirSync(audioDir, { recursive: true });
-app.use("/audio", express.static(audioDir));
-
-const uploadsDir = path.join(__dirname, "uploads");
-fs.mkdirSync(uploadsDir, { recursive: true });
-
-// ==== Multer upload ====
+// ===== Multer setup for audio upload =====
 const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadsDir),
-  filename: (_, file, cb) =>
-    cb(null, Date.now() + "_" + (file.originalname || "audio.wav")),
+  destination: "uploads/",
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + "-" + file.originalname);
+  },
 });
 const upload = multer({ storage });
 
-// ==== OpenAI ====
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// === Utility: detect language ===
+// ===== Utility: Detect language =====
 function detectLanguage(text) {
   const hasVietnamese =
     /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
@@ -50,147 +33,65 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// === Helper: create speech file ===
-async function createSpeechFile({ text, lang }) {
-  const speechResp = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: lang === "vi" ? "alloy" : "verse",
-    input: text,
-    format: "mp3",
-  });
-  const buffer = Buffer.from(await speechResp.arrayBuffer());
-  const filePath = path.join(audioDir, `tts_${Date.now()}.mp3`);
-  fs.writeFileSync(filePath, buffer);
-  return filePath;
-}
-
-// === Main handler ===
-async function handleAsk(req, res) {
+// ===== API route =====
+app.post("/api/audio", upload.single("audio"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res
-        .status(400)
-        .json({ success: false, error: "No audio file uploaded" });
-    }
+    const audioFilePath = req.file.path;
 
-    const filePath = req.file.path;
-    console.log(`[ASK] file=${req.file.originalname} size=${req.file.size}`);
-
-    // 1️⃣ Speech-to-text
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
-      model: "whisper-1",
+    // 1 Transcribe audio to text
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioFilePath),
+      model: "gpt-4o-mini-transcribe",
     });
-    const userText = stt.text?.trim() || "";
-    console.log("[STT] =>", userText);
 
-    // 2️⃣ Detect language
-    const lang = detectLanguage(userText);
+    const text = transcription.text?.trim() || "";
+    console.log("Transcribed Text:", text);
+
+    // 2 Detect language
+    const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-    // 3️⃣ Handle music request 🎵
-    const lower = userText.toLowerCase();
-    if (
-      lower.includes("phát nhạc") ||
-      lower.includes("mở nhạc") ||
-      lower.includes("bật nhạc") ||
-      lower.includes("play music") ||
-      lower.includes("play song")
-    ) {
-      const songQuery = userText
-        .replace(/(phát nhạc|mở nhạc|bật nhạc|play music|play song)/gi, "")
-        .trim();
-      const q = songQuery || "relaxing background music";
-      console.log("[MUSIC] Request:", q);
-
-      const notice =
-        finalLang === "vi" ? `Đang phát bài ${q}.` : `Playing the song ${q}.`;
-      const noticePath = await createSpeechFile({ text: notice, lang: finalLang });
-
-      // Tìm bài hát thật (iTunes API)
-      let musicUrl = null;
-      try {
-        const resp = await fetch(
-          `https://itunes.apple.com/search?term=${encodeURIComponent(
-            q
-          )}&media=music&limit=1`
-        );
-        const data = await resp.json();
-        if (data.results && data.results.length > 0) {
-          musicUrl = data.results[0].previewUrl;
-        }
-      } catch (err) {
-        console.error("iTunes fetch error:", err);
-      }
-
-      const host = process.env.PUBLIC_BASE_URL || `http://${req.headers.host}`;
-      if (!musicUrl) musicUrl = `${host}/audio/${path.basename(noticePath)}`;
-
-      console.log("[RESPONSE SENT] => music");
-      return res.json({
-        success: true,
-        text: notice,
-        audio_url: `${host}/audio/${path.basename(noticePath)}`,
-        music_url: musicUrl,
-        type: "music",
-      });
-    }
-
-    // 4️⃣ Chat reply
-    const systemPrompt =
+    // 3Prepare response text
+    const replyText =
       finalLang === "vi"
-        ? "Bạn là một cô gái trẻ, thân thiện, nói tiếng Việt tự nhiên."
-        : "You are a friendly young woman assistant speaking natural English.";
+        ? `Bạn vừa nói: "${text}".`
+        : `You said: "${text}".`;
 
-    const prompt =
-      finalLang === "vi"
-        ? `Người dùng nói: "${userText}". Trả lời ngắn gọn (1–2 câu) bằng tiếng Việt, thân thiện.`
-        : `User said: "${userText}". Reply briefly (1–2 sentences) in friendly conversational English.`;
-
-    const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.7,
+    // 4Generate TTS in proper language
+    const ttsResponse = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice: finalLang === "vi" ? "alloy" : "verse",
+      input: replyText,
     });
 
-    const answer =
-      chat.choices?.[0]?.message?.content?.trim() ||
-      (finalLang === "vi" ? "Xin chào!" : "Hello!");
+    // 5Save generated audio
+    const outputDir = path.resolve("public/audio");
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-    // 5️⃣ Text-to-speech
-    const mp3Path = await createSpeechFile({ text: answer, lang: finalLang });
+    const filename = `response_${Date.now()}.mp3`;
+    const outputPath = path.join(outputDir, filename);
+    const buffer = Buffer.from(await ttsResponse.arrayBuffer());
+    fs.writeFileSync(outputPath, buffer);
 
-    const host = process.env.PUBLIC_BASE_URL || `http://${req.headers.host}`;
-    const url = `${host}/audio/${path.basename(mp3Path)}`;
+    const fileUrl = `http://${req.hostname}:${PORT}/audio/${filename}`;
 
-    try {
-      fs.unlinkSync(filePath);
-    } catch { }
-
-    console.log("[RESPONSE SENT] => chat reply");
-    return res.json({
+    // 6 Send response
+    res.json({
       success: true,
-      text: answer,
-      audio_url: url,
+      text: replyText,
+      audio_url: fileUrl,
       lang: finalLang,
-      format: "mp3",
     });
-  } catch (err) {
-    console.error("[ASK ERROR]", err);
-    res.status(500).json({ success: false, error: err.message });
+
+    // optional: delete uploaded input after done
+    fs.unlink(audioFilePath, () => { });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
-}
+});
 
-// === Routes ===
-app.post("/ask", upload.single("audio"), handleAsk);
-app.post("/api/ask", upload.single("audio"), handleAsk);
-
-app.get("/", (_, res) =>
-  res.send("✅ OK. Use POST /ask (multipart: audio=<file>)")
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on http://localhost:${PORT}`)
 );
-
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
