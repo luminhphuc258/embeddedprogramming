@@ -1,5 +1,5 @@
 // =======================
-// ESP32 Chatbot + Music Server (Piped.video + OpenAI TTS)
+// ESP32 Chatbot + Music Server (iTunes Music + OpenAI TTS)
 // =======================
 // Node 18+
 // npm i express cors multer openai node-fetch dotenv
@@ -41,89 +41,128 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-
-// ==== Helper: fetch playable audio from piped.video ====
-async function getMusicFromPiped(query) {
-  console.log(`🎶 Searching music for: ${query}`);
-  try {
-    // 1️⃣ Search video
-    const searchRes = await fetch(`https://pipedapi.kavin.rocks/api/v1/search?q=${encodeURIComponent(query)}`);
-    if (!searchRes.ok) throw new Error(`Search failed (${searchRes.status})`);
-    const list = await searchRes.json();
-
-    if (!list || !Array.isArray(list) || list.length === 0) {
-      throw new Error("Không tìm thấy kết quả nào trên piped.video");
-    }
-
-    const video = list.find(v => v.duration < 600) || list[0];
-    console.log(`🎵 Found: ${video.title} | Duration: ${video.duration}s`);
-
-    // 2️⃣ Get stream info
-    const videoId = video.url.split("watch?v=")[1];
-    const streamRes = await fetch(`https://pipedapi.kavin.rocks/api/v1/streams/${videoId}`);
-    if (!streamRes.ok) throw new Error(`Stream fetch failed (${streamRes.status})`);
-    const streamData = await streamRes.json();
-
-    const audio = streamData.audioStreams?.find(a => a.format === "m4a" || a.format === "mp4");
-    if (!audio) throw new Error("Không có audio stream trong kết quả.");
-
-    console.log(`🎧 Audio stream ready: ${audio.quality} | ${audio.mimeType}`);
-    return audio.url;
-  } catch (err) {
-    console.error("❌ [PIPED] Lỗi khi tìm nhạc:", err.message);
-    throw new Error("Không tìm thấy hoặc lấy được nhạc.");
-  }
+// ==== Helper: detect language ====
+function detectLanguage(text) {
+  const hasVN = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
+  const hasEN = /[a-zA-Z]/.test(text);
+  if (hasVN && !hasEN) return "vi";
+  if (hasEN && !hasVN) return "en";
+  return "mixed";
 }
 
+// ==== Helper: fetch song from iTunes Music ====
+async function getMusicFromItunes(query) {
+  console.log(`🎶 Searching iTunes Music for: ${query}`);
+  try {
+    const resp = await fetch(
+      `https://itunes.apple.com/search?term=${encodeURIComponent(
+        query
+      )}&media=music&limit=1`
+    );
+    if (!resp.ok) throw new Error(`Search failed (${resp.status})`);
+    const data = await resp.json();
+    if (!data.results || data.results.length === 0)
+      throw new Error("Không tìm thấy bài hát trên iTunes.");
+
+    const song = data.results[0];
+    console.log(`🎧 Found: ${song.trackName} - ${song.artistName}`);
+    return {
+      title: song.trackName,
+      artist: song.artistName,
+      previewUrl: song.previewUrl,
+    };
+  } catch (err) {
+    console.error("❌ [iTunes] Error:", err.message);
+    throw err;
+  }
+}
 
 // ==== MAIN ROUTE ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No audio file uploaded" });
-    console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
+    if (!req.file)
+      return res
+        .status(400)
+        .json({ success: false, error: "No audio file uploaded" });
+    console.log(
+      `[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`
+    );
 
     // === 1️⃣ Speech-to-text ===
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
-      model: "gpt-4o-mini-transcribe",
+      model: "whisper-1",
     });
     const text = stt.text.trim();
     console.log(`🧠 Transcribed: ${text}`);
 
     // === 2️⃣ Detect language ===
-    const lang = /[^\x00-\x7F]/.test(text) ? "vi" : "en";
-    console.log(`[LANG DETECTED] ${lang} -> using ${lang}`);
+    const lang = detectLanguage(text);
+    const finalLang = lang === "mixed" ? "vi" : lang;
+    console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
     // === 3️⃣ Check for music command ===
     const lower = text.toLowerCase();
-    if (lower.includes("play") || lower.includes("nhạc") || lower.includes("music") || lower.includes("phát nhạc") || lower.includes("nghe")) {
-      const songQuery = text.replace(/play|phát nhạc|bật bài/gi, "").trim();
+    if (
+      lower.includes("play") ||
+      lower.includes("music") ||
+      lower.includes("nhạc") ||
+      lower.includes("bật bài") ||
+      lower.includes("phát nhạc") ||
+      lower.includes("nghe")
+    ) {
+      const songQuery = text.replace(/(play|music|nhạc|bật bài|phát nhạc|nghe)/gi, "").trim();
       console.log(`🎵 Song requested: ${songQuery}`);
 
       try {
-        const songUrl = await getMusicFromPiped(songQuery);
-        console.log(`🎶 Searching music for: ${query}`);
+        const song = await getMusicFromItunes(songQuery || "relaxing music");
+
+        // === Notice speech ===
+        const notice =
+          finalLang === "vi"
+            ? `Đang phát bài ${song.title} của ${song.artist}.`
+            : `Playing ${song.title} by ${song.artist}.`;
+
+        const tts = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: finalLang === "vi" ? "alloy" : "verse",
+          format: "mp3",
+          input: notice,
+        });
+
+        const noticeFile = `tts_${Date.now()}.mp3`;
+        const noticePath = path.join(audioDir, noticeFile);
+        fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
+
+        const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+
         res.json({
           success: true,
           type: "music",
-          text: `Đang phát bài hát: ${songQuery}`,
-          audio_url: songUrl,
+          text: notice,
+          audio_url: `${host}/audio/${noticeFile}`,
+          music_url: song.previewUrl,
         });
       } catch (err) {
         res.json({
           success: false,
-          text: `Không thể phát bài hát này: ${err.message}`,
+          text:
+            finalLang === "vi"
+              ? `Không thể phát nhạc: ${err.message}`
+              : `Could not play music: ${err.message}`,
         });
       }
     } else {
-      // === 4️⃣ Chat with GPT ===
+      // === 4️⃣ Normal Chat ===
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
-            role: "system", content: lang === "vi"
-              ? "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên."
-              : "You are a friendly young woman speaking natural English, short and casual."
+            role: "system",
+            content:
+              finalLang === "vi"
+                ? "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên."
+                : "You are a friendly young woman speaking natural English, short and casual.",
           },
           { role: "user", content: text },
         ],
@@ -133,19 +172,16 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const answer = chat.choices[0].message.content.trim();
       console.log(`💬 Answer: ${answer}`);
 
-      // === 5️⃣ Text-to-speech ===
-      const filename = `tts_${Date.now()}.mp3`;
-      const outputPath = path.join(audioDir, filename);
-
-      const speech = await openai.audio.speech.create({
+      const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
-        voice: "verse",
+        voice: finalLang === "vi" ? "alloy" : "verse",
         format: "mp3",
         input: answer,
       });
 
-      const buffer = Buffer.from(await speech.arrayBuffer());
-      fs.writeFileSync(outputPath, buffer);
+      const filename = `tts_${Date.now()}.mp3`;
+      const outputPath = path.join(audioDir, filename);
+      fs.writeFileSync(outputPath, Buffer.from(await tts.arrayBuffer()));
 
       const fileUrl = `https://${req.headers.host}/audio/${filename}`;
       res.json({ success: true, type: "chat", text: answer, audio_url: fileUrl });
@@ -159,7 +195,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 });
 
 // ==== Health check ====
-app.get("/", (_req, res) => res.send("✅ ESP32 Chatbot Music Server is running!"));
+app.get("/", (_req, res) =>
+  res.send("✅ ESP32 Chatbot Music Server (iTunes API) is running!")
+);
 
 // ==== Start server ====
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
