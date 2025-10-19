@@ -28,7 +28,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ==== Middleware ====
 app.enable("trust proxy");
-app.use((req, res, next) => {
+app.use((_, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
@@ -58,7 +58,7 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Helper: normalize audio → WAV mono 16 kHz (with silence trim + loudness) ====
+// ==== Helper: normalize audio → WAV mono 16 kHz (silence trim + loudness) ====
 async function normalizeToWavMono16k(inputPath) {
   const outWav = inputPath.replace(path.extname(inputPath), "_norm.wav");
   await new Promise((resolve, reject) => {
@@ -68,7 +68,7 @@ async function normalizeToWavMono16k(inputPath) {
         "areverse",
         "silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB",
         "areverse",
-        "loudnorm=I=-19:TP=-2:LRA=7"
+        "loudnorm=I=-19:TP=-2:LRA=7",
       ])
       .audioChannels(1)
       .audioFrequency(16000)
@@ -78,6 +78,19 @@ async function normalizeToWavMono16k(inputPath) {
       .save(outWav);
   });
   return outWav;
+}
+
+// ==== Helper: đọc thời lượng WAV (PCM) từ header ====
+function getWavDurationSeconds(wavPath) {
+  const fd = fs.openSync(wavPath, "r");
+  const header = Buffer.alloc(44);
+  fs.readSync(fd, header, 0, 44, 0);
+  fs.closeSync(fd);
+
+  const byteRate = header.readUInt32LE(28);
+  const dataSize = header.readUInt32LE(40);
+  if (!byteRate || !dataSize) return 0;
+  return dataSize / byteRate;
 }
 
 // ==== Helper: download + convert from iTunes ====
@@ -114,7 +127,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
         .save(localMP3);
     });
 
-    fs.unlinkSync(localM4A); // delete original m4a
+    fs.unlinkSync(localM4A);
     console.log(`🎵 Converted to MP3: ${path.basename(localMP3)}`);
 
     return {
@@ -130,6 +143,10 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 
 // ==== MAIN ROUTE ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
+  const SHORT_MSG = "Xin mời bạn nhắc lại câu hỏi.";
+  const MIN_SECONDS = 2.0; // yêu cầu: < 2s thì bỏ qua
+
+  let wavPath = null;
   try {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
@@ -137,9 +154,20 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
     // === 0️⃣ Normalize input audio to WAV mono 16k ===
-    const wavPath = await normalizeToWavMono16k(req.file.path);
+    wavPath = await normalizeToWavMono16k(req.file.path);
 
-    // === 1️⃣ Speech-to-text (primary: gpt-4o-transcribe → fallback: whisper-1) ===
+    // === 0.5️⃣ Check duration BEFORE STT ===
+    const durSec = getWavDurationSeconds(wavPath);
+    console.log(`[AUDIO] duration = ${durSec.toFixed(3)}s`);
+    if (!isFinite(durSec) || durSec < MIN_SECONDS) {
+      try { fs.unlinkSync(req.file.path); } catch { }
+      try { fs.unlinkSync(wavPath); } catch { }
+      return res.json({ success: false, text: SHORT_MSG });
+    }
+
+    // === 1️⃣ Speech-to-text
+    // Model chính theo yêu cầu: gpt-4o-mini-transcribe
+    // Fallback: whisper-1 (phòng trường hợp lỗi mạng/định dạng hiếm gặp)
     const langHint = "vi"; // ưu tiên tiếng Việt
     const biasPrompt =
       "Ngữ cảnh: trợ lý ảo nói giọng miền Nam, từ vựng: robot, ESP32, I2S, MAX98357A, OLED, cảm biến, iTunes, Bluetooth, phát nhạc, bài hát.";
@@ -150,18 +178,25 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         file: fs.createReadStream(wavPath),
         model: "gpt-4o-mini-transcribe",
         language: langHint,
-        prompt: biasPrompt
+        prompt: biasPrompt,
       });
       text = (stt.text || "").trim();
     } catch (e) {
-      console.warn("[STT] gpt-4o-transcribe failed, fallback whisper-1:", e.message);
-      const stt2 = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavPath),
-        model: "whisper-1",
-        language: langHint,
-        prompt: biasPrompt
-      });
-      text = (stt2.text || "").trim();
+      console.warn("[STT] mini-transcribe failed, fallback whisper-1:", e.message);
+      try {
+        const stt2 = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavPath),
+          model: "whisper-1",
+          language: langHint,
+          prompt: biasPrompt,
+        });
+        text = (stt2.text || "").trim();
+      } catch (e2) {
+        console.warn("[STT] whisper-1 failed:", e2.message);
+        try { fs.unlinkSync(req.file.path); } catch { }
+        try { fs.unlinkSync(wavPath); } catch { }
+        return res.json({ success: false, text: SHORT_MSG });
+      }
     }
     console.log(`🧠 Transcribed: ${text}`);
 
@@ -233,10 +268,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content: finalLang === "vi" ? systemViSouth : systemEn,
-          },
+          { role: "system", content: finalLang === "vi" ? systemViSouth : systemEn },
           { role: "user", content: text },
         ],
         temperature: 0.8,
@@ -270,6 +302,11 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     try { fs.unlinkSync(wavPath); } catch { }
   } catch (err) {
     console.error("❌ Server Error:", err);
+    if (err?.code === "audio_too_short") {
+      try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch { }
+      try { if (wavPath) fs.unlinkSync(wavPath); } catch { }
+      return res.json({ success: false, text: "Xin mời bạn nhắc lại câu hỏi." });
+    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
