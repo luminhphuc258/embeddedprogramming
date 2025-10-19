@@ -1,5 +1,5 @@
 // server.js
-// Node 18+  (package.json: { "type": "module" })
+// Node 18+
 // npm i express multer openai cors
 
 import express from "express";
@@ -17,108 +17,154 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 app.use(cors());
-// Log mọi request để debug 404/prefix
-app.use((req, _res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path}`);
-  next();
-});
-
-// Chỉ bật JSON parser cho route không dùng multipart
 app.use(express.json({ limit: "10mb" }));
 
-// Serve file mp3 công khai
+// ==== Folders ====
 const publicDir = path.join(__dirname, "public");
 const audioDir = path.join(publicDir, "audio");
 fs.mkdirSync(audioDir, { recursive: true });
 app.use("/audio", express.static(audioDir));
 
-// Multer nhận file từ ESP32 (multipart/form-data, field name: "audio")
 const uploadsDir = path.join(__dirname, "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
+
+// ==== Multer upload ====
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadsDir),
-  filename: (_, file, cb) =>
-    cb(null, Date.now() + "_" + (file.originalname || "audio.bin")),
+  filename: (_, file, cb) => cb(null, Date.now() + "_" + (file.originalname || "audio.wav")),
 });
 const upload = multer({ storage });
 
-// OpenAI
+// ==== OpenAI ====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Một handler dùng chung cho /ask và /api/ask
-// --- English + young female voice version ---
+// === Utility ===
+function detectLanguage(text) {
+  const hasVietnamese = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
+  const hasEnglish = /[a-zA-Z]/.test(text);
+  if (hasVietnamese && !hasEnglish) return "vi";
+  if (hasEnglish && !hasVietnamese) return "en";
+  return "mixed";
+}
+
+// === Main handler ===
 async function handleAsk(req, res) {
   try {
     if (!req.file) {
-      return res.status(400).json({ success: false, error: "No file (field name must be 'audio')" });
+      return res.status(400).json({ success: false, error: "No audio file uploaded" });
     }
-    console.log(`[ASK] file=${req.file.originalname} size=${req.file.size} type=${req.file.mimetype}`);
-
     const filePath = req.file.path;
+    console.log(`[ASK] file=${req.file.originalname} size=${req.file.size}`);
 
-    // 1️⃣ Speech-to-text (convert voice to English text)
+    // 1️⃣ Speech-to-text
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
-      model: process.env.STT_MODEL || "whisper-1",
-      language: "en", // Force English output
+      model: "whisper-1",
     });
     const userText = stt.text?.trim() || "";
     console.log("[STT] =>", userText);
 
-    // 2️⃣ ChatGPT: English short friendly reply
-    const prompt = `User said: "${userText}". 
-Answer briefly in friendly, conversational English (1–2 sentences).`;
+    // 2️⃣ Detect language
+    const lang = detectLanguage(userText);
+    console.log(`[LANG DETECTED] ${lang}`);
+
+    // 3️⃣ Handle music requests 🎵
+    const lower = userText.toLowerCase();
+    if (
+      lower.includes("phát nhạc") ||
+      lower.includes("mở nhạc") ||
+      lower.includes("play music") ||
+      lower.includes("play song")
+    ) {
+      const songQuery = userText.replace(/(phát nhạc|mở nhạc|play music|play song)/gi, "").trim();
+      const q = songQuery || "relaxing background music";
+
+      console.log("[MUSIC] Request:", q);
+
+      // dùng TTS ngắn gọn thông báo đang phát
+      const notice = lang === "vi" ? `Đang phát bài ${q}.` : `Playing the song ${q}.`;
+
+      const ttsNotice = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: lang === "vi" ? "alloy" : "verse",
+        input: notice,
+      });
+      const noticePath = path.join(audioDir, `notice_${Date.now()}.mp3`);
+      fs.writeFileSync(noticePath, Buffer.from(await ttsNotice.arrayBuffer()));
+
+      // Ở đây bạn có thể thay bằng API YouTube → mp3 hoặc phát nhạc tĩnh có sẵn
+      // Tạm thời phát file nhạc tĩnh (demo)
+      const musicFile = path.join(__dirname, "public", "music_demo.mp3");
+      if (!fs.existsSync(musicFile)) {
+        fs.writeFileSync(musicFile, Buffer.from(await ttsNotice.arrayBuffer())); // fallback
+      }
+
+      const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+      return res.json({
+        success: true,
+        text: notice,
+        audio_url: `${host}/audio/${path.basename(noticePath)}`,
+        music_url: `${host}/music_demo.mp3`,
+        type: "music",
+      });
+    }
+
+    // 4️⃣ Chat reply
+    const systemPrompt =
+      lang === "vi"
+        ? "Bạn là một cô gái trẻ, thân thiện, nói tiếng Việt tự nhiên."
+        : "You are a friendly young woman assistant speaking natural English.";
+
+    const prompt =
+      lang === "vi"
+        ? `Người dùng nói: "${userText}". Trả lời ngắn gọn (1–2 câu) bằng tiếng Việt, thân thiện.`
+        : `User said: "${userText}". Reply briefly (1–2 sentences) in friendly conversational English.`;
 
     const chat = await openai.chat.completions.create({
-      model: process.env.CHAT_MODEL || "gpt-4o-mini",
+      model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a friendly young woman assistant who speaks natural, casual English." },
+        { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ],
-      temperature: 0.8,
+      temperature: 0.7,
     });
+    const answer = chat.choices?.[0]?.message?.content?.trim() || (lang === "vi" ? "Xin chào!" : "Hello!");
 
-    const answer = chat.choices?.[0]?.message?.content?.trim() || "Hello there!";
-
-    // 3️⃣ Text-to-speech (TTS)
+    // 5️⃣ Text-to-speech
     const mp3Name = `resp_${Date.now()}.mp3`;
     const mp3Path = path.join(audioDir, mp3Name);
 
     const speech = await openai.audio.speech.create({
-      model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
-      voice: process.env.TTS_VOICE || "verse", // “verse” = young female; can try "alloy", "ember", "sage"
+      model: "gpt-4o-mini-tts",
+      voice: lang === "vi" ? "alloy" : "verse", // alloy = nữ VN, verse = nữ trẻ EN
       format: "mp3",
       input: answer,
     });
-
-    const buf = Buffer.from(await speech.arrayBuffer());
-    fs.writeFileSync(mp3Path, buf);
+    fs.writeFileSync(mp3Path, Buffer.from(await speech.arrayBuffer()));
 
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
     const url = `${host}/audio/${mp3Name}`;
 
+    // Cleanup
     try { fs.unlinkSync(filePath); } catch { }
 
-    res.json({ success: true, text: answer, audio_url: url, format: "mp3" });
+    res.json({
+      success: true,
+      text: answer,
+      audio_url: url,
+      lang,
+      format: "mp3",
+    });
   } catch (err) {
-    console.error("[ASK] error:", err);
-    res.status(500).json({ success: false, error: String(err?.message || err) });
+    console.error("[ASK ERROR]", err);
+    res.status(500).json({ success: false, error: err.message });
   }
 }
 
-
-// Chấp nhận cả /ask và /api/ask (để phòng proxy thêm prefix)
+// === Routes ===
 app.post("/ask", upload.single("audio"), handleAsk);
 app.post("/api/ask", upload.single("audio"), handleAsk);
 
-// GET vào /ask → báo rõ method
-app.get("/ask", (_req, res) => res.status(405).type("text/plain").send("Use POST /ask (multipart: audio=<file>)"));
-
-app.get("/", (_req, res) => res.type("text/plain").send("OK. POST /ask (multipart: audio=<file>)"));
-
-app.use((req, res) => {
-  // 404 rõ ràng
-  res.status(404).json({ success: false, error: `Not found: ${req.method} ${req.path}` });
-});
+app.get("/", (_, res) => res.send("OK. Use POST /ask (multipart: audio=<file>)"));
 
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
