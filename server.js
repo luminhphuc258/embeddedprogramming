@@ -28,7 +28,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ==== Middleware ====
 app.enable("trust proxy");
-app.use((_, res, next) => {
+app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
@@ -56,41 +56,6 @@ function detectLanguage(text) {
   if (hasVN && !hasEN) return "vi";
   if (hasEN && !hasVN) return "en";
   return "mixed";
-}
-
-// ==== Helper: normalize audio → WAV mono 16 kHz (silence trim + loudness) ====
-async function normalizeToWavMono16k(inputPath) {
-  const outWav = inputPath.replace(path.extname(inputPath), "_norm.wav");
-  await new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .audioFilters([
-        "silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB",
-        "areverse",
-        "silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB",
-        "areverse",
-        "loudnorm=I=-19:TP=-2:LRA=7",
-      ])
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .format("wav")
-      .on("end", resolve)
-      .on("error", reject)
-      .save(outWav);
-  });
-  return outWav;
-}
-
-// ==== Helper: đọc thời lượng WAV (PCM) từ header ====
-function getWavDurationSeconds(wavPath) {
-  const fd = fs.openSync(wavPath, "r");
-  const header = Buffer.alloc(44);
-  fs.readSync(fd, header, 0, 44, 0);
-  fs.closeSync(fd);
-
-  const byteRate = header.readUInt32LE(28);
-  const dataSize = header.readUInt32LE(40);
-  if (!byteRate || !dataSize) return 0;
-  return dataSize / byteRate;
 }
 
 // ==== Helper: download + convert from iTunes ====
@@ -127,7 +92,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
         .save(localMP3);
     });
 
-    fs.unlinkSync(localM4A);
+    fs.unlinkSync(localM4A); // delete original m4a
     console.log(`🎵 Converted to MP3: ${path.basename(localMP3)}`);
 
     return {
@@ -143,61 +108,18 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 
 // ==== MAIN ROUTE ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
-  const SHORT_MSG = "Xin mời bạn nhắc lại câu hỏi.";
-  const MIN_SECONDS = 2.0; // yêu cầu: < 2s thì bỏ qua
-
-  let wavPath = null;
   try {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // === 0️⃣ Normalize input audio to WAV mono 16k ===
-    wavPath = await normalizeToWavMono16k(req.file.path);
-
-    // === 0.5️⃣ Check duration BEFORE STT ===
-    const durSec = getWavDurationSeconds(wavPath);
-    console.log(`[AUDIO] duration = ${durSec.toFixed(3)}s`);
-    if (!isFinite(durSec) || durSec < MIN_SECONDS) {
-      try { fs.unlinkSync(req.file.path); } catch { }
-      try { fs.unlinkSync(wavPath); } catch { }
-      return res.json({ success: false, text: SHORT_MSG });
-    }
-
-    // === 1️⃣ Speech-to-text
-    // Model chính theo yêu cầu: gpt-4o-mini-transcribe
-    // Fallback: whisper-1 (phòng trường hợp lỗi mạng/định dạng hiếm gặp)
-    const langHint = "vi"; // ưu tiên tiếng Việt
-    const biasPrompt =
-      "Ngữ cảnh: trợ lý ảo nói giọng miền Nam, từ vựng: robot, ESP32, I2S, MAX98357A, OLED, cảm biến, iTunes, Bluetooth, phát nhạc, bài hát.";
-
-    let text = "";
-    try {
-      const stt = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavPath),
-        model: "gpt-4o-mini-transcribe",
-        language: langHint,
-        prompt: biasPrompt,
-      });
-      text = (stt.text || "").trim();
-    } catch (e) {
-      console.warn("[STT] mini-transcribe failed, fallback whisper-1:", e.message);
-      try {
-        const stt2 = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(wavPath),
-          model: "whisper-1",
-          language: langHint,
-          prompt: biasPrompt,
-        });
-        text = (stt2.text || "").trim();
-      } catch (e2) {
-        console.warn("[STT] whisper-1 failed:", e2.message);
-        try { fs.unlinkSync(req.file.path); } catch { }
-        try { fs.unlinkSync(wavPath); } catch { }
-        return res.json({ success: false, text: SHORT_MSG });
-      }
-    }
+    // === 1️⃣ Speech-to-text ===
+    const stt = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(req.file.path),
+      model: "gpt-4o-mini-transcribe",
+    });
+    const text = stt.text.trim();
     console.log(`🧠 Transcribed: ${text}`);
 
     // === 2️⃣ Detect language ===
@@ -260,15 +182,16 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }
     } else {
       // === 5️⃣ Normal Chat ===
-      const systemViSouth =
-        "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên, giọng miền Nam (ấm áp, gần gũi, dùng từ 'mình/bạn', hạn chế từ Hán Việt).";
-      const systemEn =
-        "You are a friendly young woman speaking natural English, short and casual.";
-
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: finalLang === "vi" ? systemViSouth : systemEn },
+          {
+            role: "system",
+            content:
+              finalLang === "vi"
+                ? "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên."
+                : "You are a friendly young woman speaking natural English, short and casual.",
+          },
           { role: "user", content: text },
         ],
         temperature: 0.8,
@@ -297,16 +220,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // cleanup files
-    try { fs.unlinkSync(req.file.path); } catch { }
-    try { fs.unlinkSync(wavPath); } catch { }
+    fs.unlinkSync(req.file.path);
   } catch (err) {
     console.error("❌ Server Error:", err);
-    if (err?.code === "audio_too_short") {
-      try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch { }
-      try { if (wavPath) fs.unlinkSync(wavPath); } catch { }
-      return res.json({ success: false, text: "Xin mời bạn nhắc lại câu hỏi." });
-    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
