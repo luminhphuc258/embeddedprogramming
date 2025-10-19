@@ -50,8 +50,8 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Helper: fetch song from iTunes Music ====
-async function getMusicFromItunes(query) {
+// ==== Helper: fetch song from iTunes and save locally ====
+async function getMusicFromItunesAndSave(query, audioDir) {
   console.log(`🎶 Searching iTunes Music for: ${query}`);
   try {
     const resp = await fetch(
@@ -66,10 +66,22 @@ async function getMusicFromItunes(query) {
 
     const song = data.results[0];
     console.log(`🎧 Found: ${song.trackName} - ${song.artistName}`);
+
+    // === Download preview ===
+    const previewUrl = song.previewUrl;
+    const res = await fetch(previewUrl);
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const localFile = `song_${Date.now()}.m4a`;
+    const localPath = path.join(audioDir, localFile);
+    fs.writeFileSync(localPath, buffer);
+
+    console.log(`💾 Saved song locally: ${localFile}`);
     return {
       title: song.trackName,
       artist: song.artistName,
-      previewUrl: song.previewUrl,
+      file: localFile,
     };
   } catch (err) {
     console.error("❌ [iTunes] Error:", err.message);
@@ -111,13 +123,19 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       lower.includes("phát nhạc") ||
       lower.includes("nghe")
     ) {
-      const songQuery = text.replace(/(play|music|nhạc|bật bài|phát nhạc|nghe)/gi, "").trim();
+      const songQuery = text.replace(
+        /(play|music|nhạc|bật bài|phát nhạc|nghe)/gi,
+        ""
+      ).trim();
       console.log(`🎵 Song requested: ${songQuery}`);
 
       try {
-        const song = await getMusicFromItunes(songQuery || "relaxing music");
+        const song = await getMusicFromItunesAndSave(
+          songQuery || "relaxing music",
+          audioDir
+        );
 
-        // === Notice speech ===
+        // === Tạo TTS thông báo ===
         const notice =
           finalLang === "vi"
             ? `Đang phát bài ${song.title} của ${song.artist}.`
@@ -134,14 +152,15 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         const noticePath = path.join(audioDir, noticeFile);
         fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
 
-        const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+        const host =
+          process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
         res.json({
           success: true,
           type: "music",
           text: notice,
           audio_url: `${host}/audio/${noticeFile}`,
-          music_url: song.previewUrl,
+          music_url: `${host}/audio/${song.file}`,
         });
       } catch (err) {
         res.json({
@@ -184,7 +203,12 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       fs.writeFileSync(outputPath, Buffer.from(await tts.arrayBuffer()));
 
       const fileUrl = `https://${req.headers.host}/audio/${filename}`;
-      res.json({ success: true, type: "chat", text: answer, audio_url: fileUrl });
+      res.json({
+        success: true,
+        type: "chat",
+        text: answer,
+        audio_url: fileUrl,
+      });
     }
 
     fs.unlinkSync(req.file.path);
@@ -196,8 +220,10 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Music Server (iTunes API) is running!")
+  res.send("✅ ESP32 Chatbot Music Server (iTunes local) is running!")
 );
 
 // ==== Start server ====
-app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+app.listen(port, () =>
+  console.log(`🚀 Server listening on port ${port}`)
+);
