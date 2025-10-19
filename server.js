@@ -41,24 +41,40 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+
 // ==== Helper: fetch playable audio from piped.video ====
 async function getMusicFromPiped(query) {
   console.log(`🎶 Searching music for: ${query}`);
-  const search = await fetch(`https://piped.video/api/v1/search?q=${encodeURIComponent(query)}`);
-  const list = await search.json();
-  if (!list.length) throw new Error("Không tìm thấy bài hát.");
+  try {
+    // 1️⃣ Search video
+    const searchRes = await fetch(`https://pipedapi.kavin.rocks/api/v1/search?q=${encodeURIComponent(query)}`);
+    if (!searchRes.ok) throw new Error(`Search failed (${searchRes.status})`);
+    const list = await searchRes.json();
 
-  const video = list.find(v => v.duration < 600) || list[0]; // chọn video < 10 phút
-  console.log(`🎵 Found: ${video.title}`);
+    if (!list || !Array.isArray(list) || list.length === 0) {
+      throw new Error("Không tìm thấy kết quả nào trên piped.video");
+    }
 
-  const info = await fetch(`https://piped.video/api/v1/streams/${video.url.split("v=")[1]}`);
-  const data = await info.json();
-  const audio = data.audioStreams.find(a => a.format === "m4a" || a.format === "mp4");
+    const video = list.find(v => v.duration < 600) || list[0];
+    console.log(`🎵 Found: ${video.title} | Duration: ${video.duration}s`);
 
-  if (!audio) throw new Error("Không có audio stream.");
-  console.log(`🎧 Audio URL ready: ${audio.url}`);
-  return audio.url;
+    // 2️⃣ Get stream info
+    const videoId = video.url.split("watch?v=")[1];
+    const streamRes = await fetch(`https://pipedapi.kavin.rocks/api/v1/streams/${videoId}`);
+    if (!streamRes.ok) throw new Error(`Stream fetch failed (${streamRes.status})`);
+    const streamData = await streamRes.json();
+
+    const audio = streamData.audioStreams?.find(a => a.format === "m4a" || a.format === "mp4");
+    if (!audio) throw new Error("Không có audio stream trong kết quả.");
+
+    console.log(`🎧 Audio stream ready: ${audio.quality} | ${audio.mimeType}`);
+    return audio.url;
+  } catch (err) {
+    console.error("❌ [PIPED] Lỗi khi tìm nhạc:", err.message);
+    throw new Error("Không tìm thấy hoặc lấy được nhạc.");
+  }
 }
+
 
 // ==== MAIN ROUTE ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
@@ -80,12 +96,13 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // === 3️⃣ Check for music command ===
     const lower = text.toLowerCase();
-    if (lower.includes("play") || lower.includes("nhạc") || lower.includes("music")) {
+    if (lower.includes("play") || lower.includes("nhạc") || lower.includes("music") || lower.includes("phát nhạc") || lower.includes("nghe")) {
       const songQuery = text.replace(/play|phát nhạc|bật bài/gi, "").trim();
       console.log(`🎵 Song requested: ${songQuery}`);
 
       try {
         const songUrl = await getMusicFromPiped(songQuery);
+        console.log(`🎶 Searching music for: ${query}`);
         res.json({
           success: true,
           type: "music",
