@@ -58,6 +58,28 @@ function detectLanguage(text) {
   return "mixed";
 }
 
+// ==== Helper: normalize audio → WAV mono 16 kHz (with silence trim + loudness) ====
+async function normalizeToWavMono16k(inputPath) {
+  const outWav = inputPath.replace(path.extname(inputPath), "_norm.wav");
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .audioFilters([
+        "silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB",
+        "areverse",
+        "silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB",
+        "areverse",
+        "loudnorm=I=-19:TP=-2:LRA=7"
+      ])
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format("wav")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(outWav);
+  });
+  return outWav;
+}
+
 // ==== Helper: download + convert from iTunes ====
 async function getMusicFromItunesAndConvert(query, audioDir) {
   console.log(`🎶 Searching iTunes Music for: ${query}`);
@@ -114,12 +136,33 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // === 1️⃣ Speech-to-text ===
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(req.file.path),
-      model: "gpt-4o-mini-transcribe",
-    });
-    const text = stt.text.trim();
+    // === 0️⃣ Normalize input audio to WAV mono 16k ===
+    const wavPath = await normalizeToWavMono16k(req.file.path);
+
+    // === 1️⃣ Speech-to-text (primary: gpt-4o-transcribe → fallback: whisper-1) ===
+    const langHint = "vi"; // ưu tiên tiếng Việt
+    const biasPrompt =
+      "Ngữ cảnh: trợ lý ảo nói giọng miền Nam, từ vựng: robot, ESP32, I2S, MAX98357A, OLED, cảm biến, iTunes, Bluetooth, phát nhạc, bài hát.";
+
+    let text = "";
+    try {
+      const stt = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavPath),
+        model: "gpt-4o-transcribe",
+        language: langHint,
+        prompt: biasPrompt
+      });
+      text = (stt.text || "").trim();
+    } catch (e) {
+      console.warn("[STT] gpt-4o-transcribe failed, fallback whisper-1:", e.message);
+      const stt2 = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavPath),
+        model: "whisper-1",
+        language: langHint,
+        prompt: biasPrompt
+      });
+      text = (stt2.text || "").trim();
+    }
     console.log(`🧠 Transcribed: ${text}`);
 
     // === 2️⃣ Detect language ===
@@ -182,15 +225,17 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }
     } else {
       // === 5️⃣ Normal Chat ===
+      const systemViSouth =
+        "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên, giọng miền Nam (ấm áp, gần gũi, dùng từ 'mình/bạn', hạn chế từ Hán Việt).";
+      const systemEn =
+        "You are a friendly young woman speaking natural English, short and casual.";
+
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
-            content:
-              finalLang === "vi"
-                ? "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên."
-                : "You are a friendly young woman speaking natural English, short and casual.",
+            content: finalLang === "vi" ? systemViSouth : systemEn,
           },
           { role: "user", content: text },
         ],
@@ -220,7 +265,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    fs.unlinkSync(req.file.path);
+    // cleanup files
+    try { fs.unlinkSync(req.file.path); } catch { }
+    try { fs.unlinkSync(wavPath); } catch { }
   } catch (err) {
     console.error("❌ Server Error:", err);
     res.status(500).json({ success: false, error: err.message });
