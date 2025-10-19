@@ -47,47 +47,34 @@ function detectLanguage(text) {
 // ==== Utility: search music via iTunes ====
 async function searchSong(query) {
   try {
-    const cleanQuery = query.trim().toLowerCase();
-    const itunesURL = `https://itunes.apple.com/search?term=${encodeURIComponent(
-      cleanQuery
-    )}&media=music&limit=3`;
+    const key = process.env.YOUTUBE_API_KEY;
+    if (!key) throw new Error("YOUTUBE_API_KEY missing in .env");
 
-    const resp = await fetch(itunesURL);
+    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodeURIComponent(
+      query + " official music video"
+    )}&key=${key}`;
+
+    const resp = await fetch(searchUrl);
     const data = await resp.json();
 
-    if (data.results && data.results.length > 0) {
-      // Ưu tiên bản có previewUrl
-      const found = data.results.find((r) => !!r.previewUrl) || data.results[0];
-      if (found?.previewUrl) {
-        console.log(
-          `🎧 Found: ${found.trackName} - ${found.artistName} (${found.previewUrl})`
-        );
-        return {
-          title: found.trackName,
-          artist: found.artistName,
-          preview: found.previewUrl,
-        };
-      }
-    }
+    if (data.items && data.items.length > 0) {
+      const item = data.items[0];
+      const title = item.snippet.title;
+      const channel = item.snippet.channelTitle;
+      const videoId = item.id.videoId;
+      const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    // Fallback: SoundCloud public API (proxy thông qua widget)
-    const scURL = `https://soundcloud.com/oembed?format=json&url=https://soundcloud.com/search?q=${encodeURIComponent(
-      cleanQuery
-    )}`;
-    const scResp = await fetch(scURL);
-    if (scResp.ok) {
-      const scData = await scResp.json();
-      console.log(`Found (SoundCloud): ${scData.title}`);
+      console.log(` Found: ${title} by ${channel}`);
       return {
-        title: scData.title,
-        artist: "SoundCloud artist",
-        preview: scData.url,
+        title,
+        artist: channel,
+        preview: videoUrl,
       };
+    } else {
+      console.warn(" No results from YouTube");
     }
-
-    console.warn("No playable preview found on iTunes or SoundCloud");
   } catch (err) {
-    console.error("Music search error:", err);
+    console.error("YouTube search error:", err);
   }
   return null;
 }
@@ -104,7 +91,7 @@ async function handleAsk(req, res) {
     const wavPath = req.file.path;
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // 1️⃣ Speech-to-text
+    // 1Speech-to-text
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(wavPath),
       model: "whisper-1",
@@ -112,12 +99,12 @@ async function handleAsk(req, res) {
     const text = transcription.text?.trim() || "(no text)";
     console.log("🧠 Transcribed:", text);
 
-    // 2️⃣ Detect language
+    // 2 Detect language
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-    // 3️⃣ Check if it's a music request
+    // 3 Check if it's a music request
     const lower = text.toLowerCase();
     if (
       lower.includes("phát nhạc") ||
@@ -131,7 +118,7 @@ async function handleAsk(req, res) {
         ""
       ).trim();
       const query = songQuery || "relaxing background music";
-      console.log("🎵 Song requested:", query);
+      console.log(" Song requested:", query);
 
       const song = await searchSong(query);
       const title = song?.title || query;
@@ -172,7 +159,7 @@ async function handleAsk(req, res) {
       });
     }
 
-    // 4️⃣ Otherwise normal chat reply
+    // 4Otherwise normal chat reply
     const systemPrompt =
       finalLang === "vi"
         ? "Bạn là một cô gái trẻ, thân thiện, nói giọng tự nhiên bằng tiếng Việt."
@@ -196,7 +183,7 @@ async function handleAsk(req, res) {
       (finalLang === "vi" ? "Xin chào!" : "Hello!");
     console.log("💬 GPT:", answer);
 
-    // 5️⃣ Text-to-speech
+    // 5Text-to-speech
     const outputDir = path.join(__dirname, "public/audio");
     fs.mkdirSync(outputDir, { recursive: true });
     const outFile = `response_${Date.now()}.mp3`;
@@ -223,7 +210,7 @@ async function handleAsk(req, res) {
 
     fs.unlinkSync(wavPath);
   } catch (err) {
-    console.error("❌ Server Error:", err);
+    console.error(" Server Error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -233,9 +220,9 @@ app.post("/ask", upload.single("audio"), handleAsk);
 app.post("/api/audio", upload.single("audio"), handleAsk);
 
 app.get("/", (req, res) => {
-  res.send("✅ ESP32 Chatbot Music Server is running fine!");
+  res.send(" ESP32 Chatbot Music Server is running fine!");
 });
 
 app.listen(PORT, () =>
-  console.log(`🚀 Server running on port ${PORT}`)
+  console.log(` Server running on port ${PORT}`)
 );
