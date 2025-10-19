@@ -47,24 +47,51 @@ function detectLanguage(text) {
 // ==== Utility: search music via iTunes ====
 async function searchSong(query) {
   try {
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
-      query
-    )}&media=music&limit=1`;
-    const resp = await fetch(url);
+    const cleanQuery = query.trim().toLowerCase();
+    const itunesURL = `https://itunes.apple.com/search?term=${encodeURIComponent(
+      cleanQuery
+    )}&media=music&limit=3`;
+
+    const resp = await fetch(itunesURL);
     const data = await resp.json();
+
     if (data.results && data.results.length > 0) {
-      const s = data.results[0];
+      // Ưu tiên bản có previewUrl
+      const found = data.results.find((r) => !!r.previewUrl) || data.results[0];
+      if (found?.previewUrl) {
+        console.log(
+          `🎧 Found: ${found.trackName} - ${found.artistName} (${found.previewUrl})`
+        );
+        return {
+          title: found.trackName,
+          artist: found.artistName,
+          preview: found.previewUrl,
+        };
+      }
+    }
+
+    // Fallback: SoundCloud public API (proxy thông qua widget)
+    const scURL = `https://soundcloud.com/oembed?format=json&url=https://soundcloud.com/search?q=${encodeURIComponent(
+      cleanQuery
+    )}`;
+    const scResp = await fetch(scURL);
+    if (scResp.ok) {
+      const scData = await scResp.json();
+      console.log(`Found (SoundCloud): ${scData.title}`);
       return {
-        title: s.trackName,
-        artist: s.artistName,
-        preview: s.previewUrl, // .m4a URL
+        title: scData.title,
+        artist: "SoundCloud artist",
+        preview: scData.url,
       };
     }
-  } catch (e) {
-    console.error("🎵 Music search error:", e);
+
+    console.warn("No playable preview found on iTunes or SoundCloud");
+  } catch (err) {
+    console.error("Music search error:", err);
   }
   return null;
 }
+
 
 // ==== MAIN HANDLER ====
 async function handleAsk(req, res) {
