@@ -1,5 +1,5 @@
 // server.js
-// Node 18+
+// Node 18+ / 20+
 // npm i express multer openai cors node-fetch p-queue
 
 import express from "express";
@@ -10,7 +10,7 @@ import path from "path";
 import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import OpenAI from "openai";
-import PQueue from "p-queue"; // kiểm soát số request đồng thời
+import PQueue from "p-queue"; // giới hạn request song song
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,10 +41,10 @@ const upload = multer({ storage });
 // ==== OpenAI ====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ==== Queue (hạn chế xử lý song song để tránh "body used already") ====
-const queue = new PQueue({ concurrency: 2 }); // tối đa 2 request cùng lúc
+// ==== Queue (giới hạn xử lý đồng thời để tránh lỗi body used already) ====
+const queue = new PQueue({ concurrency: 2 });
 
-// === Utility ===
+// === Utility: phát hiện ngôn ngữ ===
 function detectLanguage(text) {
   const hasVietnamese =
     /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
@@ -54,7 +54,7 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// === Helper: tạo file âm thanh an toàn ===
+// === Helper: tạo file TTS an toàn ===
 async function createSpeechFile({ text, voice, lang }) {
   const speechResp = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
@@ -70,7 +70,8 @@ async function createSpeechFile({ text, voice, lang }) {
 
 // === Main handler ===
 async function handleAsk(req, res) {
-  queue.add(async () => {
+  // Quan trọng: return Promise để Express chờ kết quả
+  return queue.add(async () => {
     try {
       if (!req.file) {
         return res
@@ -81,7 +82,7 @@ async function handleAsk(req, res) {
       const filePath = req.file.path;
       console.log(`[ASK] file=${req.file.originalname} size=${req.file.size}`);
 
-      // 1 Speech-to-text
+      // 1️⃣ Speech-to-text
       const stt = await openai.audio.transcriptions.create({
         file: fs.createReadStream(filePath),
         model: "whisper-1",
@@ -89,12 +90,12 @@ async function handleAsk(req, res) {
       const userText = stt.text?.trim() || "";
       console.log("[STT] =>", userText);
 
-      // 2 Detect language
+      // 2️⃣ Detect language
       const lang = detectLanguage(userText);
       const finalLang = lang === "mixed" ? "vi" : lang;
       console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-      // 3Handle music requests 
+      // 3️⃣ Handle music requests 🎵
       const lower = userText.toLowerCase();
       if (
         lower.includes("phát nhạc") ||
@@ -118,7 +119,7 @@ async function handleAsk(req, res) {
           lang: finalLang,
         });
 
-        // Tìm bài hát thật qua iTunes Search API
+        // 🔎 Tìm bài hát thật qua iTunes Search API
         const searchUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
           q
         )}&media=music&limit=1`;
@@ -127,15 +128,16 @@ async function handleAsk(req, res) {
           const resp = await fetch(searchUrl);
           const data = await resp.json();
           if (data.results && data.results.length > 0) {
-            musicUrl = data.results[0].previewUrl;
+            musicUrl = data.results[0].previewUrl; // 30s MP3 link
           }
         } catch (err) {
           console.error("iTunes fetch error:", err);
         }
 
         const host = process.env.PUBLIC_BASE_URL || `http://${req.headers.host}`;
-        if (!musicUrl) musicUrl = `${host}/audio/${path.basename(noticePath)}`; // fallback
+        if (!musicUrl) musicUrl = `${host}/audio/${path.basename(noticePath)}`;
 
+        console.log("[RESPONSE SENT] => music request");
         return res.json({
           success: true,
           text: notice,
@@ -145,7 +147,7 @@ async function handleAsk(req, res) {
         });
       }
 
-      // Chat reply
+      // 4️⃣ Chat reply
       const systemPrompt =
         finalLang === "vi"
           ? "Bạn là một cô gái trẻ, thân thiện, nói tiếng Việt tự nhiên."
@@ -168,7 +170,7 @@ async function handleAsk(req, res) {
         chat.choices?.[0]?.message?.content?.trim() ||
         (finalLang === "vi" ? "Xin chào!" : "Hello!");
 
-      //  Text-to-speech
+      // 5️⃣ Text-to-speech
       const mp3Path = await createSpeechFile({
         text: answer,
         lang: finalLang,
@@ -177,12 +179,12 @@ async function handleAsk(req, res) {
       const host = process.env.PUBLIC_BASE_URL || `http://${req.headers.host}`;
       const url = `${host}/audio/${path.basename(mp3Path)}`;
 
-      // Cleanup
       try {
         fs.unlinkSync(filePath);
       } catch { }
 
-      res.json({
+      console.log("[RESPONSE SENT] => chat reply");
+      return res.json({
         success: true,
         text: answer,
         audio_url: url,
@@ -200,6 +202,8 @@ async function handleAsk(req, res) {
 app.post("/ask", upload.single("audio"), handleAsk);
 app.post("/api/ask", upload.single("audio"), handleAsk);
 
-app.get("/", (_, res) => res.send("OK. Use POST /ask (multipart: audio=<file>)"));
+app.get("/", (_, res) =>
+  res.send("✅ OK. Use POST /ask (multipart: audio=<file>)")
+);
 
-app.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
