@@ -46,6 +46,7 @@ const upload = multer({ storage });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Một handler dùng chung cho /ask và /api/ask
+// --- English + young female voice version ---
 async function handleAsk(req, res) {
   try {
     if (!req.file) {
@@ -53,39 +54,39 @@ async function handleAsk(req, res) {
     }
     console.log(`[ASK] file=${req.file.originalname} size=${req.file.size} type=${req.file.mimetype}`);
 
-    const filePath = req.file.path; // wav/pcm từ ESP32
+    const filePath = req.file.path;
 
-    // 1) STT
+    // 1️⃣ Speech-to-text (convert voice to English text)
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
-      // Nếu tài khoản bạn chưa có gpt-4o-transcribe thì dùng "whisper-1"
       model: process.env.STT_MODEL || "whisper-1",
-      // language: "vi",
+      language: "en", // Force English output
     });
     const userText = stt.text?.trim() || "";
     console.log("[STT] =>", userText);
 
-    // 2) LLM
-    const prompt = `Người dùng hỏi (tiếng Việt): "${userText}"
-Trả lời ngắn gọn (1-2 câu), thân thiện.`;
+    // 2️⃣ ChatGPT: English short friendly reply
+    const prompt = `User said: "${userText}". 
+Answer briefly in friendly, conversational English (1–2 sentences).`;
 
     const chat = await openai.chat.completions.create({
       model: process.env.CHAT_MODEL || "gpt-4o-mini",
       messages: [
-        { role: "system", content: "Bạn là trợ lý hữu ích, trả lời tiếng Việt tự nhiên." },
+        { role: "system", content: "You are a friendly young woman assistant who speaks natural, casual English." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.6,
+      temperature: 0.8,
     });
-    const answer = chat.choices?.[0]?.message?.content?.trim() || "Xin chào!";
 
-    // 3) TTS (MP3)
+    const answer = chat.choices?.[0]?.message?.content?.trim() || "Hello there!";
+
+    // 3️⃣ Text-to-speech (TTS)
     const mp3Name = `resp_${Date.now()}.mp3`;
     const mp3Path = path.join(audioDir, mp3Name);
 
     const speech = await openai.audio.speech.create({
       model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
-      voice: process.env.TTS_VOICE || "alloy",
+      voice: process.env.TTS_VOICE || "verse", // “verse” = young female; can try "alloy", "ember", "sage"
       format: "mp3",
       input: answer,
     });
@@ -93,11 +94,9 @@ Trả lời ngắn gọn (1-2 câu), thân thiện.`;
     const buf = Buffer.from(await speech.arrayBuffer());
     fs.writeFileSync(mp3Path, buf);
 
-    // 4) Trả về link HTTPS đến MP3
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
     const url = `${host}/audio/${mp3Name}`;
 
-    // Dọn file upload gốc
     try { fs.unlinkSync(filePath); } catch { }
 
     res.json({ success: true, text: answer, audio_url: url, format: "mp3" });
@@ -106,6 +105,7 @@ Trả lời ngắn gọn (1-2 câu), thân thiện.`;
     res.status(500).json({ success: false, error: String(err?.message || err) });
   }
 }
+
 
 // Chấp nhận cả /ask và /api/ask (để phòng proxy thêm prefix)
 app.post("/ask", upload.single("audio"), handleAsk);
