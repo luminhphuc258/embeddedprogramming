@@ -1,8 +1,8 @@
 // =======================
-// ESP32 Chatbot + Music Server (iTunes Music + OpenAI TTS)
+// ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
 // =======================
 // Node 18+
-// npm i express cors multer openai node-fetch dotenv
+// npm i express cors multer openai node-fetch dotenv fluent-ffmpeg ffmpeg-static
 
 import express from "express";
 import cors from "cors";
@@ -13,8 +13,11 @@ import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
 
 dotenv.config();
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ==== Setup ====
 const __filename = fileURLToPath(import.meta.url);
@@ -50,14 +53,12 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Helper: fetch song from iTunes and save locally ====
-async function getMusicFromItunesAndSave(query, audioDir) {
+// ==== Helper: download + convert from iTunes ====
+async function getMusicFromItunesAndConvert(query, audioDir) {
   console.log(`🎶 Searching iTunes Music for: ${query}`);
   try {
     const resp = await fetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(
-        query
-      )}&media=music&limit=1`
+      `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
     );
     if (!resp.ok) throw new Error(`Search failed (${resp.status})`);
     const data = await resp.json();
@@ -67,21 +68,32 @@ async function getMusicFromItunesAndSave(query, audioDir) {
     const song = data.results[0];
     console.log(`🎧 Found: ${song.trackName} - ${song.artistName}`);
 
-    // === Download preview ===
+    // === Download preview (.m4a) ===
     const previewUrl = song.previewUrl;
     const res = await fetch(previewUrl);
     if (!res.ok) throw new Error(`Download failed (${res.status})`);
-
     const buffer = Buffer.from(await res.arrayBuffer());
-    const localFile = `song_${Date.now()}.m4a`;
-    const localPath = path.join(audioDir, localFile);
-    fs.writeFileSync(localPath, buffer);
 
-    console.log(`💾 Saved song locally: ${localFile}`);
+    const localM4A = path.join(audioDir, `song_${Date.now()}.m4a`);
+    fs.writeFileSync(localM4A, buffer);
+
+    // === Convert to MP3 ===
+    const localMP3 = localM4A.replace(".m4a", ".mp3");
+    await new Promise((resolve, reject) => {
+      ffmpeg(localM4A)
+        .toFormat("mp3")
+        .on("end", resolve)
+        .on("error", reject)
+        .save(localMP3);
+    });
+
+    fs.unlinkSync(localM4A); // delete original m4a
+    console.log(`🎵 Converted to MP3: ${path.basename(localMP3)}`);
+
     return {
       title: song.trackName,
       artist: song.artistName,
-      file: localFile,
+      file: path.basename(localMP3),
     };
   } catch (err) {
     console.error("❌ [iTunes] Error:", err.message);
@@ -93,17 +105,14 @@ async function getMusicFromItunesAndSave(query, audioDir) {
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
-      return res
-        .status(400)
-        .json({ success: false, error: "No audio file uploaded" });
-    console.log(
-      `[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`
-    );
+      return res.status(400).json({ success: false, error: "No audio file uploaded" });
+
+    console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
     // === 1️⃣ Speech-to-text ===
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
-      model: "whisper-1",
+      model: "gpt-4o-mini-transcribe",
     });
     const text = stt.text.trim();
     console.log(`🧠 Transcribed: ${text}`);
@@ -113,7 +122,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     const finalLang = lang === "mixed" ? "vi" : lang;
     console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-    // === 3️⃣ Check for music command ===
+    // === 3️⃣ Check if user requests music ===
     const lower = text.toLowerCase();
     if (
       lower.includes("play") ||
@@ -130,17 +139,14 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       console.log(`🎵 Song requested: ${songQuery}`);
 
       try {
-        const song = await getMusicFromItunesAndSave(
-          songQuery || "relaxing music",
-          audioDir
-        );
+        const song = await getMusicFromItunesAndConvert(songQuery || "relaxing music", audioDir);
 
-        // === Tạo TTS thông báo ===
         const notice =
           finalLang === "vi"
             ? `Đang phát bài ${song.title} của ${song.artist}.`
             : `Playing ${song.title} by ${song.artist}.`;
 
+        // === 4️⃣ Create voice notice (TTS) ===
         const tts = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
           voice: finalLang === "vi" ? "alloy" : "verse",
@@ -152,9 +158,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         const noticePath = path.join(audioDir, noticeFile);
         fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
 
-        const host =
-          process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-
+        const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
         res.json({
           success: true,
           type: "music",
@@ -172,7 +176,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         });
       }
     } else {
-      // === 4️⃣ Normal Chat ===
+      // === 5️⃣ Normal Chat ===
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
@@ -220,10 +224,8 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Music Server (iTunes local) is running!")
+  res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running!")
 );
 
 // ==== Start server ====
-app.listen(port, () =>
-  console.log(`🚀 Server listening on port ${port}`)
-);
+app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
