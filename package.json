@@ -19,6 +19,7 @@
   },
   "homepage": "https://github.com/luminhphuc258/embeddedprogramming#readme",
   "dependencies": {
+    "@distube/ytdl-core": "^4.13.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.19.2",

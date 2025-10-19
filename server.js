@@ -1,7 +1,7 @@
 // ===============================
-// server.js - ESP32 Chatbot + YouTube Music
+// server.js - ESP32 Chatbot + YouTube Music + OpenAI
 // Node 18+  (package.json: { "type": "module" })
-// npm i express multer openai cors node-fetch ytdl-core dotenv
+// npm i express multer openai cors dotenv node-fetch @distube/ytdl-core
 // ===============================
 
 import express from "express";
@@ -13,7 +13,7 @@ import dotenv from "dotenv";
 import multer from "multer";
 import fetch from "node-fetch";
 import OpenAI from "openai";
-import ytdl from "ytdl-core";
+import ytdl from "@distube/ytdl-core"; // ✅ an toàn hơn ytdl-core
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -22,7 +22,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 8080;
 
-// ==== Create folders ====
+// ==== Tạo thư mục nếu chưa có ====
 ["uploads", "public", "public/audio"].forEach((dir) =>
   fs.mkdirSync(path.join(__dirname, dir), { recursive: true })
 );
@@ -33,14 +33,14 @@ app.use("/audio", express.static(audioDir));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ==== Multer ====
+// ==== Multer setup ====
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, path.join(__dirname, "uploads")),
   filename: (_, file, cb) => cb(null, Date.now() + "_" + (file.originalname || "audio.wav")),
 });
 const upload = multer({ storage });
 
-// ==== Detect Language ====
+// ==== Ngôn ngữ ====
 function detectLanguage(text) {
   const hasVi = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
   const hasEn = /[a-zA-Z]/.test(text);
@@ -49,27 +49,26 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Search song from YouTube ====
+// ==== Tìm bài hát trên YouTube ====
 async function searchSong(query) {
   try {
     const apiKey = process.env.YOUTUBE_API_KEY;
     if (!apiKey) throw new Error("Missing YOUTUBE_API_KEY in .env");
 
-    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodeURIComponent(
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodeURIComponent(
       query + " official music video"
     )}&key=${apiKey}`;
-
-    const resp = await fetch(searchUrl);
+    const resp = await fetch(url);
     const data = await resp.json();
 
     if (data.items && data.items.length > 0) {
       const item = data.items[0];
       const title = item.snippet.title;
-      const channel = item.snippet.channelTitle;
+      const artist = item.snippet.channelTitle;
       const videoId = item.id.videoId;
       const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      console.log(`🎧 Found: ${title} by ${channel}`);
-      return { title, artist: channel, preview: videoUrl };
+      console.log(`🎧 Found: ${title} by ${artist}`);
+      return { title, artist, videoUrl };
     }
   } catch (err) {
     console.error("🎵 YouTube search error:", err);
@@ -77,17 +76,24 @@ async function searchSong(query) {
   return null;
 }
 
-// ==== Download YouTube audio to local ====
+// ==== Tải nhạc từ YouTube về MP3 ====
 async function downloadYouTubeAudio(videoUrl) {
   try {
     const outFile = `yt_${Date.now()}.mp3`;
     const outPath = path.join(audioDir, outFile);
-    const stream = ytdl(videoUrl, { filter: "audioonly", quality: "highestaudio" }).pipe(
-      fs.createWriteStream(outPath)
-    );
+    console.log(`💾 Downloading YouTube audio: ${videoUrl}`);
+
+    const stream = ytdl(videoUrl, {
+      filter: "audioonly",
+      quality: "highestaudio",
+      highWaterMark: 1 << 25, // tránh out of memory
+    }).pipe(fs.createWriteStream(outPath));
 
     return await new Promise((resolve, reject) => {
-      stream.on("finish", () => resolve(outFile));
+      stream.on("finish", () => {
+        console.log(`✅ Saved ${outFile}`);
+        resolve(outFile);
+      });
       stream.on("error", reject);
     });
   } catch (err) {
@@ -96,15 +102,15 @@ async function downloadYouTubeAudio(videoUrl) {
   }
 }
 
-// ==== MAIN HANDLER ====
+// ==== Main handler ====
 async function handleAsk(req, res) {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No audio file uploaded" });
+    if (!req.file) return res.status(400).json({ success: false, error: "No audio uploaded" });
 
     const filePath = req.file.path;
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // 🧠 Speech to text
+    // 🎙️ Speech-to-Text
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
       model: "whisper-1",
@@ -117,52 +123,45 @@ async function handleAsk(req, res) {
     const finalLang = lang === "mixed" ? "vi" : lang;
     console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-    // 🎵 Music request
-    const lower = text.toLowerCase();
-    if (lower.includes("play song") || lower.includes("phát nhạc") || lower.includes("mở bài")) {
+    // 🎵 Nếu là yêu cầu phát nhạc
+    if (text.toLowerCase().includes("play song") || text.toLowerCase().includes("phát nhạc")) {
       const query = text.replace(/(play song|phát nhạc|mở bài|bật nhạc)/gi, "").trim();
       console.log(`🎶 Song requested: ${query}`);
 
       const song = await searchSong(query);
-      if (song && song.preview) {
-        const outFile = await downloadYouTubeAudio(song.preview);
-        const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-        const musicUrl = outFile ? `${host}/audio/${outFile}` : song.preview;
+      if (!song) throw new Error("Không tìm thấy bài hát.");
 
-        const ttsText =
-          finalLang === "vi"
-            ? `Đang phát bài ${song.title} của ${song.artist}.`
-            : `Playing the song ${song.title} by ${song.artist}.`;
+      const audioFile = await downloadYouTubeAudio(song.videoUrl);
+      const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+      const musicUrl = `${host}/audio/${audioFile}`;
 
-        const ttsOut = path.join(audioDir, `tts_${Date.now()}.mp3`);
-        const tts = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: finalLang === "vi" ? "alloy" : "verse",
-          format: "mp3",
-          input: ttsText,
-        });
-        fs.writeFileSync(ttsOut, Buffer.from(await tts.arrayBuffer()));
+      // 🔊 Tạo TTS thông báo
+      const ttsText =
+        finalLang === "vi"
+          ? `Đang phát bài ${song.title} của ${song.artist}.`
+          : `Playing the song ${song.title} by ${song.artist}.`;
 
-        try {
-          fs.unlinkSync(filePath);
-        } catch { }
+      const ttsPath = path.join(audioDir, `tts_${Date.now()}.mp3`);
+      const tts = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: finalLang === "vi" ? "alloy" : "verse",
+        format: "mp3",
+        input: ttsText,
+      });
+      fs.writeFileSync(ttsPath, Buffer.from(await tts.arrayBuffer()));
 
-        return res.json({
-          success: true,
-          type: "music",
-          text: ttsText,
-          audio_url: `${host}/audio/${path.basename(ttsOut)}`,
-          music_url: musicUrl,
-        });
-      } else {
-        return res.json({
-          success: false,
-          error: "Không tìm thấy bài hát.",
-        });
-      }
+      try { fs.unlinkSync(filePath); } catch { }
+
+      return res.json({
+        success: true,
+        type: "music",
+        text: ttsText,
+        audio_url: `${host}/audio/${path.basename(ttsPath)}`,
+        music_url: musicUrl,
+      });
     }
 
-    // 💬 Chat reply
+    // 💬 Trả lời hội thoại bình thường
     const systemPrompt =
       finalLang === "vi"
         ? "Bạn là một cô gái trẻ, thân thiện, nói tiếng Việt tự nhiên."
@@ -182,28 +181,27 @@ async function handleAsk(req, res) {
       temperature: 0.7,
     });
 
-    const answer = chat.choices?.[0]?.message?.content?.trim() || "Hello there!";
+    const answer = chat.choices?.[0]?.message?.content?.trim() || "Hello!";
     console.log(`💬 Reply: ${answer}`);
 
-    const mp3Name = `resp_${Date.now()}.mp3`;
-    const mp3Path = path.join(audioDir, mp3Name);
+    const respFile = `resp_${Date.now()}.mp3`;
+    const respPath = path.join(audioDir, respFile);
+
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: finalLang === "vi" ? "alloy" : "verse",
       format: "mp3",
       input: answer,
     });
-    fs.writeFileSync(mp3Path, Buffer.from(await speech.arrayBuffer()));
+    fs.writeFileSync(respPath, Buffer.from(await speech.arrayBuffer()));
 
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-    try {
-      fs.unlinkSync(filePath);
-    } catch { }
+    try { fs.unlinkSync(filePath); } catch { }
 
     res.json({
       success: true,
       text: answer,
-      audio_url: `${host}/audio/${mp3Name}`,
+      audio_url: `${host}/audio/${respFile}`,
       lang: finalLang,
       format: "mp3",
     });
@@ -213,12 +211,9 @@ async function handleAsk(req, res) {
   }
 }
 
-// ==== ROUTES ====
+// ==== Routes ====
 app.post("/ask", upload.single("audio"), handleAsk);
 app.post("/api/ask", upload.single("audio"), handleAsk);
-
-app.get("/", (_, res) =>
-  res.send("✅ ESP32 Chatbot + YouTube Music Server is running fine.")
-);
+app.get("/", (_, res) => res.send("✅ ESP32 Chatbot + YouTube Music Server is live!"));
 
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
