@@ -23,8 +23,8 @@
     "dotenv": "^16.3.1",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.3.2",
     "openai": "^4.57.0",
-      "ytmusic-api": "^1.0.6",
-     "node-fetch": "^3.3.2"
+    "ytmusic-api": "^1.0.6"
   }
 }
