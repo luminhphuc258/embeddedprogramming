@@ -80,7 +80,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // === 3️⃣ Check for music command ===
     const lower = text.toLowerCase();
-    if (lower.includes("play") || lower.includes("phát nhạc") || lower.includes("bật bài")) {
+    if (lower.includes("play") || lower.includes("nhạc") || lower.includes("music")) {
       const songQuery = text.replace(/play|phát nhạc|bật bài/gi, "").trim();
       console.log(`🎵 Song requested: ${songQuery}`);
 
