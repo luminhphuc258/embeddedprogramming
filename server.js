@@ -1,51 +1,25 @@
-// server.js
-// Node 18+  (package.json: { "type": "module" })
-// npm i express multer openai cors
-
 import express from "express";
-import cors from "cors";
-import multer from "multer";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import OpenAI from "openai";
+import dotenv from "dotenv";
+import cors from "cors";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const port = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080;
 
-app.use(cors());
-// Log mọi request để debug
-app.use((req, _res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path}`);
-  next();
-});
-
-// Bật JSON parser cho các route không dùng multipart
-app.use(express.json({ limit: "10mb" }));
-
-// ==== Thư mục public để phát file mp3 ====
-const publicDir = path.join(__dirname, "public");
-const audioDir = path.join(publicDir, "audio");
-fs.mkdirSync(audioDir, { recursive: true });
-app.use("/audio", express.static(audioDir));
-
-// ==== Multer nhận file từ ESP32 (multipart/form-data, field name: "audio") ====
-const uploadsDir = path.join(__dirname, "uploads");
-fs.mkdirSync(uploadsDir, { recursive: true });
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadsDir),
-  filename: (_, file, cb) =>
-    cb(null, Date.now() + "_" + (file.originalname || "audio.bin")),
-});
-const upload = multer({ storage });
-
-// ==== OpenAI ====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ==== Utility: phát hiện ngôn ngữ trong text ====
+// ==== Middleware ====
+app.use(cors());
+app.use(express.raw({ type: "audio/*", limit: "10mb" }));
+app.use("/audio", express.static(path.join(__dirname, "public/audio")));
+
+// ==== Utility: phát hiện ngôn ngữ ====
 function detectLanguage(text) {
   const hasVietnamese =
     /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
@@ -55,122 +29,136 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Handler chính cho /ask và /api/ask ====
-async function handleAsk(req, res) {
+// ===== MAIN API: Receive audio from ESP32 =====
+app.post("/api/audio", async (req, res) => {
   try {
-    if (!req.file) {
+    const audioBuffer = req.body;
+    if (!audioBuffer || !audioBuffer.length) {
       return res
         .status(400)
-        .json({ success: false, error: "No file (field name must be 'audio')" });
+        .json({ success: false, error: "No audio data received" });
     }
-    console.log(
-      `[ASK] file=${req.file.originalname} size=${req.file.size} type=${req.file.mimetype}`
+
+    // 1️⃣ Convert raw PCM → WAV header (16-bit 16 kHz mono)
+    const sampleRate = 16000;
+    const bitsPerSample = 16;
+    const numChannels = 1;
+    const dataSize = audioBuffer.length;
+    const headerSize = 44;
+    const totalSize = dataSize + headerSize - 8;
+
+    const header = Buffer.alloc(headerSize);
+    header.write("RIFF", 0);
+    header.writeUInt32LE(totalSize, 4);
+    header.write("WAVEfmt ", 8);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(numChannels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(
+      sampleRate * numChannels * bitsPerSample / 8,
+      28
     );
+    header.writeUInt16LE(numChannels * bitsPerSample / 8, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write("data", 36);
+    header.writeUInt32LE(dataSize, 40);
 
-    const filePath = req.file.path;
+    const wavData = Buffer.concat([header, audioBuffer]);
+    const uploadsDir = path.join(__dirname, "uploads");
+    if (!fs.existsSync(uploadsDir))
+      fs.mkdirSync(uploadsDir, { recursive: true });
 
-    // 1️⃣ Speech-to-text
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
-      model: process.env.STT_MODEL || "whisper-1",
+    const wavPath = path.join(uploadsDir, `input_${Date.now()}.wav`);
+    fs.writeFileSync(wavPath, wavData);
+
+    // 2️⃣ Speech-to-Text (Whisper)
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(wavPath),
+      model: "whisper-1",
     });
+    const text = transcription.text?.trim() || "(no text)";
+    console.log("🧠 Transcribed:", text);
 
-    const userText = stt.text?.trim() || "";
-    console.log("[STT] =>", userText);
-
-    // 2️⃣ Nhận diện ngôn ngữ
-    const lang = detectLanguage(userText);
+    // 3️⃣ Phát hiện ngôn ngữ
+    const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
-    console.log(`[LANG DETECTED] ${lang} → using ${finalLang}`);
+    console.log(`[LANG DETECTED] ${lang} -> using ${finalLang}`);
 
-    // 3️⃣ Tạo phản hồi bằng ChatGPT
-    const prompt =
+    // 4️⃣ Chuẩn bị phản hồi text
+    const replyPrompt =
       finalLang === "vi"
-        ? `Người dùng nói: "${userText}". Trả lời thân thiện, ngắn gọn (1–2 câu) bằng tiếng Việt tự nhiên.`
-        : `User said: "${userText}". Reply briefly in friendly conversational English (1–2 sentences).`;
+        ? `Người dùng nói: "${text}". Hãy trả lời thân thiện, tự nhiên, ngắn gọn bằng tiếng Việt (1–2 câu).`
+        : `User said: "${text}". Reply briefly in friendly, conversational English (1–2 sentences).`;
 
     const systemPrompt =
       finalLang === "vi"
-        ? "Bạn là một cô gái trẻ, nói giọng tự nhiên, thân thiện bằng tiếng Việt."
-        : "You are a friendly young woman who speaks casual, natural English.";
+        ? "Bạn là một cô gái trẻ, thân thiện, nói giọng tự nhiên bằng tiếng Việt."
+        : "You are a friendly young woman who speaks natural English.";
 
+    // 5️⃣ ChatGPT tạo câu trả lời
     const chat = await openai.chat.completions.create({
-      model: process.env.CHAT_MODEL || "gpt-4o-mini",
+      model: "gpt-4o-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: prompt },
+        { role: "user", content: replyPrompt },
       ],
       temperature: 0.8,
     });
 
     const answer =
       chat.choices?.[0]?.message?.content?.trim() ||
-      (finalLang === "vi" ? "Xin chào!" : "Hello there!");
+      (finalLang === "vi" ? "Xin chào!" : "Hello!");
+    console.log("💬 GPT:", answer);
 
-    console.log("[AI REPLY] =>", answer);
+    // 6️⃣ Text-to-Speech (TTS)
+    const outputDir = path.join(__dirname, "public/audio");
+    if (!fs.existsSync(outputDir))
+      fs.mkdirSync(outputDir, { recursive: true });
 
-    // 4️⃣ TTS (Text-to-Speech)
-    const mp3Name = `resp_${Date.now()}.mp3`;
-    const mp3Path = path.join(audioDir, mp3Name);
+    const outFile = `response_${Date.now()}.mp3`;
+    const outPath = path.join(outputDir, outFile);
 
     const speech = await openai.audio.speech.create({
-      model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
-      voice: finalLang === "vi" ? "alloy" : "verse", // alloy = nữ VN, verse = nữ EN
-      input: answer,
+      model: "gpt-4o-mini-tts",
+      voice: finalLang === "vi" ? "alloy" : "verse",
       format: "mp3",
+      input: answer,
     });
 
-    const buf = Buffer.from(await speech.arrayBuffer());
-    fs.writeFileSync(mp3Path, buf);
+    const buffer = Buffer.from(await speech.arrayBuffer());
+    fs.writeFileSync(outPath, buffer);
 
-    const host = process.env.PUBLIC_BASE_URL || `http://${req.headers.host}`;
-    const url = `${host}/audio/${mp3Name}`;
-
-    // Xóa file tạm (upload)
-    try {
-      fs.unlinkSync(filePath);
-    } catch { }
-
-    console.log(`[RESPONSE SENT] => ${url}`);
-
-    // 5️⃣ Gửi kết quả JSON
+    // 7️⃣ Trả phản hồi cho ESP32
+    const fileURL = `http://${req.headers.host}/audio/${outFile}`;
     res.json({
       success: true,
       text: answer,
       lang: finalLang,
-      audio_url: url,
+      audio_url: fileURL,
       format: "mp3",
     });
+
+    // 8️⃣ Xóa file tạm
+    try {
+      fs.unlinkSync(wavPath);
+    } catch (e) {
+      console.warn("⚠️ Cleanup error:", e.message);
+    }
   } catch (err) {
-    console.error("[ASK ERROR]", err);
+    console.error("❌ Server Error:", err);
     res
       .status(500)
-      .json({ success: false, error: String(err?.message || err) });
+      .json({ success: false, error: err.message || "Internal server error" });
   }
-}
-
-// ==== Routes ====
-app.post("/ask", upload.single("audio"), handleAsk);
-app.post("/api/ask", upload.single("audio"), handleAsk);
-
-app.get("/ask", (_req, res) =>
-  res
-    .status(405)
-    .type("text/plain")
-    .send("Use POST /ask (multipart: audio=<file>)")
-);
-
-app.get("/", (_req, res) =>
-  res.type("text/plain").send("OK. POST /ask (multipart: audio=<file>)")
-);
-
-// 404 rõ ràng
-app.use((req, res) => {
-  res
-    .status(404)
-    .json({ success: false, error: `Not found: ${req.method} ${req.path}` });
 });
 
-app.listen(port, () =>
-  console.log(`🚀 Server running on port ${port}`)
+// ==== Health check ====
+app.get("/", (req, res) => {
+  res.send("✅ ESP32 Audio AI Server (auto-detect lang) is running fine!");
+});
+
+// ==== Start server ====
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on http://localhost:${PORT}`)
 );
