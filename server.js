@@ -13,7 +13,7 @@ import dotenv from "dotenv";
 import multer from "multer";
 import fetch from "node-fetch";
 import OpenAI from "openai";
-import ytdl from "@distube/ytdl-core"; // ✅ an toàn hơn ytdl-core
+import { Innertube } from "youtubei.js";
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -79,25 +79,29 @@ async function searchSong(query) {
 // ==== Tải nhạc từ YouTube về MP3 ====
 async function downloadYouTubeAudio(videoUrl) {
   try {
+    const youtube = await Innertube.create();
+    const videoId = videoUrl.split("v=")[1].split("&")[0];
+    console.log(`💾 Fetching audio info for video ID: ${videoId}`);
+
+    const info = await youtube.getInfo(videoId);
+    const format = info.streaming_data?.adaptive_formats?.find(
+      (f) => f.mime_type.includes("audio/mp4") && f.bitrate < 260000
+    );
+
+    if (!format?.url) throw new Error("Không tìm thấy stream URL audio");
+
     const outFile = `yt_${Date.now()}.mp3`;
     const outPath = path.join(audioDir, outFile);
-    console.log(`💾 Downloading YouTube audio: ${videoUrl}`);
 
-    const stream = ytdl(videoUrl, {
-      filter: "audioonly",
-      quality: "highestaudio",
-      highWaterMark: 1 << 25, // tránh out of memory
-    }).pipe(fs.createWriteStream(outPath));
+    console.log(`🎧 Downloading YouTube audio → ${outFile}`);
+    const response = await fetch(format.url);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.writeFileSync(outPath, buffer);
 
-    return await new Promise((resolve, reject) => {
-      stream.on("finish", () => {
-        console.log(`✅ Saved ${outFile}`);
-        resolve(outFile);
-      });
-      stream.on("error", reject);
-    });
+    console.log(`✅ Saved ${outFile}`);
+    return outFile;
   } catch (err) {
-    console.error("🎵 Download error:", err);
+    console.error("🎵 YouTube download error:", err.message);
     return null;
   }
 }
