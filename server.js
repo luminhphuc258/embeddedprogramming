@@ -3,6 +3,7 @@
 // =======================
 // Node 18+
 // npm i express cors multer openai node-fetch dotenv fluent-ffmpeg ffmpeg-static
+// + npm i socket.io
 
 import express from "express";
 import cors from "cors";
@@ -15,6 +16,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+import { Server } from "socket.io";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -112,6 +114,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
+    // 🔔 Socket.IO: báo bắt đầu xử lý
+    emitStatus("processing");
+
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
     // === 1️⃣ Speech-to-text ===
@@ -164,6 +169,10 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
 
         const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+
+        // 🔔 đang “nói” (tùy bạn, có thể vẫn giữ tim)
+        emitStatus("speaking", { type: "music" });
+
         res.json({
           success: true,
           type: "music",
@@ -172,6 +181,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
           music_url: `${host}/audio/${song.file}`,
         });
       } catch (err) {
+        emitStatus("error", { message: err.message });
         res.json({
           success: false,
           text:
@@ -212,6 +222,10 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       fs.writeFileSync(outputPath, Buffer.from(await tts.arrayBuffer()));
 
       const fileUrl = `https://${req.headers.host}/audio/${filename}`;
+
+      // 🔔 đang “nói”
+      emitStatus("speaking", { type: "chat" });
+
       res.json({
         success: true,
         type: "chat",
@@ -222,8 +236,12 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     fs.unlinkSync(req.file.path);
   } catch (err) {
+    emitStatus("error", { message: err.message });
     console.error("❌ Server Error:", err);
     res.status(500).json({ success: false, error: err.message });
+  } finally {
+    // 🔔 quay lại trạng thái bình thường
+    emitStatus("idle");
   }
 });
 
@@ -232,5 +250,16 @@ app.get("/", (_req, res) =>
   res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running!")
 );
 
-// ==== Start server ====
-app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+// ==== Start server (Socket.IO gắn vào HTTP server) ====
+const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
+const io = new Server(server, { cors: { origin: "*" } });
+
+io.on("connection", (socket) => {
+  console.log("🔌 ESP connected:", socket.id);
+  socket.emit("status", { event: "status", state: "hello" });
+});
+
+// Helper phát trạng thái qua Socket.IO
+function emitStatus(state, extra = {}) {
+  io.emit("status", { event: "status", state, ...extra });
+}
