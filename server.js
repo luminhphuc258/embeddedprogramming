@@ -1,9 +1,6 @@
 // =======================
 // ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
 // =======================
-// Node 18+
-// npm i express cors multer openai node-fetch dotenv fluent-ffmpeg ffmpeg-static
-// + npm i socket.io
 
 import express from "express";
 import cors from "cors";
@@ -60,10 +57,11 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ==== Helper: Socket.IO emitter (khai báo sau io) ====
+// ==== Helper: Socket.IO emitter ====
 let ioRef = null;
 function emitStatus(state, extra = {}) {
   if (!ioRef) return;
+  console.log(`📡 [SOCKET EMIT] ${state}`, extra);
   ioRef.emit("status", { event: "status", state, ...extra });
 }
 
@@ -84,7 +82,6 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
     const song = data.results[0];
     console.log(`🎧 Found: ${song.trackName} - ${song.artistName}`);
 
-    // === Download preview (.m4a) ===
     const previewUrl = song.previewUrl;
     emitStatus("processing:music_download");
     const res = await fetch(previewUrl);
@@ -94,7 +91,6 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
     const localM4A = path.join(audioDir, `song_${Date.now()}.m4a`);
     fs.writeFileSync(localM4A, buffer);
 
-    // === Convert to MP3 ===
     const localMP3 = localM4A.replace(".m4a", ".mp3");
     emitStatus("processing:convert", { from: "m4a", to: "mp3" });
     await new Promise((resolve, reject) => {
@@ -105,7 +101,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
         .save(localMP3);
     });
 
-    fs.unlinkSync(localM4A); // delete original m4a
+    fs.unlinkSync(localM4A);
     console.log(`🎵 Converted to MP3: ${path.basename(localMP3)}`);
 
     return {
@@ -125,9 +121,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
-    // 🔔 bắt đầu xử lý toàn phiên
     emitStatus("processing");
-
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
     // === 1️⃣ Speech-to-text ===
@@ -162,13 +156,11 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
       try {
         const song = await getMusicFromItunesAndConvert(songQuery || "relaxing music", audioDir);
-
         const notice =
           finalLang === "vi"
             ? `Đang phát bài ${song.title} của ${song.artist}.`
             : `Playing ${song.title} by ${song.artist}.`;
 
-        // === 4️⃣ Create voice notice (TTS) ===
         emitStatus("speaking:tts", { lang: finalLang });
         const tts = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
@@ -182,8 +174,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
 
         const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-
-        // 🔔 đang “nói” (có nội dung music)
         emitStatus("speaking", { type: "music" });
 
         res.json({
@@ -237,8 +227,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       fs.writeFileSync(outputPath, Buffer.from(await tts.arrayBuffer()));
 
       const fileUrl = `https://${req.headers.host}/audio/${filename}`;
-
-      // 🔔 đang “nói”
       emitStatus("speaking", { type: "chat" });
 
       res.json({
@@ -255,7 +243,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     console.error("Server Error:", err);
     res.status(500).json({ success: false, error: err.message });
   } finally {
-    // 🔔 quay lại trạng thái bình thường
     emitStatus("idle");
   }
 });
@@ -265,20 +252,31 @@ app.get("/", (_req, res) =>
   res.send("ESP32 Chatbot Music Server (iTunes → MP3) is running!")
 );
 
-// ==== Start server (Socket.IO gắn vào HTTP server) ====
-const server = app.listen(port, () => console.log(`Server listening on port ${port}`));
+// ==== Start server & Socket.IO ====
+const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
 
 const io = new Server(server, {
   cors: { origin: "*" },
-  transports: ["websocket"],   // ép websocket để hợp với client nhúng
+  transports: ["websocket"],
   pingInterval: 25000,
   pingTimeout: 20000,
 });
 ioRef = io;
 
+// ==== Socket.IO Connection Logs ====
 io.on("connection", (socket) => {
-  console.log("ESP connected:", socket.id);
+  console.log(`✅ [SOCKET CONNECTED] ID: ${socket.id}`);
   socket.emit("status", { event: "status", state: "hello" });
-});
 
-// Helper phát trạng thái qua Socket.IO (đặt trên đầu file đã có)
+  socket.on("client_message", (data) => {
+    console.log(`💬 [FROM CLIENT ${socket.id}]`, data);
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log(`❌ [SOCKET DISCONNECTED] ${socket.id} | Reason: ${reason}`);
+  });
+
+  socket.on("error", (err) => {
+    console.error(`⚠️ [SOCKET ERROR] ${socket.id}`, err);
+  });
+});
