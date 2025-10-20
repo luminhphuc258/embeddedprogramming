@@ -1,8 +1,9 @@
 {
   "name": "embeddedprogramming",
   "version": "1.0.0",
-  "description": "ESP32 Audio AI Server for OpenAI transcription + TTS",
+  "description": "ESP32 AI Chatbot REST Server (OpenAI STT + TTS + iTunes music)",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
@@ -12,18 +13,14 @@
   },
   "keywords": [
     "esp32",
-    "audio",
     "openai",
     "express",
     "tts",
-    "whisper"
+    "whisper",
+    "iot"
   ],
   "author": "Lucie",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/luminhphuc258/embeddedprogramming/issues"
-  },
-  "homepage": "https://github.com/luminhphuc258/embeddedprogramming#readme",
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -31,9 +28,7 @@
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
     "multer": "^1.4.5-lts.1",
-    "node-fetch": "^2.6.12",
-    "openai": "^4.57.0",
-    "socket.io": "^2.4.1",
-    "socket.io-client": "^2.4.1"
+    "node-fetch": "^3.3.2",
+    "openai": "^4.57.0"
   }
 }
