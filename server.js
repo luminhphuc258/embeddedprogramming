@@ -253,10 +253,10 @@ const server = app.listen(port, () => console.log(`🚀 Server listening on port
 // ✅ Cập nhật để tương thích EIO=3 (Arduino)
 const io = new Server(server, {
   cors: { origin: "*" },
-  allowEIO3: true, // ⚡ cho phép client cũ
-  transports: ["websocket"],
-  pingInterval: 25000,
-  pingTimeout: 20000,
+  allowEIO3: true,          // ✅ Cho phép Arduino EIO=3
+  transports: ["websocket"], // Ưu tiên WebSocket
+  pingInterval: 10000,       // Ping server gửi xuống mỗi 10s
+  pingTimeout: 40000,        // Client có 40s để phản hồi
 });
 ioRef = io;
 
