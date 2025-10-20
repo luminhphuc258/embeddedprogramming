@@ -1,5 +1,6 @@
 // =======================
 // ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
+// Compatible with Arduino Socket.IO v3 client
 // =======================
 
 import express from "express";
@@ -27,10 +28,6 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ==== Middleware ====
 app.enable("trust proxy");
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  next();
-});
 app.use(cors());
 app.use(express.json());
 app.use(express.static("public"));
@@ -82,9 +79,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
     const song = data.results[0];
     console.log(`🎧 Found: ${song.trackName} - ${song.artistName}`);
 
-    const previewUrl = song.previewUrl;
-    emitStatus("processing:music_download");
-    const res = await fetch(previewUrl);
+    const res = await fetch(song.previewUrl);
     if (!res.ok) throw new Error(`Download failed (${res.status})`);
     const buffer = Buffer.from(await res.arrayBuffer());
 
@@ -249,21 +244,23 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("ESP32 Chatbot Music Server (iTunes → MP3) is running!")
+  res.send("ESP32 Chatbot Music Server (iTunes → MP3, ESP32 compatible) is running!")
 );
 
 // ==== Start server & Socket.IO ====
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
 
+// ✅ Cập nhật để tương thích EIO=3 (Arduino)
 const io = new Server(server, {
   cors: { origin: "*" },
+  allowEIO3: true, // ⚡ cho phép client cũ
   transports: ["websocket"],
   pingInterval: 25000,
   pingTimeout: 20000,
 });
 ioRef = io;
 
-// ==== Socket.IO Connection Logs ====
+// ==== Socket.IO Logs ====
 io.on("connection", (socket) => {
   console.log(`✅ [SOCKET CONNECTED] ID: ${socket.id}`);
   socket.emit("status", { event: "status", state: "hello" });
@@ -274,9 +271,5 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", (reason) => {
     console.log(`❌ [SOCKET DISCONNECTED] ${socket.id} | Reason: ${reason}`);
-  });
-
-  socket.on("error", (err) => {
-    console.error(`⚠️ [SOCKET ERROR] ${socket.id}`, err);
   });
 });
