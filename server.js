@@ -60,9 +60,18 @@ function detectLanguage(text) {
   return "mixed";
 }
 
+// ==== Helper: Socket.IO emitter (khai báo sau io) ====
+let ioRef = null;
+function emitStatus(state, extra = {}) {
+  if (!ioRef) return;
+  ioRef.emit("status", { event: "status", state, ...extra });
+}
+
 // ==== Helper: download + convert from iTunes ====
 async function getMusicFromItunesAndConvert(query, audioDir) {
   console.log(`🎶 Searching iTunes Music for: ${query}`);
+  emitStatus("processing:music_search", { q: query });
+
   try {
     const resp = await fetch(
       `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
@@ -77,6 +86,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 
     // === Download preview (.m4a) ===
     const previewUrl = song.previewUrl;
+    emitStatus("processing:music_download");
     const res = await fetch(previewUrl);
     if (!res.ok) throw new Error(`Download failed (${res.status})`);
     const buffer = Buffer.from(await res.arrayBuffer());
@@ -86,6 +96,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 
     // === Convert to MP3 ===
     const localMP3 = localM4A.replace(".m4a", ".mp3");
+    emitStatus("processing:convert", { from: "m4a", to: "mp3" });
     await new Promise((resolve, reject) => {
       ffmpeg(localM4A)
         .toFormat("mp3")
@@ -114,12 +125,13 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
-    // 🔔 Socket.IO: báo bắt đầu xử lý
+    // 🔔 bắt đầu xử lý toàn phiên
     emitStatus("processing");
 
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
     // === 1️⃣ Speech-to-text ===
+    emitStatus("processing:stt");
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
       model: "gpt-4o-mini-transcribe",
@@ -157,6 +169,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
             : `Playing ${song.title} by ${song.artist}.`;
 
         // === 4️⃣ Create voice notice (TTS) ===
+        emitStatus("speaking:tts", { lang: finalLang });
         const tts = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
           voice: finalLang === "vi" ? "alloy" : "verse",
@@ -170,7 +183,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
         const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-        // 🔔 đang “nói” (tùy bạn, có thể vẫn giữ tim)
+        // 🔔 đang “nói” (có nội dung music)
         emitStatus("speaking", { type: "music" });
 
         res.json({
@@ -192,6 +205,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }
     } else {
       // === 5️⃣ Normal Chat ===
+      emitStatus("processing:chat");
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
@@ -210,6 +224,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const answer = chat.choices[0].message.content.trim();
       console.log(`💬 Answer: ${answer}`);
 
+      emitStatus("speaking:tts", { lang: finalLang });
       const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: finalLang === "vi" ? "alloy" : "verse",
@@ -237,7 +252,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     fs.unlinkSync(req.file.path);
   } catch (err) {
     emitStatus("error", { message: err.message });
-    console.error("❌ Server Error:", err);
+    console.error("Server Error:", err);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     // 🔔 quay lại trạng thái bình thường
@@ -247,19 +262,23 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running!")
+  res.send("ESP32 Chatbot Music Server (iTunes → MP3) is running!")
 );
 
 // ==== Start server (Socket.IO gắn vào HTTP server) ====
-const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
-const io = new Server(server, { cors: { origin: "*" } });
+const server = app.listen(port, () => console.log(`Server listening on port ${port}`));
+
+const io = new Server(server, {
+  cors: { origin: "*" },
+  transports: ["websocket"],   // ép websocket để hợp với client nhúng
+  pingInterval: 25000,
+  pingTimeout: 20000,
+});
+ioRef = io;
 
 io.on("connection", (socket) => {
-  console.log("🔌 ESP connected:", socket.id);
+  console.log("ESP connected:", socket.id);
   socket.emit("status", { event: "status", state: "hello" });
 });
 
-// Helper phát trạng thái qua Socket.IO
-function emitStatus(state, extra = {}) {
-  io.emit("status", { event: "status", state, ...extra });
-}
+// Helper phát trạng thái qua Socket.IO (đặt trên đầu file đã có)
