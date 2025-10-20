@@ -14,7 +14,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
-const { Server } = require("socket.io");
+import { Server } from "socket.io";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
