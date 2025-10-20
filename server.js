@@ -1,27 +1,24 @@
 // =======================
 // ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
-// Compatible with Arduino Socket.IO v3 client
+// Fully compatible with Arduino Socket.IO v3 (EIO=3)
 // =======================
 
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import fs from "fs";
-import path from "path";
-import fetch from "node-fetch";
-import { fileURLToPath } from "url";
-import OpenAI from "openai";
-import dotenv from "dotenv";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import { Server } from "socket.io";
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const fetch = require("node-fetch");
+const OpenAI = require("openai");
+const dotenv = require("dotenv");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
+const { Server } = require("socket.io");
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ==== Setup ====
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 8080;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -88,6 +85,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 
     const localMP3 = localM4A.replace(".m4a", ".mp3");
     emitStatus("processing:convert", { from: "m4a", to: "mp3" });
+
     await new Promise((resolve, reject) => {
       ffmpeg(localM4A)
         .toFormat("mp3")
@@ -149,47 +147,36 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       ).trim();
       console.log(`🎵 Song requested: ${songQuery}`);
 
-      try {
-        const song = await getMusicFromItunesAndConvert(songQuery || "relaxing music", audioDir);
-        const notice =
-          finalLang === "vi"
-            ? `Đang phát bài ${song.title} của ${song.artist}.`
-            : `Playing ${song.title} by ${song.artist}.`;
+      const song = await getMusicFromItunesAndConvert(songQuery || "relaxing music", audioDir);
+      const notice =
+        finalLang === "vi"
+          ? `Đang phát bài ${song.title} của ${song.artist}.`
+          : `Playing ${song.title} by ${song.artist}.`;
 
-        emitStatus("speaking:tts", { lang: finalLang });
-        const tts = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: finalLang === "vi" ? "alloy" : "verse",
-          format: "mp3",
-          input: notice,
-        });
+      emitStatus("speaking:tts", { lang: finalLang });
+      const tts = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: finalLang === "vi" ? "alloy" : "verse",
+        format: "mp3",
+        input: notice,
+      });
 
-        const noticeFile = `tts_${Date.now()}.mp3`;
-        const noticePath = path.join(audioDir, noticeFile);
-        fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
+      const noticeFile = `tts_${Date.now()}.mp3`;
+      const noticePath = path.join(audioDir, noticeFile);
+      fs.writeFileSync(noticePath, Buffer.from(await tts.arrayBuffer()));
 
-        const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-        emitStatus("speaking", { type: "music" });
+      const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+      emitStatus("speaking", { type: "music" });
 
-        res.json({
-          success: true,
-          type: "music",
-          text: notice,
-          audio_url: `${host}/audio/${noticeFile}`,
-          music_url: `${host}/audio/${song.file}`,
-        });
-      } catch (err) {
-        emitStatus("error", { message: err.message });
-        res.json({
-          success: false,
-          text:
-            finalLang === "vi"
-              ? `Không thể phát nhạc: ${err.message}`
-              : `Could not play music: ${err.message}`,
-        });
-      }
+      res.json({
+        success: true,
+        type: "music",
+        text: notice,
+        audio_url: `${host}/audio/${noticeFile}`,
+        music_url: `${host}/audio/${song.file}`,
+      });
     } else {
-      // === 5️⃣ Normal Chat ===
+      // === Normal chat ===
       emitStatus("processing:chat");
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -244,23 +231,21 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("ESP32 Chatbot Music Server (iTunes → MP3, ESP32 compatible) is running!")
+  res.send("ESP32 Chatbot Music Server (iTunes → MP3, EIO=3 compatible) is running!")
 );
 
 // ==== Start server & Socket.IO ====
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
 
-// ✅ Cập nhật để tương thích EIO=3 (Arduino)
 const io = new Server(server, {
   cors: { origin: "*" },
-  allowEIO3: true,          // ✅ Cho phép Arduino EIO=3
-  transports: ["websocket"], // Ưu tiên WebSocket
-  pingInterval: 10000,       // Ping server gửi xuống mỗi 10s
-  pingTimeout: 40000,        // Client có 40s để phản hồi
+  allowEIO3: true,
+  transports: ["websocket"],
+  pingInterval: 10000,
+  pingTimeout: 40000,
 });
 ioRef = io;
 
-// ==== Socket.IO Logs ====
 io.on("connection", (socket) => {
   console.log(`✅ [SOCKET CONNECTED] ID: ${socket.id}`);
   socket.emit("status", { event: "status", state: "hello" });

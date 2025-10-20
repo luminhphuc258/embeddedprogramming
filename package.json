@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "ESP32 Audio AI Server for OpenAI transcription + TTS",
   "main": "server.js",
-  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
@@ -19,7 +18,7 @@
     "tts",
     "whisper"
   ],
-  "author": "Your Name",
+  "author": "Lucie",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/luminhphuc258/embeddedprogramming/issues"
@@ -32,7 +31,7 @@
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
     "multer": "^1.4.5-lts.1",
-    "node-fetch": "^3.3.2",
+    "node-fetch": "^2.6.12",
     "openai": "^4.57.0",
     "socket.io": "^2.4.1",
     "socket.io-client": "^2.4.1"
