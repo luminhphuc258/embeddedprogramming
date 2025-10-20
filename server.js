@@ -194,6 +194,18 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 app.get("/", (_req, res) =>
   res.send("✅ ESP32 REST AI Server is running. Use /status or /ask endpoints.")
 );
+// ==== 2️⃣ Robot update status ====
+app.post("/update", express.json(), (req, res) => {
+  const { robot_state } = req.body;
+  if (!robot_state) {
+    return res.status(400).json({ success: false, error: "Missing robot_state" });
+  }
+  console.log(`🤖 Robot reported state: ${robot_state}`);
+  systemStatus.last_robot_state = robot_state;
+  systemStatus.last_update = new Date().toISOString();
+  res.json({ success: true, message: `State updated: ${robot_state}` });
+});
+
 
 // ==== Start Server ====
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
