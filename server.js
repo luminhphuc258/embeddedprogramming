@@ -13,7 +13,7 @@ const OpenAI = require("openai");
 const dotenv = require("dotenv");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
-const { Server } = require("socket.io");
+const socketio = require("socket.io");
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -237,8 +237,11 @@ app.get("/", (_req, res) =>
 // ==== Start server & Socket.IO ====
 const server = app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
 
-const io = new Server(server, {
-  cors: { origin: "*" },
+// ✅ Socket.IO v2.x syntax (Arduino EIO=3 compatible)
+const socketio = require("socket.io");
+
+const io = socketio(server, {
+  origins: "*:*",           // v2.x syntax for CORS
   allowEIO3: true,
   transports: ["websocket"],
   pingInterval: 10000,
@@ -246,6 +249,7 @@ const io = new Server(server, {
 });
 ioRef = io;
 
+// ==== Socket.IO Logs ====
 io.on("connection", (socket) => {
   console.log(`✅ [SOCKET CONNECTED] ID: ${socket.id}`);
   socket.emit("status", { event: "status", state: "hello" });
@@ -258,3 +262,4 @@ io.on("connection", (socket) => {
     console.log(`❌ [SOCKET DISCONNECTED] ${socket.id} | Reason: ${reason}`);
   });
 });
+
