@@ -125,7 +125,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
-
+    const lower = text.toLowerCase();
     // --- Play music ---
     if (
       lower.includes("play") ||
