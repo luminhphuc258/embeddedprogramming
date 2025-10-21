@@ -39,7 +39,7 @@ fs.mkdirSync(audioDir, { recursive: true });
 
 // ==== Global System Status ====
 let systemStatus = {
-  state: "idle",
+  state: "idle", // idle | speaking | music | error
   message: "Server ready",
   last_update: new Date().toISOString(),
   last_robot_state: "unknown",
@@ -71,7 +71,7 @@ function detectLanguage(text) {
 
 // ==== Helper: download + convert from iTunes ====
 async function getMusicFromItunesAndConvert(query, audioDir) {
-  updateStatus("music_search", `Searching iTunes: ${query}`);
+  updateStatus("music", `Searching iTunes: ${query}`);
   const resp = await fetch(
     `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
   );
@@ -86,7 +86,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   fs.writeFileSync(localM4A, buffer);
 
   const localMP3 = localM4A.replace(".m4a", ".mp3");
-  updateStatus("converting", "Converting to MP3...");
+  updateStatus("music", "Converting to MP3...");
   await new Promise((resolve, reject) => {
     ffmpeg(localM4A)
       .toFormat("mp3")
@@ -95,7 +95,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
       .save(localMP3);
   });
   fs.unlinkSync(localM4A);
-  updateStatus("done", "Music ready");
+  updateStatus("music", "Music ready");
 
   return {
     title: song.trackName,
@@ -124,7 +124,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     const lower = text.toLowerCase();
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-    // --- MUSIC ---
+    // --- MUSIC MODE ---
     if (
       lower.includes("play") ||
       lower.includes("music") ||
@@ -139,9 +139,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
           ? `Đang phát bài ${song.title} của ${song.artist}.`
           : `Playing ${song.title} by ${song.artist}.`;
 
-      updateStatus("playing", notice);
+      updateStatus("music", notice);
 
-      // 🧩 Generate voice notice
+      // 🧩 Generate TTS Notice
       const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: finalLang === "vi" ? "alloy" : "verse",
@@ -152,7 +152,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const noticeFile = `tts_${Date.now()}.mp3`;
       fs.writeFileSync(path.join(audioDir, noticeFile), Buffer.from(await tts.arrayBuffer()));
 
-      // ✅ FIXED: send plain JSON with correct keys for ESP32
       res.setHeader("Content-Type", "application/json");
       res.send(
         JSON.stringify({
@@ -163,11 +162,14 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
           music_url: `${host}/audio/${song.file}`,
         })
       );
+
+      // Khi nhạc sẵn sàng → về lại idle sau 10s
+      setTimeout(() => updateStatus("idle", "Server ready"), 10000);
       return;
     }
 
-    // --- CHAT ---
-    updateStatus("chatting", "Generating reply...");
+    // --- CHAT / SPEAKING MODE ---
+    updateStatus("speaking", "Generating reply...");
     const chat = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -194,7 +196,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     const filename = `tts_${Date.now()}.mp3`;
     fs.writeFileSync(path.join(audioDir, filename), Buffer.from(await tts.arrayBuffer()));
-    updateStatus("done", "TTS ready");
+    updateStatus("speaking", "TTS ready");
 
     res.setHeader("Content-Type", "application/json");
     res.send(
@@ -206,11 +208,15 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       })
     );
 
+    // Sau 8s, chuyển về idle để client hiển thị mặt robot
+    setTimeout(() => updateStatus("idle", "Server ready"), 8000);
+
     fs.unlinkSync(req.file.path);
   } catch (err) {
     updateStatus("error", err.message);
     res.setHeader("Content-Type", "application/json");
     res.send(JSON.stringify({ success: false, error: err.message }));
+    setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
   }
 });
 
@@ -237,7 +243,7 @@ app.get("/status", (_req, res) => {
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running!")
+  res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running and synced with robot!")
 );
 
 // ==== Start server ====
