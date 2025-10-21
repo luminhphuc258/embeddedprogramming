@@ -2,8 +2,6 @@
 // ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
 // + Robot Status Update (ESP32 polling)
 // =======================
-// Node 18+
-// npm i express cors multer openai node-fetch dotenv fluent-ffmpeg ffmpeg-static
 
 import express from "express";
 import cors from "cors";
@@ -79,8 +77,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   );
   if (!resp.ok) throw new Error(`Search failed (${resp.status})`);
   const data = await resp.json();
-  if (!data.results || data.results.length === 0)
-    throw new Error("Không tìm thấy bài hát trên iTunes.");
+  if (!data.results?.length) throw new Error("Không tìm thấy bài hát trên iTunes.");
 
   const song = data.results[0];
   const res = await fetch(song.previewUrl);
@@ -97,7 +94,6 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
       .on("error", reject)
       .save(localMP3);
   });
-
   fs.unlinkSync(localM4A);
   updateStatus("done", "Music ready");
 
@@ -108,11 +104,13 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   };
 }
 
-// ==== ROUTE: Ask (Speech → Chat / Music) ====
+// ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
-      return res.status(400).json({ success: false, error: "No audio file uploaded" });
+      return res
+        .status(400)
+        .send(JSON.stringify({ success: false, error: "No audio file uploaded" }));
 
     updateStatus("processing", "Transcribing...");
     const stt = await openai.audio.transcriptions.create({
@@ -121,12 +119,12 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     });
 
     const text = stt.text.trim();
-    console.log(`🧠 Transcribed: ${text}`);
-
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
-    // --- Play music ---
+    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+
+    // --- MUSIC ---
     if (
       lower.includes("play") ||
       lower.includes("music") ||
@@ -136,21 +134,39 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       lower.includes("nghe")
     ) {
       const song = await getMusicFromItunesAndConvert(text, audioDir);
-      const msg =
+      const notice =
         finalLang === "vi"
           ? `Đang phát bài ${song.title} của ${song.artist}.`
           : `Playing ${song.title} by ${song.artist}.`;
 
-      updateStatus("playing", msg);
-      return res.json({
-        success: true,
-        type: "music",
-        text: msg,
-        url: `/audio/${song.file}`,
+      updateStatus("playing", notice);
+
+      // 🧩 Generate voice notice
+      const tts = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: finalLang === "vi" ? "alloy" : "verse",
+        format: "mp3",
+        input: notice,
       });
+
+      const noticeFile = `tts_${Date.now()}.mp3`;
+      fs.writeFileSync(path.join(audioDir, noticeFile), Buffer.from(await tts.arrayBuffer()));
+
+      // ✅ FIXED: send plain JSON with correct keys for ESP32
+      res.setHeader("Content-Type", "application/json");
+      res.send(
+        JSON.stringify({
+          success: true,
+          type: "music",
+          text: notice,
+          audio_url: `${host}/audio/${noticeFile}`,
+          music_url: `${host}/audio/${song.file}`,
+        })
+      );
+      return;
     }
 
-    // --- Normal chat ---
+    // --- CHAT ---
     updateStatus("chatting", "Generating reply...");
     const chat = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -168,8 +184,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     });
 
     const answer = chat.choices[0].message.content.trim();
-    console.log(`💬 Answer: ${answer}`);
-
     updateStatus("speaking", "Generating TTS...");
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
@@ -182,18 +196,21 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     fs.writeFileSync(path.join(audioDir, filename), Buffer.from(await tts.arrayBuffer()));
     updateStatus("done", "TTS ready");
 
-    res.json({
-      success: true,
-      type: "chat",
-      text: answer,
-      url: `/audio/${filename}`,
-    });
+    res.setHeader("Content-Type", "application/json");
+    res.send(
+      JSON.stringify({
+        success: true,
+        type: "chat",
+        text: answer,
+        audio_url: `${host}/audio/${filename}`,
+      })
+    );
 
     fs.unlinkSync(req.file.path);
   } catch (err) {
     updateStatus("error", err.message);
-    console.error("❌ Server Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    res.setHeader("Content-Type", "application/json");
+    res.send(JSON.stringify({ success: false, error: err.message }));
   }
 });
 
@@ -201,16 +218,22 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 app.post("/update", (req, res) => {
   const { robot_state } = req.body || {};
   if (!robot_state)
-    return res.status(400).json({ success: false, error: "Missing robot_state" });
+    return res
+      .status(400)
+      .send(JSON.stringify({ success: false, error: "Missing robot_state" }));
 
   systemStatus.last_robot_state = robot_state;
   systemStatus.last_update = new Date().toISOString();
   console.log(`🤖 Robot reported: ${robot_state}`);
-  res.json({ success: true, message: `State updated: ${robot_state}` });
+  res.setHeader("Content-Type", "application/json");
+  res.send(JSON.stringify({ success: true, message: `State updated: ${robot_state}` }));
 });
 
 // ==== ROUTE: ESP32 polls current system status ====
-app.get("/status", (_req, res) => res.json(systemStatus));
+app.get("/status", (_req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.send(JSON.stringify(systemStatus));
+});
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
