@@ -246,5 +246,49 @@ app.get("/", (_req, res) =>
   res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running and synced with robot!")
 );
 
+// ==== ROUTE: Generate Doraemon greeting ====
+app.get("/greeting", async (req, res) => {
+  try {
+    updateStatus("speaking", "Generating Doraemon greeting...");
+
+    const text = "Mình là Doraemon, rất vui được gặp bạn.";
+    const tts = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice: "alloy", // giọng tự nhiên, nhẹ nhàng
+      format: "mp3",
+      input: text,
+    });
+
+    const filename = `doraemon_greeting_${Date.now()}.mp3`;
+    const filePath = path.join(audioDir, filename);
+    fs.writeFileSync(filePath, Buffer.from(await tts.arrayBuffer()));
+
+    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+    const audioUrl = `${host}/audio/${filename}`;
+
+    console.log(`🎤 Doraemon greeting generated → ${audioUrl}`);
+
+    updateStatus("speaking", "Doraemon greeting ready");
+
+    res.setHeader("Content-Type", "application/json");
+    res.send(
+      JSON.stringify({
+        success: true,
+        type: "greeting",
+        text: text,
+        audio_url: audioUrl,
+      })
+    );
+
+    // 8s sau trở lại idle
+    setTimeout(() => updateStatus("idle", "Server ready"), 8000);
+  } catch (err) {
+    console.error("❌ Greeting error:", err);
+    updateStatus("error", err.message);
+    res.status(500).json({ success: false, error: err.message });
+    setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
+  }
+});
+
 // ==== Start server ====
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
