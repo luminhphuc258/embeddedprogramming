@@ -50,7 +50,7 @@ function updateStatus(state, message = "") {
   systemStatus.state = state;
   if (message) systemStatus.message = message;
   systemStatus.last_update = new Date().toISOString();
-  console.log(`📡 STATUS: ${state} → ${message}`);
+  //console.log(`📡 STATUS: ${state} → ${message}`);
 }
 
 // ==== Multer for audio upload ====
@@ -112,13 +112,33 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         .status(400)
         .send(JSON.stringify({ success: false, error: "No audio file uploaded" }));
 
-    updateStatus("processing", "Transcribing...");
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(req.file.path),
-      model: "gpt-4o-mini-transcribe",
+    updateStatus("processing", "Transcribing with DeepSeek...");
+
+    // --- TRANSCRIBE bằng DeepSeek ---
+    const deepseekResp = await fetch("https://api.deepseek.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`, // thêm vào file .env
+      },
+      body: (() => {
+        const form = new FormData();
+        form.append("model", "deepseek-whisper-large-v2"); // model của DeepSeek hỗ trợ tiếng Việt tốt
+        form.append("language", "vi");
+        form.append("file", fs.createReadStream(req.file.path));
+        return form;
+      })(),
     });
 
-    const text = stt.text.trim();
+    if (!deepseekResp.ok) {
+      const errText = await deepseekResp.text();
+      throw new Error(`DeepSeek API error: ${deepseekResp.status} ${errText}`);
+    }
+
+    const deepseekData = await deepseekResp.json();
+    const text = (deepseekData.text || "").trim();
+
+    if (!text) throw new Error("Không nhận được kết quả từ DeepSeek");
+    console.log(`=========> Transcription nek: ${text}`);
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
@@ -141,7 +161,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
       updateStatus("music", notice);
 
-      // 🧩 Generate TTS Notice
       const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: finalLang === "vi" ? "alloy" : "verse",
@@ -163,7 +182,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         })
       );
 
-      // Khi nhạc sẵn sàng → về lại idle sau 10s
       setTimeout(() => updateStatus("idle", "Server ready"), 10000);
       return;
     }
@@ -208,10 +226,9 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       })
     );
 
-    // Sau 8s, chuyển về idle để client hiển thị mặt robot
     setTimeout(() => updateStatus("idle", "Server ready"), 8000);
-
     fs.unlinkSync(req.file.path);
+
   } catch (err) {
     updateStatus("error", err.message);
     res.setHeader("Content-Type", "application/json");
@@ -219,6 +236,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
   }
 });
+
 
 // ==== ROUTE: Robot sends status ====
 app.post("/update", (req, res) => {
@@ -230,7 +248,7 @@ app.post("/update", (req, res) => {
 
   systemStatus.last_robot_state = robot_state;
   systemStatus.last_update = new Date().toISOString();
-  console.log(`🤖 Robot reported: ${robot_state}`);
+  //console.log(`🤖 Robot reported: ${robot_state}`);
   res.setHeader("Content-Type", "application/json");
   res.send(JSON.stringify({ success: true, message: `State updated: ${robot_state}` }));
 });
