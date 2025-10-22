@@ -1,6 +1,5 @@
 // =======================
-// ESP32 Chatbot + Music Server (iTunes + OpenAI TTS + Auto Convert to MP3)
-// + Robot Status Update (ESP32 polling)
+// ESP32 Chatbot + Music Server (Whisper STT + DeepSeek Chat + OpenAI TTS + iTunes Music)
 // =======================
 
 import express from "express";
@@ -14,7 +13,6 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
-import FormData from "form-data";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -46,12 +44,11 @@ let systemStatus = {
   last_robot_state: "unknown",
 };
 
-// ==== Helper: update system status ====
 function updateStatus(state, message = "") {
   systemStatus.state = state;
   if (message) systemStatus.message = message;
   systemStatus.last_update = new Date().toISOString();
-  //console.log(`📡 STATUS: ${state} → ${message}`);
+  console.log(`📡 STATUS: ${state} → ${message}`);
 }
 
 // ==== Multer for audio upload ====
@@ -111,36 +108,20 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     if (!req.file)
       return res
         .status(400)
-        .send(JSON.stringify({ success: false, error: "No audio file uploaded" }));
+        .json({ success: false, error: "No audio file uploaded" });
 
-    updateStatus("processing", "Transcribing with DeepSeek...");
+    updateStatus("processing", "Transcribing with Whisper...");
 
-    // --- TRANSCRIBE bằng DeepSeek ---
-    const deepseekResp = await fetch("https://api.deepseek.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`, // thêm vào file .env
-      },
-      body: (() => {
-        const form = new FormData();
-        form.append("model", "deepseek-whisper-large-v2"); // model của DeepSeek hỗ trợ tiếng Việt tốt
-        form.append("language", "vi");
-        form.append("file", fs.createReadStream(req.file.path));
-        return form;
-      })(),
+    // 🎙️ TRANSCRIBE bằng OpenAI Whisper
+    const stt = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(req.file.path),
+      model: "whisper-1",
+      language: "vi",
     });
 
-    if (!deepseekResp.ok) {
-      const errText = await deepseekResp.text();
-      console.log("❌ DeepSeek response error:", errText);
-      throw new Error(`DeepSeek API error: ${deepseekResp.status} ${errText}`);
-    }
+    const text = stt.text.trim();
+    console.log("🎧 Whisper transcript:", text);
 
-    const deepseekData = await deepseekResp.json();
-    const text = await (deepseekData.text || "").trim();
-
-    if (!text) throw new Error("Không nhận được kết quả từ DeepSeek");
-    console.log(`=========> Transcription nek: ${text}`);
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
@@ -163,6 +144,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
       updateStatus("music", notice);
 
+      // 🔊 Generate TTS
       const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: finalLang === "vi" ? "alloy" : "verse",
@@ -173,40 +155,52 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const noticeFile = `tts_${Date.now()}.mp3`;
       fs.writeFileSync(path.join(audioDir, noticeFile), Buffer.from(await tts.arrayBuffer()));
 
-      res.setHeader("Content-Type", "application/json");
-      res.send(
-        JSON.stringify({
-          success: true,
-          type: "music",
-          text: notice,
-          audio_url: `${host}/audio/${noticeFile}`,
-          music_url: `${host}/audio/${song.file}`,
-        })
-      );
-
-      setTimeout(() => updateStatus("idle", "Server ready"), 10000);
-      return;
+      return res.json({
+        success: true,
+        type: "music",
+        text: notice,
+        audio_url: `${host}/audio/${noticeFile}`,
+        music_url: `${host}/audio/${song.file}`,
+      });
     }
 
     // --- CHAT / SPEAKING MODE ---
-    updateStatus("speaking", "Generating reply...");
-    const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            finalLang === "vi"
-              ? "Bạn là một cô gái trẻ thân thiện, trả lời ngắn gọn bằng tiếng Việt tự nhiên."
-              : "You are a friendly young woman speaking natural English, short and casual.",
-        },
-        { role: "user", content: text },
-      ],
-      temperature: 0.8,
+    updateStatus("speaking", "Generating reply (DeepSeek)...");
+
+    // 💬 ChatCompletion bằng DeepSeek
+    const deepseekResp = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content:
+              finalLang === "vi"
+                ? "Bạn là một cô gái vui vẻ, nói chuyện thân thiện bằng tiếng Việt tự nhiên."
+                : "You are a friendly young woman speaking casual English.",
+          },
+          { role: "user", content: text },
+        ],
+        temperature: 0.9,
+      }),
     });
 
-    const answer = chat.choices[0].message.content.trim();
+    if (!deepseekResp.ok) {
+      const errText = await deepseekResp.text();
+      throw new Error(`DeepSeek API error: ${errText}`);
+    }
+
+    const deepseekData = await deepseekResp.json();
+    const answer = deepseekData.choices?.[0]?.message?.content?.trim() || "Xin lỗi, tôi chưa nghe rõ.";
+
     updateStatus("speaking", "Generating TTS...");
+
+    // 🗣️ TTS bằng OpenAI
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: finalLang === "vi" ? "alloy" : "verse",
@@ -216,29 +210,25 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     const filename = `tts_${Date.now()}.mp3`;
     fs.writeFileSync(path.join(audioDir, filename), Buffer.from(await tts.arrayBuffer()));
+
     updateStatus("speaking", "TTS ready");
 
-    res.setHeader("Content-Type", "application/json");
-    res.send(
-      JSON.stringify({
-        success: true,
-        type: "chat",
-        text: answer,
-        audio_url: `${host}/audio/${filename}`,
-      })
-    );
+    res.json({
+      success: true,
+      type: "chat",
+      text: answer,
+      audio_url: `${host}/audio/${filename}`,
+    });
 
     setTimeout(() => updateStatus("idle", "Server ready"), 8000);
     fs.unlinkSync(req.file.path);
-
   } catch (err) {
+    console.error("❌ Error:", err.message);
     updateStatus("error", err.message);
-    res.setHeader("Content-Type", "application/json");
-    res.send(JSON.stringify({ success: false, error: err.message }));
+    res.json({ success: false, error: err.message });
     setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
   }
 });
-
 
 // ==== ROUTE: Robot sends status ====
 app.post("/update", (req, res) => {
@@ -246,69 +236,21 @@ app.post("/update", (req, res) => {
   if (!robot_state)
     return res
       .status(400)
-      .send(JSON.stringify({ success: false, error: "Missing robot_state" }));
+      .json({ success: false, error: "Missing robot_state" });
 
   systemStatus.last_robot_state = robot_state;
   systemStatus.last_update = new Date().toISOString();
-  //console.log(`🤖 Robot reported: ${robot_state}`);
-  res.setHeader("Content-Type", "application/json");
-  res.send(JSON.stringify({ success: true, message: `State updated: ${robot_state}` }));
+  console.log(`🤖 Robot reported: ${robot_state}`);
+  res.json({ success: true, message: `State updated: ${robot_state}` });
 });
 
 // ==== ROUTE: ESP32 polls current system status ====
-app.get("/status", (_req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.send(JSON.stringify(systemStatus));
-});
+app.get("/status", (_req, res) => res.json(systemStatus));
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Music Server (iTunes → MP3) is running and synced with robot!")
+  res.send("✅ ESP32 Chatbot Server (Whisper + DeepSeek + TTS + Music) is running!")
 );
-
-// ==== ROUTE: Generate Doraemon greeting ====
-app.get("/greeting", async (req, res) => {
-  try {
-    updateStatus("speaking", "Generating Doraemon greeting...");
-
-    const text = "Mình là Doraemon, rất vui được gặp bạn.";
-    const tts = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: "alloy", // giọng tự nhiên, nhẹ nhàng
-      format: "mp3",
-      input: text,
-    });
-
-    const filename = `doraemon_greeting_${Date.now()}.mp3`;
-    const filePath = path.join(audioDir, filename);
-    fs.writeFileSync(filePath, Buffer.from(await tts.arrayBuffer()));
-
-    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-    const audioUrl = `${host}/audio/${filename}`;
-
-    console.log(`🎤 Doraemon greeting generated → ${audioUrl}`);
-
-    updateStatus("speaking", "Doraemon greeting ready");
-
-    res.setHeader("Content-Type", "application/json");
-    res.send(
-      JSON.stringify({
-        success: true,
-        type: "greeting",
-        text: text,
-        audio_url: audioUrl,
-      })
-    );
-
-    // 8s sau trở lại idle
-    setTimeout(() => updateStatus("idle", "Server ready"), 8000);
-  } catch (err) {
-    console.error("❌ Greeting error:", err);
-    updateStatus("error", err.message);
-    res.status(500).json({ success: false, error: err.message });
-    setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
-  }
-});
 
 // ==== Start server ====
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
