@@ -102,7 +102,6 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   };
 }
 
-import FormData from "form-data";
 
 // ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
