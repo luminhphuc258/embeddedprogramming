@@ -14,6 +14,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+import FormData from "form-data";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -131,11 +132,12 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     if (!deepseekResp.ok) {
       const errText = await deepseekResp.text();
+      console.log("❌ DeepSeek response error:", errText);
       throw new Error(`DeepSeek API error: ${deepseekResp.status} ${errText}`);
     }
 
     const deepseekData = await deepseekResp.json();
-    const text = (deepseekData.text || "").trim();
+    const text = await (deepseekData.text || "").trim();
 
     if (!text) throw new Error("Không nhận được kết quả từ DeepSeek");
     console.log(`=========> Transcription nek: ${text}`);
