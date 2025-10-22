@@ -1,5 +1,6 @@
 // =======================
-// ESP32 Chatbot + Music Server (Whisper STT + DeepSeek Chat + OpenAI TTS + iTunes Music)
+// ESP32 Chatbot + Music Server
+// (Together Whisper v3 + DeepSeek Chat + OpenAI TTS + iTunes Music)
 // =======================
 
 import express from "express";
@@ -38,7 +39,7 @@ fs.mkdirSync(audioDir, { recursive: true });
 
 // ==== Global System Status ====
 let systemStatus = {
-  state: "idle", // idle | speaking | music | error
+  state: "idle",
   message: "Server ready",
   last_update: new Date().toISOString(),
   last_robot_state: "unknown",
@@ -102,45 +103,42 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   };
 }
 
-
 // ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
-    updateStatus("processing", "Transcribing with DeepSeek Whisper...");
-
-    // 🎧 1️⃣ TRANSCRIBE bằng DeepSeek Whisper API
+    // 1️⃣ TRANSCRIBE with Together.ai Whisper large-v3
+    updateStatus("processing", "Transcribing with Together.ai Whisper Large-v3...");
     const form = new FormData();
-    form.append("model", "deepseek-whisper-large-v2"); // model hỗ trợ tiếng Việt
-    form.append("language", "vi");
+    form.append("model", "openai/whisper-large-v3");
     form.append("file", fs.createReadStream(req.file.path));
 
-    const deepseekResp = await fetch("https://api.deepseek.com/v1/audio/transcriptions", {
+    const togetherWhisper = await fetch("https://api.together.xyz/v1/audio/transcriptions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${process.env.TOGETHER_API_KEY}`,
         ...form.getHeaders(),
       },
       body: form,
     });
 
-    if (!deepseekResp.ok) {
-      const errText = await deepseekResp.text();
-      throw new Error(`DeepSeek API error: ${errText}`);
+    if (!togetherWhisper.ok) {
+      const errText = await togetherWhisper.text();
+      throw new Error(`Together.ai Whisper error: ${errText}`);
     }
 
-    const deepseekData = await deepseekResp.json();
-    const text = (deepseekData.text || "").trim();
-    console.log("🎙️ DeepSeek transcript:", text);
+    const whisperData = await togetherWhisper.json();
+    const text = (whisperData.text || "").trim();
+    console.log("🎙️ Together Whisper transcript:", text);
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-    // 🎵 2️⃣ MUSIC MODE
+    // 2️⃣ MUSIC MODE
     if (
       lower.includes("play") ||
       lower.includes("music") ||
@@ -176,17 +174,16 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // 💬 3️⃣ CHAT MODE — Together.ai (Gemma)
-    updateStatus("speaking", "Generating reply (Gemma via Together.ai)...");
-
-    const togetherResp = await fetch("https://api.together.xyz/v1/chat/completions", {
+    // 3️⃣ CHAT MODE — DeepSeek Chat
+    updateStatus("speaking", "Generating reply (DeepSeek Chat)...");
+    const deepseekResp = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.TOGETHER_API_KEY}`,
+        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemma-3n-E4B-it", // model bạn chọn
+        model: "deepseek-chat",
         messages: [
           {
             role: "system",
@@ -201,19 +198,19 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }),
     });
 
-    if (!togetherResp.ok) {
-      const errText = await togetherResp.text();
-      throw new Error(`Together.ai API error: ${errText}`);
+    if (!deepseekResp.ok) {
+      const errText = await deepseekResp.text();
+      throw new Error(`DeepSeek Chat error: ${errText}`);
     }
 
-    const togetherData = await togetherResp.json();
+    const deepseekData = await deepseekResp.json();
     const answer =
-      togetherData.choices?.[0]?.message?.content?.trim() ||
+      deepseekData.choices?.[0]?.message?.content?.trim() ||
       "Xin lỗi, mình chưa nghe rõ lắm.";
 
-    console.log("💬 Together.ai reply:", answer);
+    console.log("💬 DeepSeek reply:", answer);
 
-    // 🔊 4️⃣ TTS bằng OpenAI
+    // 4️⃣ TTS using OpenAI
     updateStatus("speaking", "Generating TTS...");
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
@@ -235,7 +232,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     setTimeout(() => updateStatus("idle", "Server ready"), 8000);
     fs.unlinkSync(req.file.path);
-
   } catch (err) {
     console.error("❌ Error:", err.message);
     updateStatus("error", err.message);
@@ -244,15 +240,11 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
   }
 });
 
-
-
-// ==== ROUTE: Robot sends status ====
+// ==== ROUTE: Robot updates ====
 app.post("/update", (req, res) => {
   const { robot_state } = req.body || {};
   if (!robot_state)
-    return res
-      .status(400)
-      .json({ success: false, error: "Missing robot_state" });
+    return res.status(400).json({ success: false, error: "Missing robot_state" });
 
   systemStatus.last_robot_state = robot_state;
   systemStatus.last_update = new Date().toISOString();
@@ -260,12 +252,12 @@ app.post("/update", (req, res) => {
   res.json({ success: true, message: `State updated: ${robot_state}` });
 });
 
-// ==== ROUTE: ESP32 polls current system status ====
+// ==== ROUTE: ESP32 polls status ====
 app.get("/status", (_req, res) => res.json(systemStatus));
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Server (Whisper + DeepSeek + TTS + Music) is running!")
+  res.send("✅ ESP32 Chatbot Server (Together Whisper + DeepSeek Chat + OpenAI TTS + Music) is running!")
 );
 
 // ==== Start server ====
