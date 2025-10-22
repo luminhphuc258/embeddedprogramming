@@ -13,7 +13,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
-
+import FormData from "form-data";
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -102,24 +102,39 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   };
 }
 
-// ==== ROUTE: ASK ====
+import FormData from "form-data";
+
 // ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
-    updateStatus("processing", "Transcribing with Whisper...");
+    updateStatus("processing", "Transcribing with DeepSeek Whisper...");
 
-    // 🎧 1️⃣ STT bằng OpenAI Whisper
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(req.file.path),
-      model: "whisper-1",
-      language: "vi",
+    // 🎧 1️⃣ TRANSCRIBE bằng DeepSeek Whisper API
+    const form = new FormData();
+    form.append("model", "deepseek-whisper-large-v2"); // model hỗ trợ tiếng Việt
+    form.append("language", "vi");
+    form.append("file", fs.createReadStream(req.file.path));
+
+    const deepseekResp = await fetch("https://api.deepseek.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        ...form.getHeaders(),
+      },
+      body: form,
     });
 
-    const text = stt.text.trim();
-    console.log("🎙️ Whisper transcript:", text);
+    if (!deepseekResp.ok) {
+      const errText = await deepseekResp.text();
+      throw new Error(`DeepSeek API error: ${errText}`);
+    }
+
+    const deepseekData = await deepseekResp.json();
+    const text = (deepseekData.text || "").trim();
+    console.log("🎙️ DeepSeek transcript:", text);
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
@@ -162,8 +177,8 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // 💬 3️⃣ CHAT MODE với Together.ai (Gemma)
-    updateStatus("speaking", "Generating reply (Gemma)...");
+    // 💬 3️⃣ CHAT MODE — Together.ai (Gemma)
+    updateStatus("speaking", "Generating reply (Gemma via Together.ai)...");
 
     const togetherResp = await fetch("https://api.together.xyz/v1/chat/completions", {
       method: "POST",
@@ -172,7 +187,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemma-3n-E4B-it", // 🔥 model bạn chọn
+        model: "google/gemma-3n-E4B-it", // model bạn chọn
         messages: [
           {
             role: "system",
@@ -197,7 +212,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       togetherData.choices?.[0]?.message?.content?.trim() ||
       "Xin lỗi, mình chưa nghe rõ lắm.";
 
-    console.log("💬 Gemma reply:", answer);
+    console.log("💬 Together.ai reply:", answer);
 
     // 🔊 4️⃣ TTS bằng OpenAI
     updateStatus("speaking", "Generating TTS...");
@@ -229,6 +244,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
   }
 });
+
 
 
 // ==== ROUTE: Robot sends status ====
