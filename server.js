@@ -103,16 +103,15 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 }
 
 // ==== ROUTE: ASK ====
+// ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
-      return res
-        .status(400)
-        .json({ success: false, error: "No audio file uploaded" });
+      return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
     updateStatus("processing", "Transcribing with Whisper...");
 
-    // 🎙️ TRANSCRIBE bằng OpenAI Whisper
+    // 🎧 1️⃣ STT bằng OpenAI Whisper
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
       model: "whisper-1",
@@ -120,14 +119,14 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     });
 
     const text = stt.text.trim();
-    console.log("🎧 Whisper transcript:", text);
+    console.log("🎙️ Whisper transcript:", text);
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-    // --- MUSIC MODE ---
+    // 🎵 2️⃣ MUSIC MODE
     if (
       lower.includes("play") ||
       lower.includes("music") ||
@@ -144,7 +143,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
       updateStatus("music", notice);
 
-      // 🔊 Generate TTS
       const tts = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: finalLang === "vi" ? "alloy" : "verse",
@@ -164,43 +162,45 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // --- CHAT / SPEAKING MODE ---
-    updateStatus("speaking", "Generating reply (DeepSeek)...");
+    // 💬 3️⃣ CHAT MODE với Together.ai (Gemma)
+    updateStatus("speaking", "Generating reply (Gemma)...");
 
-    // 💬 ChatCompletion bằng DeepSeek
-    const deepseekResp = await fetch("https://api.together.xyz/v1/chat/completions", {
+    const togetherResp = await fetch("https://api.together.xyz/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.TOGETHER_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "google/gemma-3n-E4B-it", // 🔥 model bạn chọn
         messages: [
           {
             role: "system",
             content:
               finalLang === "vi"
-                ? "Bạn là một cô gái vui vẻ, nói chuyện thân thiện bằng tiếng Việt tự nhiên."
-                : "You are a friendly young woman speaking casual English.",
+                ? "Bạn là một cô gái trẻ thân thiện, nói chuyện tự nhiên và dễ thương bằng tiếng Việt."
+                : "You are a friendly young woman speaking natural English.",
           },
           { role: "user", content: text },
         ],
-        temperature: 0.9,
+        temperature: 0.8,
       }),
     });
 
-    if (!deepseekResp.ok) {
-      const errText = await deepseekResp.text();
-      throw new Error(`DeepSeek API error: ${errText}`);
+    if (!togetherResp.ok) {
+      const errText = await togetherResp.text();
+      throw new Error(`Together.ai API error: ${errText}`);
     }
 
-    const deepseekData = await deepseekResp.json();
-    const answer = deepseekData.choices?.[0]?.message?.content?.trim() || "Xin lỗi, tôi chưa nghe rõ.";
+    const togetherData = await togetherResp.json();
+    const answer =
+      togetherData.choices?.[0]?.message?.content?.trim() ||
+      "Xin lỗi, mình chưa nghe rõ lắm.";
 
+    console.log("💬 Gemma reply:", answer);
+
+    // 🔊 4️⃣ TTS bằng OpenAI
     updateStatus("speaking", "Generating TTS...");
-
-    // 🗣️ TTS bằng OpenAI
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: finalLang === "vi" ? "alloy" : "verse",
@@ -210,7 +210,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     const filename = `tts_${Date.now()}.mp3`;
     fs.writeFileSync(path.join(audioDir, filename), Buffer.from(await tts.arrayBuffer()));
-
     updateStatus("speaking", "TTS ready");
 
     res.json({
@@ -222,6 +221,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     setTimeout(() => updateStatus("idle", "Server ready"), 8000);
     fs.unlinkSync(req.file.path);
+
   } catch (err) {
     console.error("❌ Error:", err.message);
     updateStatus("error", err.message);
@@ -229,6 +229,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     setTimeout(() => updateStatus("idle", "Recovered from error"), 5000);
   }
 });
+
 
 // ==== ROUTE: Robot sends status ====
 app.post("/update", (req, res) => {
