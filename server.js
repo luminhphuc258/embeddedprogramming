@@ -168,10 +168,10 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     updateStatus("speaking", "Generating reply (DeepSeek)...");
 
     // 💬 ChatCompletion bằng DeepSeek
-    const deepseekResp = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    const deepseekResp = await fetch("https://api.together.xyz/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Authorization": `Bearer ${process.env.TOGETHER_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
