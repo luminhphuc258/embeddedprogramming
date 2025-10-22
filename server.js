@@ -108,29 +108,22 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({ success: false, error: "No audio file uploaded" });
-
-    updateStatus("processing", "Transcribing with Together.ai Whisper Large-v3...");
-    const form = new FormData();
-    form.append("model", "openai/whisper-large-v3");
-    form.append("file", fs.createReadStream(req.file.path));
-
-    const togetherWhisper = await fetch("https://api.together.xyz/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.TOGETHER_API_KEY}`,
-        ...form.getHeaders(),
-      },
-      body: form,
-    });
-
-    if (!togetherWhisper.ok) {
-      const errText = await togetherWhisper.text();
-      throw new Error(`Together.ai Whisper error: ${errText}`);
+    if (systemStatus.state !== "idle") {
+      console.log("--> Server busy, let wait...:", systemStatus.state);
+      return res.status(429).json({ success: false, error: "Server busy. Try again later." });
     }
 
-    const whisperData = await togetherWhisper.json();
-    const text = (whisperData.text || "").trim();
-    console.log("🎙️ Together Whisper transcript:", text);
+    updateStatus("processing", "Transcribing with Whisper...");
+
+    // 🎧 1️⃣ STT bằng OpenAI Whisper
+    const stt = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(req.file.path),
+      model: "whisper-1",
+      language: "vi",
+    });
+
+    const text = stt.text.trim();
+    console.log("🎙️ Whisper transcript:", text);
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
