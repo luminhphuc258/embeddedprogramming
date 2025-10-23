@@ -14,9 +14,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
-import FormData from "form-data";
 import { Console } from "console";
-import { use } from "react";
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
 
