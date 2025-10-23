@@ -1,6 +1,6 @@
 // =======================
 // ESP32 Chatbot + Music Server
-// STT: OpenAI gpt-4o-mini-transcribe
+// STT: Deepgram (vi) + ffmpeg enhance
 // Chat: Together.ai (Google/Gemma)
 // TTS: OpenAI gpt-4o-mini-tts
 // Music: iTunes preview + ffmpeg
@@ -29,13 +29,12 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const STT_MODEL = "gpt-4o-mini-transcribe"; // STT model bạn chọn
 
 // ---- Middleware
 app.enable("trust proxy");
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public")); // để serve /public/audio/*.mp3
+app.use(express.static("public")); // serve /public/audio/*.mp3
 
 // ---- Dirs
 const uploadsDir = path.join(__dirname, "uploads");
@@ -55,6 +54,87 @@ function updateStatus(state, message = "") {
   if (message) systemStatus.message = message;
   systemStatus.last_update = new Date().toISOString();
   console.log(`STATUS: ${state} → ${message}`);
+}
+
+// ---- Helpers ----
+function detectLanguage(text) {
+  const hasVN = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
+  const hasEN = /[a-zA-Z]/.test(text);
+  if (hasVN && !hasEN) return "vi";
+  if (hasEN && !hasVN) return "en";
+  return "mixed";
+}
+
+// Làm sạch câu nói để lấy từ khoá bài hát/ca sĩ
+function extractSongQuery(raw) {
+  const q = (raw || "")
+    .toLowerCase()
+    .replace(/[.?!,;:]/g, " ")
+    .replace(/\b(play|music|song|bật|mở|phát|bài|bài hát|nhạc|nghe|cho tôi nghe|mở nhạc|mở bài)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return q;
+}
+
+async function getAudioDuration(filePath) {
+  try {
+    const metadata = await mm.parseFile(filePath);
+    const dur = metadata.format.duration || 0;
+    console.log(`=> audio duration: ${dur}s`);
+    return Math.floor(dur * 1000);
+  } catch (e) {
+    console.error("Lỗi đọc file âm thanh:", e.message);
+    updateStatus("error", "Lỗi khi đọc file âm thanh.");
+    return 0;
+  }
+}
+
+// Enhance audio cho STT: 16kHz mono, reduce noise, normalize
+async function enhanceForSTT(inputPath) {
+  const outPath = inputPath.replace(/\.[\w]+$/, "_enh16k.wav");
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .audioFilter([
+        "highpass=f=100",
+        "lowpass=f=3800",
+        "afftdn=nr=18",
+        "acompressor=threshold=-20dB:ratio=3:attack=200:release=1000",
+        "loudnorm=I=-23:TP=-2:LRA=7",
+        "aformat=sample_fmts=s16:channel_layouts=mono:sample_rates=16000",
+      ])
+      .audioCodec("pcm_s16le")
+      .on("end", () => resolve(outPath))
+      .on("error", reject)
+      .save(outPath);
+  });
+}
+
+// Deepgram prerecorded transcription (Vietnamese)
+async function transcribeDeepgram(filePath) {
+  const url =
+    "https://api.deepgram.com/v1/listen" +
+    "?model=nova-2-general" +      // model mới & tốt
+    "&language=vi" +               // tiếng Việt
+    "&punctuate=true" +            // chấm câu
+    "&smart_format=true";          // viết hoa, số...
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+      "Content-Type": "audio/wav", // mình gửi WAV 16k mono
+    },
+    body: fs.createReadStream(filePath),
+  });
+
+  if (!resp.ok) {
+    const errTxt = await resp.text().catch(() => "");
+    throw new Error(`Deepgram error ${resp.status}: ${errTxt}`);
+  }
+
+  const data = await resp.json();
+  const text = data?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim() || "";
+  return text;
 }
 
 // ---- Together chat (Google/Gemma)
@@ -95,43 +175,12 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ---- Helpers
-function detectLanguage(text) {
-  const hasVN = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
-  const hasEN = /[a-zA-Z]/.test(text);
-  if (hasVN && !hasEN) return "vi";
-  if (hasEN && !hasVN) return "en";
-  return "mixed";
-}
-
-// Làm sạch câu nói để lấy từ khoá bài hát/ca sĩ
-function extractSongQuery(raw) {
-  const q = (raw || "")
-    .toLowerCase()
-    .replace(/[.?!,;:]/g, " ")
-    .replace(/\b(play|music|song|bật|mở|phát|bài|bài hát|nhạc|nghe|cho tôi nghe|mở nhạc|mở bài)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return q;
-}
-
-async function getAudioDuration(filePath) {
-  try {
-    const metadata = await mm.parseFile(filePath);
-    const dur = metadata.format.duration || 0;
-    console.log(`=> audio duration: ${dur}s`);
-    return Math.floor(dur * 1000);
-  } catch (e) {
-    console.error("Lỗi đọc file âm thanh:", e.message);
-    updateStatus("error", "Lỗi khi đọc file âm thanh.");
-    return 0;
-  }
-}
-
 // iTunes download & convert an toàn (bắt buộc có previewUrl)
 async function getMusicFromItunesAndConvert(query, audioDir) {
   updateStatus("music", `Searching iTunes: ${query}`);
-  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=musicTrack&limit=1`;
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
+    query
+  )}&media=music&entity=musicTrack&limit=1`;
   const resp = await fetch(url);
 
   if (!resp.ok) {
@@ -183,25 +232,30 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       return res.status(429).json({ success: false, error: "Server busy. Try again later." });
     }
 
-    updateStatus("processing", "Transcribing with OpenAI (gpt-4o-mini-transcribe)...");
-    // --- STT (OpenAI)
+    updateStatus("processing", "Transcribing with Deepgram (vi)...");
+    // --- STT (Deepgram)
     let text = "";
     try {
-      const stt = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(req.file.path),
-        model: STT_MODEL,   // gpt-4o-mini-transcribe
-        language: "vi",     // có thể bỏ để auto-detect
-      });
-      text = (stt.text || "").trim();
+      // 1) Enhance trước khi STT
+      const sttInputPath = await enhanceForSTT(req.file.path);
+
+      // 2) Gọi Deepgram
+      text = await transcribeDeepgram(sttInputPath);
+
+      // 3) Dọn file tạm
+      try { fs.unlinkSync(req.file.path); } catch { }
+      try { fs.unlinkSync(sttInputPath); } catch { }
     } catch (e) {
-      console.error("OpenAI STT error:", e.message);
+      console.error("Deepgram STT error:", e.message);
       updateStatus("error", "Transcribe failed");
       try { fs.unlinkSync(req.file.path); } catch { }
+      try {
+        const maybeEnhanced = req.file.path.replace(/\.[\w]+$/, "_enh16k.wav");
+        if (fs.existsSync(maybeEnhanced)) fs.unlinkSync(maybeEnhanced);
+      } catch { }
       return res.json({
         success: false,
-        error: e.message.includes("too short")
-          ? "Âm thanh quá ngắn, hãy nói dài hơn chút nhé."
-          : "Không thể nhận dạng giọng nói lúc này.",
+        error: "Không thể nhận dạng giọng nói lúc này.",
       });
     }
 
@@ -221,7 +275,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const songQuery = extractSongQuery(text);
       if (!songQuery || songQuery.length < 2) {
         updateStatus("idle", "Server ready");
-        try { fs.unlinkSync(req.file.path); } catch { }
         return res.json({
           success: false,
           error: finalLang === "vi"
@@ -233,7 +286,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const song = await getMusicFromItunesAndConvert(songQuery, audioDir);
       if (!song.success) {
         updateStatus("idle", "Server ready");
-        try { fs.unlinkSync(req.file.path); } catch { }
         return res.json({ success: false, error: "Không tìm thấy bản preview phù hợp." });
       }
 
@@ -245,7 +297,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const musicDuration = await getAudioDuration(musicPath);
       setTimeout(() => updateStatus("idle", "Server ready"), musicDuration + 1000);
 
-      try { fs.unlinkSync(req.file.path); } catch { }
       return res.json({
         success: true,
         type: "music",
@@ -261,7 +312,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       const errText = togetherResp ? await togetherResp.text() : "No response";
       console.error("Together error:", errText);
       updateStatus("error", "Chat generation failed");
-      try { fs.unlinkSync(req.file.path); } catch { }
       return res.json({ success: false, error: "Xin lỗi, máy bận. Hãy thử lại." });
     }
 
@@ -286,7 +336,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     fs.writeFileSync(ttsPath, Buffer.from(await tts.arrayBuffer()));
     updateStatus("speaking", "TTS ready");
 
-    try { fs.unlinkSync(req.file.path); } catch { }
     const duration = await getAudioDuration(ttsPath);
     setTimeout(() => updateStatus("idle", "Server ready"), duration + 1000);
 
@@ -321,7 +370,7 @@ app.get("/status", (_req, res) => res.json(systemStatus));
 
 // ---- Health
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Server (OpenAI STT + Together(Google) + TTS + Music) is running!")
+  res.send("✅ ESP32 Chatbot Server (Deepgram STT + Together(Google) + OpenAI TTS + Music) is running!")
 );
 
 // ---- Start
