@@ -52,7 +52,7 @@ function updateStatus(state, message = "") {
   console.log(`STATUS: ${state} → ${message}`);
 }
 
-async function callChatCompletion(user_promp) {
+async function callChatCompletion(user_promp, finalLang = "vi") {
   let togetherResp = "";
   updateStatus("Calling chatCompletin & get answer", "Generating reply (Gemma)...");
   if (!user_promp || user_promp.trim() === "" || user_promp.length > 1000 || user_promp.length < 3) {
@@ -231,7 +231,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // ================ CHAT MODE với Together.ai (Gemma)
 
-    const togetherResp = await callChatCompletion(text);
+    const togetherResp = await callChatCompletion(text, finalLang);
     if (!togetherResp.ok || togetherResp === "") {
       const errText = await togetherResp.text();
       console.log("Update status vi khong xu ly duoc user prompt:", errText);
