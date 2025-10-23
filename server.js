@@ -176,7 +176,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     updateStatus("processing", "Transcribing with Whisper...");
 
-    // 🎧 1️⃣ STT bằng OpenAI Whisper
+    // 🎧 1STT bằng OpenAI Whisper
     const stt = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
       model: "whisper-1",
@@ -187,7 +187,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     console.log("🎙️ Whisper transcript:", text);
 
     const lang = detectLanguage(text);
-    // const finalLang = lang === "mixed" ? "vi" : lang;
+    const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
