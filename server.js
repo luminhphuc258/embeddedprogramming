@@ -224,6 +224,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
 }
 
 // ==== ROUTE: /ask
+// ==== ROUTE: /ask
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: "No audio file uploaded" });
@@ -261,12 +262,44 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     console.log("🎙️ Transcript:", text);
 
+    // ===== ✅ NEW: Nếu rỗng hoặc < 2 từ → mời nói lại (TTS), không gọi Together
+    const wordCount = (text || "").trim().split(/\s+/).filter(Boolean).length;
+    if (!text || wordCount < 2) {
+      const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+      const retryMsg = "Mời bạn nói lại ạ.";
+
+      updateStatus("speaking", "Generating TTS (retry)...");
+      const tts = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: "alloy",
+        format: "mp3",
+        input: retryMsg,
+      });
+
+      const stamp = Date.now();
+      const filename = `tts_retry_${stamp}.mp3`;
+      const ttsPath = path.join(audioDir, filename);
+      fs.writeFileSync(ttsPath, Buffer.from(await tts.arrayBuffer()));
+      updateStatus("speaking", "TTS (retry) ready");
+
+      const duration = await getAudioDuration(ttsPath);
+      setTimeout(() => updateStatus("idle", "Server ready"), duration + 1000);
+
+      return res.json({
+        success: true,
+        type: "retry",
+        text: retryMsg,
+        audio_url: `${host}/audio/${filename}`,
+      });
+    }
+    // ===== END NEW
+
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
     const lower = text.toLowerCase();
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-    // --- Music mode
+    // --- Music mode (giữ nguyên)
     if (
       lower.includes("nghe") || lower.includes("bật") || lower.includes("nhạc") || lower.includes("music") ||
       lower.includes("bật bài") || lower.includes("phát nhạc") || lower.includes("nghe nhạc") ||
@@ -306,7 +339,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // --- Chat mode (Together.ai + Google/Gemma)
+    // --- Chat mode (Together.ai + Google/Gemma) (giữ nguyên)
     const togetherResp = await callChatCompletion(text, finalLang);
     if (!togetherResp || !togetherResp.ok) {
       const errText = togetherResp ? await togetherResp.text() : "No response";
@@ -321,7 +354,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       (finalLang === "vi" ? "Xin lỗi, mình chưa nghe rõ lắm." : "Sorry, I didn’t catch that.");
     console.log("Gemma reply:", answer);
 
-    // --- TTS (OpenAI)
+    // --- TTS (OpenAI) (giữ nguyên)
     updateStatus("speaking", "Generating TTS...");
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
@@ -354,6 +387,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     setTimeout(() => updateStatus("idle", "Recovered from error"), 2000);
   }
 });
+
 
 // ---- Robot status
 app.post("/update", (req, res) => {
