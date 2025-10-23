@@ -1,7 +1,8 @@
 // =======================
-// ESP32 Audio Server with Voice Enhancement
-// - /ask: receive audio, enhance quality, return URLs for original + enhanced
-// - /uploads: serve uploaded files
+// ESP32 Audio Server with Voice Enhancement + Streaming
+// - /ask: receive audio, enhance quality, return URLs (original_audio_url will point to ENHANCED audio)
+// - /stream: stream any file from /uploads (HTTP range supported)
+// - /uploads: static serving (fallback)
 // - /status, /update, / (healthcheck)
 // =======================
 
@@ -23,6 +24,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 8080;
+
+// Ensure ffmpeg is available (works on Railway/Render/Heroku)
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ---- Middleware
@@ -35,7 +38,7 @@ app.use(express.static("public")); // if you have static assets
 const uploadsDir = path.join(__dirname, "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
 
-// Serve uploaded audio files
+// Serve uploaded audio files (direct links)
 app.use("/uploads", express.static(uploadsDir));
 
 // ---- Status tracking
@@ -70,13 +73,13 @@ async function enhanceAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .audioFilter([
-        "highpass=f=200",   // remove rumble
+        "highpass=f=200",   // remove low rumble
         "lowpass=f=3000",   // reduce hiss
         "acompressor=threshold=-20dB:ratio=3:attack=200:release=1000", // smooth dynamics
-        "loudnorm",          // normalize
-        "volume=1.3"         // slight volume boost
+        "loudnorm",         // normalize loudness
+        "volume=1.3"        // slight gain boost
       ])
-      .audioCodec("pcm_s16le")
+      .audioCodec("pcm_s16le") // output WAV PCM 16-bit
       .on("end", () => resolve(outputPath))
       .on("error", reject)
       .save(outputPath);
@@ -101,18 +104,25 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     updateStatus("processing", "Enhancing uploaded audio");
 
     const inputFile = req.file.path;
-    const enhancedFile = inputFile.replace(/\.(\w+)$/, "_enhanced.wav");
+
+    // Ensure the enhanced file is .wav regardless of input extension
+    const base = path.join(path.dirname(inputFile), path.parse(inputFile).name);
+    const enhancedFile = `${base}_enhanced.wav`;
 
     // 🎧 Enhance the audio
     await enhanceAudio(inputFile, enhancedFile);
 
-    // Get URLs for both files
+    // Build absolute URLs (works behind proxies like Railway)
     const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
     const host = process.env.PUBLIC_BASE_URL || `${proto}://${req.headers.host}`;
-    const originalUrl = `${host}/uploads/${path.basename(inputFile)}`;
+
+    // Direct file URL (static)
     const enhancedUrl = `${host}/uploads/${path.basename(enhancedFile)}`;
 
-    // Get metadata
+    // Streaming URL (range-support, safer for long files/players)
+    const streamUrl = `${host}/stream?file=${encodeURIComponent(path.basename(enhancedFile))}`;
+
+    // Get metadata (optional)
     let durationMs = 0;
     try {
       const meta = await mm.parseFile(enhancedFile);
@@ -125,14 +135,16 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     updateStatus("idle", "Audio enhancement complete");
 
+    // IMPORTANT:
+    // Your ESP32 reads `original_audio_url`. We point it to the ENHANCED audio.
+    // You can switch to `stream_url` in your client later without firmware changes.
     return res.json({
       success: true,
       message: "Audio enhanced successfully.",
-      original_audio_url: enhancedUrl,
-      enhanced_audio_url: enhancedUrl,
+      original_audio_url: streamUrl,      // <-- ESP32 will now hear the enhanced audio
+      enhanced_audio_url: enhancedUrl,    // direct file URL (also enhanced)
+      stream_url: streamUrl,              // explicit
       enhanced_filename: path.basename(enhancedFile),
-      mime_type: req.file.mimetype,
-      size_bytes: req.file.size,
       duration_ms: durationMs
     });
   } catch (err) {
@@ -142,7 +154,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
   }
 });
 
-// ---- Robot status
+// ---- Robot status (optional)
 app.post("/update", (req, res) => {
   const { robot_state } = req.body || {};
   if (!robot_state)
@@ -158,7 +170,7 @@ app.post("/update", (req, res) => {
 app.get("/status", (_req, res) => res.json(systemStatus));
 
 // ==== ROUTE: /stream ====
-// Stream any enhanced audio file by filename
+// Stream any file by filename with HTTP range support
 app.get("/stream", async (req, res) => {
   try {
     const { file } = req.query;
@@ -176,7 +188,9 @@ app.get("/stream", async (req, res) => {
     const fileSize = stat.size;
     const range = req.headers.range;
 
-    // ---- Stream with partial content (for browser / audio tag compatibility)
+    // We always output WAV (since enhanceAudio writes .wav)
+    const contentType = "audio/wav";
+
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
@@ -188,13 +202,13 @@ app.get("/stream", async (req, res) => {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
         "Accept-Ranges": "bytes",
         "Content-Length": chunkSize,
-        "Content-Type": "audio/wav",
+        "Content-Type": contentType,
       });
       fileStream.pipe(res);
     } else {
       res.writeHead(200, {
         "Content-Length": fileSize,
-        "Content-Type": "audio/wav",
+        "Content-Type": contentType,
       });
       fs.createReadStream(filePath).pipe(res);
     }
@@ -206,9 +220,8 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-
 // ---- Health check
-app.get("/", (_req, res) => res.send("✅ ESP32 Audio Server is running with voice enhancement!"));
+app.get("/", (_req, res) => res.send("✅ ESP32 Audio Server is running with voice enhancement + streaming!"));
 
 // ---- Start server
 app.listen(port, () => console.log(`🚀 Server listening on port ${port}`));
