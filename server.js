@@ -214,7 +214,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // --- Music mode
     if (
-      lower.includes("play") || lower.includes("music") || lower.includes("nhạc") ||
+      lower.includes("nghe") || lower.includes("bật") || lower.includes("nhạc") || lower.includes("music") ||
       lower.includes("bật bài") || lower.includes("phát nhạc") || lower.includes("nghe nhạc") ||
       lower.includes("cho tôi nghe") || lower.includes("mở bài") || lower.includes("mở nhạc")
     ) {
