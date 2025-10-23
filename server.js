@@ -1,5 +1,5 @@
 // =======================
-// ESP32 Chatbot + Music Server (Whisper STT + DeepSeek Chat + OpenAI TTS + iTunes Music)
+// ESP32 Chatbot + Music Server (DeepSeek STT + Together Chat + OpenAI TTS + iTunes Music)
 // =======================
 
 import express from "express";
@@ -14,6 +14,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -74,7 +75,7 @@ async function callChatCompletion(user_promp, finalLang = "vi") {
               ? "Bạn là doremon robot, nói chuyện thân thiện bằng tiếng Việt."
               : "You are a robot speaking natural English.",
         },
-        { role: "user", content: user_promp }, // FIX: user role
+        { role: "user", content: user_promp },
       ],
       temperature: 0.8,
     }),
@@ -119,7 +120,7 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
     `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
   );
   if (!resp.ok) {
-    console.error("Lỗi khi tìm kiếm bài hát trên iTunes."); // FIX: console.error
+    console.error("Lỗi khi tìm kiếm bài hát trên iTunes.");
     updateStatus("error", "Lỗi khi tìm kiếm bài hát trên iTunes.");
     return { title: "", artist: "", file: "", success: false };
   }
@@ -149,25 +150,64 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   };
 }
 
+/* =========================
+   DeepSeek Speech-to-Text
+   ========================= */
+async function transcribeAudioWithDeepSeek(filePath, lang = "vi") {
+  // You can override URL/model via env if DeepSeek uses a different path/model name.
+  const url = process.env.DEEPSEEK_STT_URL || "https://api.deepseek.com/audio/transcriptions";
+  const model = process.env.DEEPSEEK_STT_MODEL || "whisper-large-v3";
+
+  // FormData & ReadStream
+  const form = new FormData();
+  form.append("file", fs.createReadStream(filePath));
+  form.append("model", model);
+  if (lang) form.append("language", lang);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      // DO NOT set Content-Type explicitly for multipart; let fetch set boundary
+    },
+    body: form,
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`DeepSeek STT failed: ${resp.status} ${txt}`);
+  }
+
+  const data = await resp.json();
+  // Try common fields that providers use
+  const text = data.text || data.transcript || data.result || "";
+  return (text || "").trim();
+}
+
 // ==== ROUTE: ASK ====
 app.post("/ask", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: "No audio file uploaded" });
+
     if (systemStatus.state !== "idle") {
       console.log("--> Server busy, let wait...:", systemStatus.state);
       return res.status(429).json({ success: false, error: "Server busy. Try again later." });
     }
 
-    updateStatus("processing", "Transcribing with Whisper...");
+    updateStatus("processing", "Transcribing with DeepSeek...");
 
-    // STT
-    const stt = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(req.file.path),
-      model: "whisper-1",
-      language: "vi",
-    });
-    const text = (stt.text || "").trim();
-    console.log("🎙️ Whisper transcript:", text);
+    // STT (DeepSeek)
+    let text = "";
+    try {
+      text = await transcribeAudioWithDeepSeek(req.file.path, "vi");
+    } catch (e) {
+      console.error(e.message);
+      updateStatus("error", "DeepSeek STT failed");
+      try { fs.unlinkSync(req.file.path); } catch { }
+      return res.json({ success: false, error: "Transcribe lỗi: " + e.message });
+    }
+
+    console.log("🎙️ DeepSeek transcript:", text);
 
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
@@ -207,7 +247,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       return res.json({
         success: true,
         type: "music",
-        text: notice, // FIX: define notice
+        text: notice,
         audio_url: `${host}/audio/${song.file}`,
         music_url: `${host}/audio/${song.file}`,
       });
@@ -230,7 +270,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     console.log("Gemma reply:", answer);
 
-    // TTS
+    // TTS (OpenAI)
     updateStatus("speaking", "Generating TTS...");
     const tts = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
@@ -239,7 +279,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       input: answer,
     });
 
-    const stamp = Date.now();                 // FIX: capture once
+    const stamp = Date.now();
     const filename = `tts_${stamp}.mp3`;
     const ttsPath = path.join(audioDir, filename);
     fs.writeFileSync(ttsPath, Buffer.from(await tts.arrayBuffer()));
@@ -247,7 +287,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     try { fs.unlinkSync(req.file.path); } catch { }
 
-    const duration = await getAudioDuration(ttsPath); // FIX: same path/filename
+    const duration = await getAudioDuration(ttsPath);
     setTimeout(() => updateStatus("idle", "Server ready"), duration + 1000);
 
     return res.json({
@@ -282,7 +322,7 @@ app.get("/status", (_req, res) => res.json(systemStatus));
 
 // ==== Health check ====
 app.get("/", (_req, res) =>
-  res.send("✅ ESP32 Chatbot Server (Whisper + DeepSeek + TTS + Music) is running!")
+  res.send("✅ ESP32 Chatbot Server (DeepSeek STT + Together Chat + TTS + Music) is running!")
 );
 
 // ==== Start server ====
