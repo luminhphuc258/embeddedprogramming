@@ -128,7 +128,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     return res.json({
       success: true,
       message: "Audio enhanced successfully.",
-      original_audio_url: originalUrl,
+      original_audio_url: enhancedUrl,
       enhanced_audio_url: enhancedUrl,
       enhanced_filename: path.basename(enhancedFile),
       mime_type: req.file.mimetype,
