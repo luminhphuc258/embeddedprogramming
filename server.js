@@ -157,6 +157,56 @@ app.post("/update", (req, res) => {
 // ---- Poll status
 app.get("/status", (_req, res) => res.json(systemStatus));
 
+// ==== ROUTE: /stream ====
+// Stream any enhanced audio file by filename
+app.get("/stream", async (req, res) => {
+  try {
+    const { file } = req.query;
+    if (!file) {
+      return res.status(400).json({ success: false, error: "Missing ?file parameter" });
+    }
+
+    const filePath = path.join(uploadsDir, path.basename(file));
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ success: false, error: "File not found" });
+    }
+
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    // ---- Stream with partial content (for browser / audio tag compatibility)
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+      const fileStream = fs.createReadStream(filePath, { start, end });
+
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": "audio/wav",
+      });
+      fileStream.pipe(res);
+    } else {
+      res.writeHead(200, {
+        "Content-Length": fileSize,
+        "Content-Type": "audio/wav",
+      });
+      fs.createReadStream(filePath).pipe(res);
+    }
+
+    console.log(`🎧 Streaming file: ${file}`);
+  } catch (err) {
+    console.error("Stream error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // ---- Health check
 app.get("/", (_req, res) => res.send("✅ ESP32 Audio Server is running with voice enhancement!"));
 
