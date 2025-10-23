@@ -29,13 +29,13 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const STT_MODEL = "gpt-4o-mini-transcribe"; // yêu cầu của bạn
+const STT_MODEL = "gpt-4o-mini-transcribe"; // STT model bạn chọn
 
 // ---- Middleware
 app.enable("trust proxy");
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public"));
+app.use(express.static("public")); // để serve /public/audio/*.mp3
 
 // ---- Dirs
 const uploadsDir = path.join(__dirname, "uploads");
@@ -103,6 +103,18 @@ function detectLanguage(text) {
   if (hasEN && !hasVN) return "en";
   return "mixed";
 }
+
+// Làm sạch câu nói để lấy từ khoá bài hát/ca sĩ
+function extractSongQuery(raw) {
+  const q = (raw || "")
+    .toLowerCase()
+    .replace(/[.?!,;:]/g, " ")
+    .replace(/\b(play|music|song|bật|mở|phát|bài|bài hát|nhạc|nghe|cho tôi nghe|mở nhạc|mở bài)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return q;
+}
+
 async function getAudioDuration(filePath) {
   try {
     const metadata = await mm.parseFile(filePath);
@@ -116,46 +128,32 @@ async function getAudioDuration(filePath) {
   }
 }
 
-// --- Enhance audio specifically for STT (16 kHz, mono, denoise, normalize)
-async function enhanceForSTT(inputPath) {
-  const outPath = inputPath.replace(/\.[\w]+$/, "_enh16k.wav");
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .audioFilter([
-        // tame low rumble & hiss
-        "highpass=f=100",
-        "lowpass=f=3800",
-        // frequency-domain noise reduction (built-in; no external model file)
-        "afftdn=nr=18",
-        // mild compression + loudness normalization
-        "acompressor=threshold=-20dB:ratio=3:attack=200:release=1000",
-        "loudnorm=I=-23:TP=-2:LRA=7",
-        // ensure 16 kHz mono for best ASR performance
-        "aformat=sample_fmts=s16:channel_layouts=mono:sample_rates=16000"
-      ])
-      .audioCodec("pcm_s16le")
-      .on("end", () => resolve(outPath))
-      .on("error", reject)
-      .save(outPath);
-  });
-}
-
-
+// iTunes download & convert an toàn (bắt buộc có previewUrl)
 async function getMusicFromItunesAndConvert(query, audioDir) {
   updateStatus("music", `Searching iTunes: ${query}`);
-  const resp = await fetch(
-    `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
-  );
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=musicTrack&limit=1`;
+  const resp = await fetch(url);
+
   if (!resp.ok) {
-    console.error("Lỗi iTunes search.");
+    console.error("Lỗi iTunes search:", await resp.text());
     updateStatus("error", "Lỗi khi tìm kiếm bài hát trên iTunes.");
     return { title: "", artist: "", file: "", success: false };
   }
-  const data = await resp.json();
-  if (!data.results?.length) return { title: "", artist: "", file: "", success: false };
 
-  const song = data.results[0];
+  const data = await resp.json();
+  const song = data.results?.[0];
+  if (!song || !song.previewUrl) {
+    updateStatus("error", "Không có bản preview cho bài hát này.");
+    return { title: "", artist: "", file: "", success: false };
+  }
+
   const res = await fetch(song.previewUrl);
+  if (!res.ok) {
+    console.error("Lỗi tải preview:", await res.text());
+    updateStatus("error", "Không tải được preview bài hát.");
+    return { title: "", artist: "", file: "", success: false };
+  }
+
   const buffer = Buffer.from(await res.arrayBuffer());
   const localM4A = path.join(audioDir, `song_${Date.now()}.m4a`);
   fs.writeFileSync(localM4A, buffer);
@@ -168,7 +166,12 @@ async function getMusicFromItunesAndConvert(query, audioDir) {
   fs.unlinkSync(localM4A);
   updateStatus("music", "Music ready");
 
-  return { title: song.trackName, artist: song.artistName, file: path.basename(localMP3), success: true };
+  return {
+    title: song.trackName || "",
+    artist: song.artistName || "",
+    file: path.basename(localMP3),
+    success: true,
+  };
 }
 
 // ==== ROUTE: /ask
@@ -184,11 +187,10 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     // --- STT (OpenAI)
     let text = "";
     try {
-      const sttInputPath = await enhanceForSTT(req.file.path);
       const stt = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(sttInputPath),
+        file: fs.createReadStream(req.file.path),
         model: STT_MODEL,   // gpt-4o-mini-transcribe
-        language: "vi",     // hoặc bỏ để auto-detect
+        language: "vi",     // có thể bỏ để auto-detect
       });
       text = (stt.text || "").trim();
     } catch (e) {
@@ -216,12 +218,25 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       lower.includes("bật bài") || lower.includes("phát nhạc") || lower.includes("nghe nhạc") ||
       lower.includes("cho tôi nghe") || lower.includes("mở bài") || lower.includes("mở nhạc")
     ) {
-      const song = await getMusicFromItunesAndConvert(text, audioDir);
+      const songQuery = extractSongQuery(text);
+      if (!songQuery || songQuery.length < 2) {
+        updateStatus("idle", "Server ready");
+        try { fs.unlinkSync(req.file.path); } catch { }
+        return res.json({
+          success: false,
+          error: finalLang === "vi"
+            ? "Bạn hãy nói tên bài hát hoặc ca sĩ nhé."
+            : "Please say the song title or artist.",
+        });
+      }
+
+      const song = await getMusicFromItunesAndConvert(songQuery, audioDir);
       if (!song.success) {
         updateStatus("idle", "Server ready");
         try { fs.unlinkSync(req.file.path); } catch { }
-        return res.json({ success: false, error: "Không tìm thấy bài hát phù hợp." });
+        return res.json({ success: false, error: "Không tìm thấy bản preview phù hợp." });
       }
+
       const notice = finalLang === "vi"
         ? `Đang phát: ${song.title} – ${song.artist}`
         : `Playing: ${song.title} – ${song.artist}`;
