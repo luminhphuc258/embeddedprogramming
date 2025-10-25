@@ -1,5 +1,5 @@
-// ====== ESP32 Chatbot Server with Voice Classification ======
-// npm i express multer openai cors dotenv node-fetch itunes-search-api
+// ====== ESP32 Chatbot Server with AI + Voice Command ======
+// npm i express multer openai cors dotenv node-fetch form-data
 
 import express from "express";
 import fs from "fs";
@@ -7,10 +7,10 @@ import path from "path";
 import multer from "multer";
 import { fileURLToPath } from "url";
 import fetch from "node-fetch";
+import FormData from "form-data";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import cors from "cors";
-import itunes from "itunes-search-api";
 
 dotenv.config();
 
@@ -19,24 +19,25 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ===== Python voice model API =====
 const PYTHON_API = "https://mylocalpythonserver-mypythonserver.up.railway.app/predict";
 
 // ===== Middleware =====
 app.use(cors());
 app.use("/audio", express.static(path.join(__dirname, "public/audio")));
 
-// ===== Multer setup for ESP32 upload =====
+// ===== Multer setup =====
 const uploadsDir = path.join(__dirname, "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadsDir),
-  filename: (_, file, cb) =>
-    cb(null, Date.now() + "_" + (file.originalname || "audio.wav")),
+  filename: (_, file, cb) => cb(null, Date.now() + "_" + (file.originalname || "audio.wav")),
 });
 const upload = multer({ storage });
 
-// ===== Utility =====
+// ===== Detect language =====
 function detectLanguage(text) {
   const hasVi = /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
   const hasEn = /[a-zA-Z]/.test(text);
@@ -48,12 +49,13 @@ function detectLanguage(text) {
 // ===== MAIN HANDLER =====
 async function handleAsk(req, res) {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No audio file uploaded" });
+    if (!req.file)
+      return res.status(400).json({ success: false, error: "No audio file uploaded" });
 
     const wavPath = req.file.path;
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // --- Step 1: Gửi file đến Python API ---
+    // --- Step 1: Gửi file đến Python server để dự đoán hành động ---
     console.log("🎯 Sending file to Python server for label prediction...");
     const form = new FormData();
     form.append("file", fs.createReadStream(wavPath));
@@ -62,20 +64,21 @@ async function handleAsk(req, res) {
     const predictData = await predictRes.json();
     console.log("🔹 Prediction result:", predictData);
 
-    let label = predictData.label || "unknown";
+    const label = predictData.label || "unknown";
 
-    // --- Step 2: Nếu là "nhac" → search nhạc trên iTunes ---
+    // --- Step 2: Nếu label là "nhac" → tìm nhạc iTunes ---
     if (label === "nhac") {
-      console.log("🎵 Detected 'nhac' → searching iTunes...");
+      console.log("🎵 Detected 'nhac' → searching iTunes API...");
+      const query = "Vietnam top hits";
+      const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
+        query
+      )}&media=music&limit=1`;
 
-      const searchResult = await itunes.search({
-        term: "Vietnam top hits",
-        media: "music",
-        limit: 1,
-      });
+      const musicRes = await fetch(itunesUrl);
+      const musicData = await musicRes.json();
 
-      if (searchResult?.results?.length) {
-        const song = searchResult.results[0];
+      if (musicData.results && musicData.results.length > 0) {
+        const song = musicData.results[0];
         console.log("✅ Found:", song.trackName, "-", song.artistName);
         return res.json({
           success: true,
@@ -98,8 +101,9 @@ async function handleAsk(req, res) {
       }
     }
 
-    // --- Step 3: Nếu không phải "nhac" → gọi OpenAI Chat + TTS ---
-    console.log("💬 Sending to OpenAI...");
+    // --- Step 3: Nếu không phải "nhac" → gọi OpenAI GPT + TTS ---
+    console.log("💬 Sending to OpenAI for chat response...");
+
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(wavPath),
       model: "whisper-1",
@@ -134,7 +138,7 @@ async function handleAsk(req, res) {
       (finalLang === "vi" ? "Xin chào!" : "Hello!");
     console.log("💬 GPT:", answer);
 
-    // --- Step 4: Text-to-Speech ---
+    // --- Step 4: Text-to-Speech (TTS) ---
     const outputDir = path.join(__dirname, "public/audio");
     fs.mkdirSync(outputDir, { recursive: true });
 
@@ -157,13 +161,14 @@ async function handleAsk(req, res) {
     res.json({
       success: true,
       type: "chat",
+      label,
       text: answer,
       lang: finalLang,
       audio_url: fileURL,
       format: "mp3",
     });
 
-    // Cleanup temp file
+    // --- Cleanup ---
     try {
       fs.unlinkSync(wavPath);
     } catch (err) {
@@ -177,6 +182,6 @@ async function handleAsk(req, res) {
 
 // ===== ROUTES =====
 app.post("/ask", upload.single("audio"), handleAsk);
-app.get("/", (req, res) => res.send("✅ Chatbot + KWS Server is running fine!"));
+app.get("/", (req, res) => res.send("✅ Chatbot + KWS Server (AI integrated) is running fine!"));
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
