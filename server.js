@@ -6,7 +6,7 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import { fileURLToPath } from "url";
-import * as tf from "@tensorflow/tfjs-node";
+import * as tf from "@tensorflow/tfjs";
 import wav from "wav-decoder";
 import OpenAI from "openai";
 import dotenv from "dotenv";
