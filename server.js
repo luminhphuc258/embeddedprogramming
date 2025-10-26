@@ -1,7 +1,7 @@
 // =======================
-// ESP32 Chatbot + KWS + Music + TTS Server (fixed flow)
+// ESP32 Chatbot + KWS + Music + TTS Server (enhanced)
 // 1️⃣ Send to Python API first for intent label
-// 2️⃣ If "music"/"nhac" → search iTunes, save MP3
+// 2️⃣ If "music"/"nhac" → use Whisper to extract song name → search iTunes + save MP3
 // 3️⃣ Else → OpenAI transcribe + chat + TTS
 // =======================
 
@@ -76,6 +76,7 @@ async function convertToMP3(src, dst) {
 }
 
 async function searchItunesAndSave(query) {
+  console.log(`🎶 Searching iTunes for: ${query}`);
   const resp = await fetch(
     `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&limit=1`
   );
@@ -127,9 +128,47 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // === Step 2: Music branch ===
     if (label === "music" || label === "nhac") {
-      console.log("🎵 Detected 'music' → iTunes search");
+      console.log("🎵 Detected 'music' intent → extracting song name...");
+
+      // Use Whisper to get song name text
+      let text = "";
       try {
-        const song = await searchItunesAndSave("Vietnam top hits");
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavPath),
+          model: "gpt-4o-mini-transcribe",
+        });
+        text = (tr.text || "").trim();
+      } catch (e) {
+        console.error("⚠️ Whisper error:", e.message);
+      }
+
+      // Ask GPT to extract only the song name from the voice command
+      let songName = "Vietnam top hits";
+      try {
+        const chat = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Extract only the name of the song mentioned in the user's command. Respond with the song title only, no explanation.",
+            },
+            {
+              role: "user",
+              content: `Voice command: "${text}"`,
+            },
+          ],
+        });
+        songName = chat.choices?.[0]?.message?.content?.trim() || songName;
+      } catch (e) {
+        console.error("⚠️ Song name extraction error:", e.message);
+      }
+
+      console.log("🎯 Detected song name:", songName);
+
+      // Search and download that song
+      try {
+        const song = await searchItunesAndSave(songName);
         if (!song) {
           cleanup();
           return res.json({ success: false, type: "music", error: "No song found", audio_url: null });
@@ -140,6 +179,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
           success: true,
           type: "music",
           label,
+          query: songName,
           text: `Playing: ${song.title} – ${song.artist}`,
           audio_url: `${host}/audio/${song.filename}`,
           format: "mp3",
