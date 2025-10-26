@@ -50,23 +50,30 @@ function detectLanguage(text) {
 async function handleAsk(req, res) {
   try {
     if (!req.file)
-      return res.status(400).json({ success: false, error: "No audio file uploaded" });
+      return res
+        .status(400)
+        .json({ success: false, error: "No audio file uploaded", audio_url: null });
 
     const wavPath = req.file.path;
     console.log(`[ASK] Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // --- Step 1: Gửi file đến Python server để dự đoán hành động ---
+    // --- Step 1: Predict action from Python model ---
     console.log("🎯 Sending file to Python server for label prediction...");
     const form = new FormData();
     form.append("file", fs.createReadStream(wavPath));
 
-    const predictRes = await fetch(PYTHON_API, { method: "POST", body: form });
-    const predictData = await predictRes.json();
-    console.log("🔹 Prediction result:", predictData);
+    let predictData = {};
+    try {
+      const predictRes = await fetch(PYTHON_API, { method: "POST", body: form });
+      predictData = await predictRes.json();
+    } catch (e) {
+      console.warn("⚠️ Python API not reachable, fallback to 'chat'");
+    }
 
     const label = predictData.label || "unknown";
+    console.log("🔹 Prediction result:", label);
 
-    // --- Step 2: Nếu label là "nhac" → tìm nhạc iTunes ---
+    // --- Step 2: If label === 'nhac' → iTunes search ---
     if (label === "nhac") {
       console.log("🎵 Detected 'nhac' → searching iTunes API...");
       const query = "Vietnam top hits";
@@ -74,41 +81,60 @@ async function handleAsk(req, res) {
         query
       )}&media=music&limit=1`;
 
-      const musicRes = await fetch(itunesUrl);
-      const musicData = await musicRes.json();
+      try {
+        const musicRes = await fetch(itunesUrl);
+        const musicData = await musicRes.json();
 
-      if (musicData.results && musicData.results.length > 0) {
-        const song = musicData.results[0];
-        console.log("✅ Found:", song.trackName, "-", song.artistName);
+        if (musicData.results && musicData.results.length > 0) {
+          const song = musicData.results[0];
+          console.log("✅ Found:", song.trackName, "-", song.artistName);
+          return res.json({
+            success: true,
+            type: "music",
+            label,
+            song: {
+              title: song.trackName,
+              artist: song.artistName,
+              previewUrl: song.previewUrl,
+              artwork: song.artworkUrl100,
+            },
+            audio_url: song.previewUrl || null,
+          });
+        } else {
+          return res.json({
+            success: true,
+            type: "music",
+            label,
+            message: "No music found",
+            audio_url: null,
+          });
+        }
+      } catch (err) {
+        console.error("❌ iTunes search failed:", err.message);
         return res.json({
-          success: true,
+          success: false,
           type: "music",
           label,
-          song: {
-            title: song.trackName,
-            artist: song.artistName,
-            previewUrl: song.previewUrl,
-            artwork: song.artworkUrl100,
-          },
-        });
-      } else {
-        return res.json({
-          success: true,
-          type: "music",
-          label,
-          message: "No music found",
+          error: "Music API failed",
+          audio_url: null,
         });
       }
     }
 
-    // --- Step 3: Nếu không phải "nhac" → gọi OpenAI GPT + TTS ---
+    // --- Step 3: Normal chatbot mode ---
     console.log("💬 Sending to OpenAI for chat response...");
 
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(wavPath),
-      model: "whisper-1",
-    });
-    const text = transcription.text?.trim() || "(no text)";
+    // Whisper transcription
+    let text = "(no text)";
+    try {
+      const transcription = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavPath),
+        model: "whisper-1",
+      });
+      text = transcription.text?.trim() || text;
+    } catch (e) {
+      console.error("⚠️ Whisper error:", e.message);
+    }
     console.log("🧠 Transcribed:", text);
 
     const lang = detectLanguage(text);
@@ -124,39 +150,49 @@ async function handleAsk(req, res) {
         ? `Người dùng nói: "${text}". Trả lời thân thiện, ngắn gọn bằng tiếng Việt.`
         : `User said: "${text}". Reply briefly in friendly English.`;
 
-    const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.8,
-    });
+    let answer =
+      finalLang === "vi" ? "Xin chào!" : "Hello!";
 
-    const answer =
-      chat.choices?.[0]?.message?.content?.trim() ||
-      (finalLang === "vi" ? "Xin chào!" : "Hello!");
+    try {
+      const chat = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.8,
+      });
+      answer = chat.choices?.[0]?.message?.content?.trim() || answer;
+    } catch (err) {
+      console.error("⚠️ Chat error:", err.message);
+    }
+
     console.log("💬 GPT:", answer);
 
-    // --- Step 4: Text-to-Speech (TTS) ---
+    // --- Step 4: Text-to-Speech ---
     const outputDir = path.join(__dirname, "public/audio");
     fs.mkdirSync(outputDir, { recursive: true });
 
     const outFile = `response_${Date.now()}.mp3`;
     const outPath = path.join(outputDir, outFile);
 
-    const speech = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: finalLang === "vi" ? "alloy" : "verse",
-      input: answer,
-      format: "mp3",
-    });
+    let fileURL = null;
+    try {
+      const speech = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: finalLang === "vi" ? "alloy" : "verse",
+        input: answer,
+        format: "mp3",
+      });
 
-    const buffer = Buffer.from(await speech.arrayBuffer());
-    fs.writeFileSync(outPath, buffer);
+      const buffer = Buffer.from(await speech.arrayBuffer());
+      fs.writeFileSync(outPath, buffer);
 
-    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-    const fileURL = `${host}/audio/${outFile}`;
+      const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+      fileURL = `${host}/audio/${outFile}`;
+    } catch (err) {
+      console.error("⚠️ TTS error:", err.message);
+    }
 
     res.json({
       success: true,
@@ -176,12 +212,18 @@ async function handleAsk(req, res) {
     }
   } catch (err) {
     console.error("❌ Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message,
+      audio_url: null,
+    });
   }
 }
 
 // ===== ROUTES =====
 app.post("/ask", upload.single("audio"), handleAsk);
-app.get("/", (req, res) => res.send("✅ Chatbot + KWS Server (AI integrated) is running fine!"));
+app.get("/", (req, res) =>
+  res.send("✅ Chatbot + KWS Server (AI integrated) is running fine!")
+);
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
