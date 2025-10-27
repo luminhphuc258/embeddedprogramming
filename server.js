@@ -213,8 +213,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       tien: "Dạ rõ sư phụ, đệ tử đang di chuyển lên.",
       lui: "Dạ rõ sư phụ, đệ tử đang di chuyển lùi lại.",
       trai: "Dạ rõ sư phụ, đệ tử đang di chuyển qua trái.",
-      phai: "Dạ rõ sư phụ, đệ tử đang di chuyển qua phải.",
-      yen: "Dạ rõ sư phụ, đệ tử đang đứng yên.",
+      phai: "Dạ rõ sư phụ, đệ tử đang di chuyển qua phải."
     };
 
     if (label in controlMap) {
@@ -226,7 +225,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         console.log(`🗣️ Creating control TTS for label: ${label}`);
         const speech = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
-          voice: "alloy",
+          voice: "blithe",
           format: "mp3",
           input: answer,
         });
