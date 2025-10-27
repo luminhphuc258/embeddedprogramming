@@ -2,7 +2,8 @@
 // ESP32 Chatbot + KWS + Music + TTS Server (enhanced)
 // 1️⃣ Send to Python API first for intent label
 // 2️⃣ If "music"/"nhac" → use Whisper to extract song name → search iTunes + save MP3
-// 3️⃣ Else → OpenAI transcribe + chat + TTS
+// 3️⃣ If label ∈ [tien, lui, trai, phai, yen] → create fixed TTS response (no chat)
+// 4️⃣ Else → OpenAI transcribe + chat + TTS
 // =======================
 
 import express from "express";
@@ -130,7 +131,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     if (label === "music" || label === "nhac") {
       console.log("🎵 Detected 'music' intent → extracting song name...");
 
-      // Use Whisper to get song name text
       let text = "";
       try {
         const tr = await openai.audio.transcriptions.create({
@@ -142,7 +142,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         console.error("⚠️ Whisper error:", e.message);
       }
 
-      // Ask GPT to extract only the song name from the voice command
       let songName = "Vietnam top hits";
       try {
         const chat = await openai.chat.completions.create({
@@ -166,7 +165,6 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
       console.log("🎯 Detected song name:", songName);
 
-      // Search and download that song
       try {
         const song = await searchItunesAndSave(songName);
         if (!song) {
@@ -210,6 +208,47 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     const lang = detectLanguage(text);
     const finalLang = lang === "mixed" ? "vi" : lang;
 
+    // 🧩 Step 3A — Kiểm tra nhãn điều khiển robot
+    const controlMap = {
+      tien: "Dạ rõ sư phụ, đệ tử đang di chuyển lên.",
+      lui: "Dạ rõ sư phụ, đệ tử đang di chuyển lùi lại.",
+      trai: "Dạ rõ sư phụ, đệ tử đang di chuyển qua trái.",
+      phai: "Dạ rõ sư phụ, đệ tử đang di chuyển qua phải.",
+      yen: "Dạ rõ sư phụ, đệ tử đang đứng yên.",
+    };
+
+    if (label in controlMap) {
+      const answer = controlMap[label];
+      const filename = `response_${Date.now()}.mp3`;
+      const outPath = path.join(audioDir, filename);
+
+      try {
+        console.log(`🗣️ Creating control TTS for label: ${label}`);
+        const speech = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: "alloy",
+          format: "mp3",
+          input: answer,
+        });
+        const buf = Buffer.from(await speech.arrayBuffer());
+        fs.writeFileSync(outPath, buf);
+      } catch (e) {
+        console.error("⚠️ TTS error (control branch):", e.message);
+      }
+
+      cleanup();
+      return res.json({
+        success: true,
+        type: "chat",
+        label,
+        text: answer,
+        lang: "vi",
+        audio_url: `${host}/audio/${filename}`,
+        format: "mp3",
+      });
+    }
+
+    // 🧩 Step 3B — Flow gốc (chat)
     let answer = finalLang === "vi" ? "Xin chào!" : "Hello!";
     try {
       const chat = await openai.chat.completions.create({
