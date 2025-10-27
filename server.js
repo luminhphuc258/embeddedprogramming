@@ -225,7 +225,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         console.log(`🗣️ Creating control TTS for label: ${label}`);
         const speech = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
-          voice: "blithe",
+          voice: "nova",
           format: "mp3",
           input: answer,
         });
