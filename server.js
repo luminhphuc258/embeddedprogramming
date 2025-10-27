@@ -85,7 +85,67 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // === Step 2: Music flow ===
     if (label === "music" || label === "nhac") {
-      // ... (giữ nguyên toàn bộ phần iTunes ở bản gốc)
+      console.log("🎵 Detected 'music' intent → extracting song name...");
+
+      // Use Whisper to get song name text
+      let text = "";
+      try {
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavPath),
+          model: "gpt-4o-mini-transcribe",
+        });
+        text = (tr.text || "").trim();
+      } catch (e) {
+        console.error("⚠️ Whisper error:", e.message);
+      }
+
+      // Ask GPT to extract only the song name from the voice command
+      let songName = "Vietnam top hits";
+      try {
+        const chat = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Extract only the name of the song mentioned in the user's command. Respond with the song title only, no explanation.",
+            },
+            {
+              role: "user",
+              content: `Voice command: "${text}"`,
+            },
+          ],
+        });
+        songName = chat.choices?.[0]?.message?.content?.trim() || songName;
+      } catch (e) {
+        console.error("⚠️ Song name extraction error:", e.message);
+      }
+
+      console.log("🎯 Detected song name:", songName);
+
+      // Search and download that song
+      try {
+        const song = await searchItunesAndSave(songName);
+        if (!song) {
+          cleanup();
+          return res.json({ success: false, type: "music", error: "No song found", audio_url: null });
+        }
+
+        cleanup();
+        return res.json({
+          success: true,
+          type: "music",
+          label,
+          query: songName,
+          text: `Playing: ${song.title} – ${song.artist}`,
+          audio_url: `${host}/audio/${song.filename}`,
+          format: "mp3",
+        });
+      } catch (err) {
+        console.error("❌ Music branch error:", err.message);
+        cleanup();
+        return res.json({ success: false, type: "music", error: "Music failed", audio_url: null });
+      }
     }
 
     // === Step 3: Transcribe để phân tích từ khóa ===
