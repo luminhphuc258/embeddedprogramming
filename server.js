@@ -89,23 +89,39 @@ async function trimSilence(inputPath) {
 // ===== Helper: Search iTunes and convert preview to MP3 =====
 async function searchItunesAndSave(query) {
   try {
-    console.log(`🎶 Searching iTunes for: ${query}`);
-    const resp = await fetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(
-        query
-      )}&media=music&limit=1`
-    );
+    // Ưu tiên store Việt Nam + chỉ bài hát
+    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
+      query
+    )}&media=music&entity=song&country=vn&limit=10`;
+
+    console.log(`🎶 Searching iTunes (VN) for: ${query}`);
+    const resp = await fetch(url);
     if (!resp.ok) throw new Error("iTunes search failed");
     const data = await resp.json();
     if (!data.results?.length) {
-      console.warn("⚠️ No iTunes results found.");
+      console.warn("⚠️ No iTunes results found (VN).");
       return null;
     }
 
-    const song = data.results[0];
-    const previewUrl = song.previewUrl;
-    const trackName = song.trackName || "Unknown";
-    const artistName = song.artistName || "Unknown Artist";
+    // Chọn kết quả có dấu tiếng Việt nếu có
+    let pick =
+      data.results.find(
+        (r) =>
+          hasVietnamese(r.trackName) ||
+          hasVietnamese(r.artistName) ||
+          hasVietnamese(r.collectionName)
+      ) || data.results[0];
+
+    const previewUrl = pick.previewUrl;
+    const trackName = pick.trackName || "Unknown";
+    const artistName = pick.artistName || "Unknown Artist";
+
+    if (!previewUrl) {
+      console.warn("⚠️ No previewUrl, trying another result…");
+      const alt = data.results.find((r) => r.previewUrl);
+      if (!alt) return null;
+      return await searchItunesAndSave(`${alt.artistName} ${alt.trackName}`);
+    }
 
     const tmpM4A = path.join(audioDir, `song_${Date.now()}.m4a`);
     const outMP3 = tmpM4A.replace(".m4a", ".mp3");
@@ -115,7 +131,6 @@ async function searchItunesAndSave(query) {
     const arrayBuffer = await songRes.arrayBuffer();
     fs.writeFileSync(tmpM4A, Buffer.from(arrayBuffer));
 
-    // Convert M4A → MP3
     console.log("🎧 Converting preview to MP3...");
     await new Promise((resolve, reject) =>
       ffmpeg(tmpM4A)
@@ -136,7 +151,7 @@ async function searchItunesAndSave(query) {
       filename: path.basename(outMP3),
     };
   } catch (err) {
-    console.error("❌ iTunes fetch/conversion error:", err.message);
+    console.error("❌ iTunes VN fetch/conversion error:", err.message);
     return null;
   }
 }
