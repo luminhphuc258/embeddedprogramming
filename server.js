@@ -94,6 +94,47 @@ async function trimSilence(inputPath) {
   }
 }
 
+// ====== (1) Helper: bỏ dấu tiếng Việt & so khớp từ khoá ======
+function stripDiacritics(s) {
+  // đơn giản hoá để so khớp "cám ơn" / "cảm ơn", "đô rê mon" ...
+  return s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")   // remove accents
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D");
+}
+
+function hasWake(text) {
+  const t = stripDiacritics(text.toLowerCase());
+  // các biến thể phổ biến
+  return (
+    t.includes("doremon") || t.includes("do re mon") || t.includes("do remon") ||
+    t.includes("doremon oi") || t.includes("do re mon oi")
+  );
+}
+
+function hasStop(text) {
+  const t = stripDiacritics(text.toLowerCase());
+  return (
+    t.includes("cam on ban") || t.includes("cam on nhe") ||
+    t.includes("thank you") || t.includes("thanks")
+  );
+}
+
+// ====== (2) Helper: TTS tiếng Việt, trả về đường dẫn MP3 ======
+async function ttsViToFile(text) {
+  const filename = `wake_${Date.now()}.mp3`;
+  const outPath = path.join(audioDir, filename);
+  const speech = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "nova",          // giọng VI
+    format: "mp3",
+    input: text,
+  });
+  const buf = Buffer.from(await speech.arrayBuffer());
+  fs.writeFileSync(outPath, buf);
+  return filename;
+}
 // ===== Helper: Search iTunes (VN) and convert preview to MP3 =====
 async function searchItunesAndSave(query) {
   try {
@@ -336,6 +377,80 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
   } catch (err) {
     console.error("❌ /ask error:", err);
     res.status(500).json({ success: false, error: err.message, audio_url: null });
+  }
+});
+
+// ====== (3) API: /wake  — phát hiện "doremon (ơi)" hoặc "cám ơn bạn" ======
+app.post("/wake", upload.single("audio"), async (req, res) => {
+  const cleanup = () => {
+    try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch { }
+  };
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "No audio file uploaded" });
+    }
+
+    const wavPath = req.file.path;
+    let text = "";
+
+    // STT: chuyển âm thanh thành text
+    try {
+      const tr = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavPath),
+        model: "gpt-4o-mini-transcribe",
+      });
+      text = (tr.text || "").trim();
+    } catch (e) {
+      cleanup();
+      return res.json({ success: false, label: "none", error: "transcribe_failed" });
+    }
+
+    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+    // So khớp từ khoá
+    if (hasStop(text)) {
+      cleanup();
+      return res.json({
+        success: true,
+        label: "yen",            // dừng mic ở client
+        text,                    // câu người dùng nói ra (tham khảo)
+        audio_url: null,         // không phát gì
+      });
+    }
+
+    if (hasWake(text)) {
+      // Tạo MP3 câu chào
+      const reply = "Dạ, có em. Anh cần giúp gì vậy?";
+      let filename = null;
+      try {
+        filename = await ttsViToFile(reply);
+      } catch (e) {
+        // nếu TTS lỗi vẫn trả wake, nhưng không có audio
+      }
+
+      cleanup();
+      return res.json({
+        success: true,
+        label: "wake",           // bật logic gửi /ask ở client
+        text,
+        reply,
+        audio_url: filename ? `${host}/audio/${filename}` : null,
+        format: filename ? "mp3" : null,
+      });
+    }
+
+    // Không có từ khoá
+    cleanup();
+    return res.json({
+      success: true,
+      label: "none",
+      text,
+      audio_url: null,
+    });
+
+  } catch (err) {
+    console.error("❌ /wake error:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
