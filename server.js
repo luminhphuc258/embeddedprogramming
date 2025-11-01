@@ -185,7 +185,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     // 0) Trim silence (dùng file đã cắt cho tất cả các bước sau)
     const { path: procPath, trimmed } = await trimSilence(wavPath);
     tmpTrim = trimmed;
-    if (trimmed) console.log(`✂️  Trimmed silence -> ${trimmed}`);
+    if (trimmed) console.log(`Trimmed silence -> ${trimmed}`);
 
     // 1) Gửi Python để phân loại nhanh
     console.log("📤 Sending to Python model for classification...");
@@ -221,7 +221,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       lowerText.includes("nghe nhạc") ||
       lowerText.includes("phát nhạc") ||
       lowerText.includes("music") ||
-      lowerText.includes("play music")
+      lowerText.includes("play music") || lowerText.includes("nghe")
     ) {
       label = "nhac";
       console.log("🎵 Keyword detected → overriding label = nhac");
@@ -231,7 +231,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     // 4) Nhánh nhạc (VN only)
     if (label === "nhac") {
-      console.log("🎶 Detected music intent → playing Vietnamese playlist...");
+      console.log("Dang tim kiem nhac tren itune....");
       const defaultSongs = [
         "Top 100 Việt Nam",
         "Nhạc Trẻ",
@@ -240,15 +240,15 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
         "Nhạc Acoustic Việt",
       ];
       const randomSong = defaultSongs[Math.floor(Math.random() * defaultSongs.length)];
-
+      const tenbaihat = lowerText.replace(/(phát|nghe|cho|mở|bật|nhạc|music|play|nghe nhạc|phát nhạc)/g, "").trim();
       try {
-        const song = await searchItunesAndSave(randomSong);
+        const song = await searchItunesAndSave(tenbaihat);
         if (!song) {
           cleanup();
           return res.json({
             success: false,
             type: "music",
-            error: "No Vietnamese song found",
+            error: "Khong tim thay bai hat phu hop tren iTunes VN.",
             audio_url: null,
           });
         }
