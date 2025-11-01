@@ -1,5 +1,8 @@
 // =======================
-// ESP32 Chatbot + KWS + Music + TTS Server (trim silence, keyword "nhac")
+// ESP32 Chatbot + KWS + Vietnamese Music + TTS Server
+// - Trim silence (ffmpeg)
+// - Keyword "nhac" override
+// - iTunes VN only (country=vn, entity=song)
 // =======================
 
 import express from "express";
@@ -42,7 +45,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ===== Helper functions =====
+// ===== Helper: language detection =====
 function detectLanguage(text) {
   const hasVi =
     /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
@@ -52,8 +55,14 @@ function detectLanguage(text) {
   return "mixed";
 }
 
-// ---- Trim leading/trailing silence using ffmpeg ----
-// -45 dB, tối thiểu 0.15s; thêm highpass để bỏ ồn thấp/DC.
+// ===== Helper: detect Vietnamese diacritics =====
+const VI_DIACRITIC_RE =
+  /[ĂÂÊÔƠƯĐáàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴđ]/;
+function hasVietnamese(text = "") {
+  return VI_DIACRITIC_RE.test(String(text).normalize("NFC"));
+}
+
+// ===== Helper: Trim leading/trailing silence with ffmpeg =====
 async function trimSilence(inputPath) {
   const ext = path.extname(inputPath) || ".wav";
   const outPath = inputPath.replace(ext, `_nosil${ext}`);
@@ -63,7 +72,9 @@ async function trimSilence(inputPath) {
       ffmpeg(inputPath)
         .noVideo()
         .audioFilters([
+          // cắt im lặng đầu/cuối: ngưỡng -45 dB, tối thiểu 0.15s
           "silenceremove=start_periods=1:start_duration=0.15:start_threshold=-45dB:stop_periods=1:stop_duration=0.15:stop_threshold=-45dB",
+          // bỏ ồn thấp/DC
           "highpass=f=60",
         ])
         .on("end", resolve)
@@ -71,12 +82,9 @@ async function trimSilence(inputPath) {
         .save(outPath);
     });
 
-    // Nếu sau khi cắt quá ngắn thì dùng file gốc
     const meta = await mm.parseFile(outPath).catch(() => null);
     if (!meta || !meta.format?.duration || meta.format.duration < 0.25) {
-      try {
-        fs.unlinkSync(outPath);
-      } catch { }
+      try { fs.unlinkSync(outPath); } catch { }
       return { path: inputPath, trimmed: null };
     }
     return { path: outPath, trimmed: outPath };
@@ -86,42 +94,44 @@ async function trimSilence(inputPath) {
   }
 }
 
-// ===== Helper: Search iTunes and convert preview to MP3 =====
+// ===== Helper: Search iTunes (VN) and convert preview to MP3 =====
 async function searchItunesAndSave(query) {
   try {
-    // Ưu tiên store Việt Nam + chỉ bài hát
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
-      query
-    )}&media=music&entity=song&country=vn&limit=10`;
+    const url =
+      `https://itunes.apple.com/search?term=${encodeURIComponent(query)}` +
+      `&media=music&entity=song&country=vn&limit=10`;
 
     console.log(`🎶 Searching iTunes (VN) for: ${query}`);
     const resp = await fetch(url);
     if (!resp.ok) throw new Error("iTunes search failed");
+
     const data = await resp.json();
-    if (!data.results?.length) {
+    const results = Array.isArray(data.results) ? data.results : [];
+    if (!results.length) {
       console.warn("⚠️ No iTunes results found (VN).");
       return null;
     }
 
-    // Chọn kết quả có dấu tiếng Việt nếu có
+    // Ưu tiên kết quả có dấu và có previewUrl
     let pick =
-      data.results.find(
+      results.find(
         (r) =>
-          hasVietnamese(r.trackName) ||
-          hasVietnamese(r.artistName) ||
-          hasVietnamese(r.collectionName)
-      ) || data.results[0];
+          r.previewUrl &&
+          (hasVietnamese(r.trackName) ||
+            hasVietnamese(r.artistName) ||
+            hasVietnamese(r.collectionName))
+      ) ||
+      results.find((r) => r.previewUrl) ||
+      null;
+
+    if (!pick || !pick.previewUrl) {
+      console.warn("⚠️ No previewUrl in VN results.");
+      return null;
+    }
 
     const previewUrl = pick.previewUrl;
     const trackName = pick.trackName || "Unknown";
     const artistName = pick.artistName || "Unknown Artist";
-
-    if (!previewUrl) {
-      console.warn("⚠️ No previewUrl, trying another result…");
-      const alt = data.results.find((r) => r.previewUrl);
-      if (!alt) return null;
-      return await searchItunesAndSave(`${alt.artistName} ${alt.trackName}`);
-    }
 
     const tmpM4A = path.join(audioDir, `song_${Date.now()}.m4a`);
     const outMP3 = tmpM4A.replace(".m4a", ".mp3");
@@ -141,9 +151,7 @@ async function searchItunesAndSave(query) {
         .save(outMP3)
     );
 
-    try {
-      fs.unlinkSync(tmpM4A);
-    } catch { }
+    try { fs.unlinkSync(tmpM4A); } catch { }
 
     return {
       title: trackName,
@@ -158,31 +166,28 @@ async function searchItunesAndSave(query) {
 
 // ===== MAIN HANDLER =====
 app.post("/ask", upload.single("audio"), async (req, res) => {
-  let tmpTrim = null; // để dọn file tạm sau cùng
+  let tmpTrim = null; // để thu dọn file tạm (sau trim)
 
   const cleanup = () => {
     try {
-      if (req.file?.path && fs.existsSync(req.file.path))
-        fs.unlinkSync(req.file.path);
+      if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
       if (tmpTrim && fs.existsSync(tmpTrim)) fs.unlinkSync(tmpTrim);
     } catch { }
   };
 
   try {
     if (!req.file)
-      return res
-        .status(400)
-        .json({ success: false, error: "No audio file uploaded", audio_url: null });
+      return res.status(400).json({ success: false, error: "No audio file uploaded", audio_url: null });
 
     const wavPath = req.file.path;
     console.log(`🎧 Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // === NEW: Trim silence trước khi xử lý ===
+    // 0) Trim silence (dùng file đã cắt cho tất cả các bước sau)
     const { path: procPath, trimmed } = await trimSilence(wavPath);
     tmpTrim = trimmed;
     if (trimmed) console.log(`✂️  Trimmed silence -> ${trimmed}`);
 
-    // === Step 1: gửi Python phân loại ===
+    // 1) Gửi Python để phân loại nhanh
     console.log("📤 Sending to Python model for classification...");
     let label = "unknown";
     try {
@@ -196,7 +201,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     }
     console.log("🔹 Initial label:", label);
 
-    // === Step 2: STT để lấy text (trên file đã cắt) ===
+    // 2) STT (dùng file đã cắt)
     let text = "";
     try {
       const tr = await openai.audio.transcriptions.create({
@@ -209,7 +214,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     }
     console.log("🧠 Transcribed text:", text);
 
-    // === Step 3: Keyword detection override for music ===
+    // 3) Keyword override → nhạc Việt
     const lowerText = text.toLowerCase();
     if (
       lowerText.includes("nhạc") ||
@@ -224,13 +229,17 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
 
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
 
-    // === Step 4: Music branch (no song-name extraction) ===
+    // 4) Nhánh nhạc (VN only)
     if (label === "nhac") {
-      console.log("🎶 Detected music intent → playing default playlist...");
-
-      const defaultSongs = ["Vietnam Top Hits", "Pop Chill", "Relaxing Music"];
-      const randomSong =
-        defaultSongs[Math.floor(Math.random() * defaultSongs.length)];
+      console.log("🎶 Detected music intent → playing Vietnamese playlist...");
+      const defaultSongs = [
+        "Top 100 Việt Nam",
+        "Nhạc Trẻ",
+        "V-Pop Hits Vietnam",
+        "Ballad Việt",
+        "Nhạc Acoustic Việt",
+      ];
+      const randomSong = defaultSongs[Math.floor(Math.random() * defaultSongs.length)];
 
       try {
         const song = await searchItunesAndSave(randomSong);
@@ -239,7 +248,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
           return res.json({
             success: false,
             type: "music",
-            error: "No song found",
+            error: "No Vietnamese song found",
             audio_url: null,
           });
         }
@@ -266,7 +275,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }
     }
 
-    // === Step 5: Normal chat branch ===
+    // 5) Nhánh chat
     console.log("💬 Proceeding to chat branch...");
 
     const lang = detectLanguage(text);
@@ -326,15 +335,13 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     });
   } catch (err) {
     console.error("❌ /ask error:", err);
-    res
-      .status(500)
-      .json({ success: false, error: err.message, audio_url: null });
+    res.status(500).json({ success: false, error: err.message, audio_url: null });
   }
 });
 
 // ===== ROUTES =====
 app.get("/", (req, res) =>
-  res.send("✅ ESP32 Chatbot server (trim silence + keyword nhac) is running!")
+  res.send("✅ ESP32 Chatbot server (trim silence + VN music + keyword nhac) is running!")
 );
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
