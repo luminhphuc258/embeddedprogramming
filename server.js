@@ -1,8 +1,9 @@
 // =======================
-// ESP32 Chatbot + KWS + Vietnamese Music + TTS Server
+// ESP32 Chatbot + KWS + Vietnamese Music + TTS Server (VN-first)
 // - Trim silence (ffmpeg)
-// - Keyword "nhac" override
-// - iTunes VN only (country=vn, entity=song)
+// - Only Vietnamese handled; otherwise reply "Mình chưa hiểu..." (vi TTS)
+// - Keyword "nhac" override (VN only)
+// - iTunes VN (country=vn, entity=song)
 // =======================
 
 import express from "express";
@@ -45,24 +46,61 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ===== Helper: language detection =====
-function detectLanguage(text) {
-  const hasVi =
-    /[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/i.test(text);
-  const hasEn = /[a-zA-Z]/.test(text);
-  if (hasVi && !hasEn) return "vi";
-  if (hasEn && !hasVi) return "en";
-  return "mixed";
-}
-
-// ===== Helper: detect Vietnamese diacritics =====
+// ===== Language helpers =====
 const VI_DIACRITIC_RE =
   /[ĂÂÊÔƠƯĐáàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴđ]/;
+
+function stripDiacritics(s = "") {
+  return String(s)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D");
+}
+
 function hasVietnamese(text = "") {
   return VI_DIACRITIC_RE.test(String(text).normalize("NFC"));
 }
 
-// ===== Helper: Trim leading/trailing silence with ffmpeg =====
+// Bảng chữ cái ngoại (CJK, Cyrillic, Arabic, Hebrew, Thai, Devanagari, Hangul…)
+const FOREIGN_SCRIPT_RE =
+  /[\u0400-\u04FF\u0600-\u06FF\u0590-\u05FF\u0E00-\u0E7F\u0900-\u097F\u3040-\u30FF\u3130-\u318F\uAC00-\uD7AF\u3400-\u9FFF\uF900-\uFAFF]/;
+
+function containsForeignScript(text = "") {
+  return FOREIGN_SCRIPT_RE.test(text);
+}
+
+// Từ tiếng Việt phổ biến (sau khi bỏ dấu) để nhận biết khi không có dấu
+const VN_COMMON_WORDS = [
+  "xin chao", "chao", "ban", "toi", "minh", "anh", "em",
+  "nhac", "nghe nhac", "phat nhac", "mo nhac", "bat nhac",
+  "cam on", "cam on ban", "doremon", "do re mon", "doremon oi",
+  "gi", "gi vay", "duoc khong", "phai", "trai", "tien", "lui",
+  "phat", "nghe", "mo", "bat"
+];
+
+function looksVietnameseWithoutDiacritics(text = "") {
+  const t = stripDiacritics(text).toLowerCase();
+  return VN_COMMON_WORDS.some(w => t.includes(w));
+}
+
+function isLikelyVietnamese(text = "") {
+  // Ưu tiên: có dấu → chắc chắn VI
+  if (hasVietnamese(text)) return true;
+  // Không có dấu: chấp nhận nếu có nhiều từ Việt phổ biến
+  if (looksVietnameseWithoutDiacritics(text)) return true;
+  return false;
+}
+
+function isNonsenseOrTooShort(text = "") {
+  const t = (text || "").trim();
+  if (t.length < 2) return true;
+  // nếu toàn dấu, số, ký tự lạ
+  const letters = (t.match(/[A-Za-zÀ-ỹ]/g) || []).length;
+  return letters < Math.ceil(t.length * 0.25);
+}
+
+// ===== Trim leading/trailing silence =====
 async function trimSilence(inputPath) {
   const ext = path.extname(inputPath) || ".wav";
   const outPath = inputPath.replace(ext, `_nosil${ext}`);
@@ -72,9 +110,7 @@ async function trimSilence(inputPath) {
       ffmpeg(inputPath)
         .noVideo()
         .audioFilters([
-          // cắt im lặng đầu/cuối: ngưỡng -45 dB, tối thiểu 0.15s
           "silenceremove=start_periods=1:start_duration=0.15:start_threshold=-45dB:stop_periods=1:stop_duration=0.15:stop_threshold=-45dB",
-          // bỏ ồn thấp/DC
           "highpass=f=60",
         ])
         .on("end", resolve)
@@ -94,40 +130,27 @@ async function trimSilence(inputPath) {
   }
 }
 
-// ====== (1) Helper: bỏ dấu tiếng Việt & so khớp từ khoá ======
-function stripDiacritics(s) {
-  // đơn giản hoá để so khớp "cám ơn" / "cảm ơn", "đô rê mon" ...
-  return s
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")   // remove accents
-    .replace(/đ/g, "d")
-    .replace(/Đ/g, "D");
-}
-
+// ===== Keyword helpers (VN) =====
 function hasWake(text) {
   const t = stripDiacritics(text.toLowerCase());
-  // các biến thể phổ biến
   return (
-    t.includes("doremon") || t.includes("do re mon") || t.includes("do remon") || t.includes("xin chao") || t.includes("xin chào") ||
-    t.includes("hello") || t.includes("doremon oi") || t.includes("do re mon oi")
+    t.includes("doremon") || t.includes("do re mon") || t.includes("doremon oi") ||
+    t.includes("xin chao") || t.includes("xin chào")
   );
 }
 
 function hasStop(text) {
   const t = stripDiacritics(text.toLowerCase());
-  return (
-    t.includes("cam on ban") || t.includes("cam on nhe") ||
-    t.includes("thank you") || t.includes("thanks")
-  );
+  return t.includes("cam on") || t.includes("cam on ban");
 }
 
-// ====== (2) Helper: TTS tiếng Việt, trả về đường dẫn MP3 ======
+// ===== TTS (Vietnamese) =====
 async function ttsViToFile(text) {
-  const filename = `wake_${Date.now()}.mp3`;
+  const filename = `tts_${Date.now()}.mp3`;
   const outPath = path.join(audioDir, filename);
   const speech = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
-    voice: "nova",          // giọng VI
+    voice: "nova",
     format: "mp3",
     input: text,
   });
@@ -135,7 +158,8 @@ async function ttsViToFile(text) {
   fs.writeFileSync(outPath, buf);
   return filename;
 }
-// ===== Helper: Search iTunes (VN) and convert preview to MP3 =====
+
+// ===== iTunes VN search & convert preview to mp3 =====
 async function searchItunesAndSave(query) {
   try {
     const url =
@@ -153,7 +177,6 @@ async function searchItunesAndSave(query) {
       return null;
     }
 
-    // Ưu tiên kết quả có dấu và có previewUrl
     let pick =
       results.find(
         (r) =>
@@ -205,9 +228,9 @@ async function searchItunesAndSave(query) {
   }
 }
 
-// ===== MAIN HANDLER =====
+// ===== /ask =====
 app.post("/ask", upload.single("audio"), async (req, res) => {
-  let tmpTrim = null; // để thu dọn file tạm (sau trim)
+  let tmpTrim = null;
 
   const cleanup = () => {
     try {
@@ -223,12 +246,12 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     const wavPath = req.file.path;
     console.log(`🎧 Received ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // 0) Trim silence (dùng file đã cắt cho tất cả các bước sau)
+    // 0) Trim silence
     const { path: procPath, trimmed } = await trimSilence(wavPath);
     tmpTrim = trimmed;
     if (trimmed) console.log(`Trimmed silence -> ${trimmed}`);
 
-    // 1) Gửi Python để phân loại nhanh
+    // 1) Quick classifier (KWS)
     console.log("📤 Sending to Python model for classification...");
     let label = "unknown";
     try {
@@ -242,7 +265,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     }
     console.log("🔹 Initial label:", label);
 
-    // 2) STT (dùng file đã cắt)
+    // 2) STT
     let text = "";
     try {
       const tr = await openai.audio.transcriptions.create({
@@ -255,41 +278,57 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     }
     console.log("🧠 Transcribed text:", text);
 
-    // 3) Keyword override → nhạc Việt
-    const lowerText = text.toLowerCase();
-    if (
-      lowerText.includes("nhạc") ||
-      lowerText.includes("nghe nhạc") ||
-      lowerText.includes("phát nhạc") ||
-      lowerText.includes("music") ||
-      lowerText.includes("play music") || lowerText.includes("nghe")
-    ) {
-      label = "nhac";
-      console.log("🎵 Keyword detected → overriding label = nhac");
+    // 2.5) Vietnamese-first filter
+    // - Nếu không phải tiếng Việt / chứa bảng chữ cái ngoại / câu vô nghĩa → trả lời “Mình chưa hiểu…” (vi TTS)
+    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+    const notVietnamese =
+      !isLikelyVietnamese(text) || containsForeignScript(text) || isNonsenseOrTooShort(text);
+
+    if (notVietnamese) {
+      const reply = "Mình chưa hiểu câu này. Bạn nói lại bằng tiếng Việt nhé.";
+      let file = null;
+      try {
+        file = await ttsViToFile(reply);
+      } catch { }
+      cleanup();
+      return res.json({
+        success: true,
+        type: "chat",
+        label: "unknown_vi_only",
+        text: reply,
+        lang: "vi",
+        audio_url: file ? `${host}/audio/${file}` : null,
+        format: file ? "mp3" : null,
+      });
     }
 
-    const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+    // 3) Keyword override → nhạc VN
+    const lowerNoAccent = stripDiacritics(text.toLowerCase());
+    const isMusic =
+      lowerNoAccent.includes("nhac") ||
+      lowerNoAccent.includes("nghe nhac") ||
+      lowerNoAccent.includes("phat nhac") ||
+      lowerNoAccent.match(/\b(phat|mo|bat)\b.+\bnhac\b/);
 
-    // 4) Nhánh nhạc (VN only)
+    if (isMusic) {
+      label = "nhac";
+      console.log("🎵 Keyword detected (VI) → overriding label = nhac");
+    }
+
+    // 4) Music branch (VN only)
     if (label === "nhac") {
-      console.log("Dang tim kiem nhac tren itune....");
-      const defaultSongs = [
-        "Top 100 Việt Nam",
-        "Nhạc Trẻ",
-        "V-Pop Hits Vietnam",
-        "Ballad Việt",
-        "Nhạc Acoustic Việt",
-      ];
-      const randomSong = defaultSongs[Math.floor(Math.random() * defaultSongs.length)];
-      const tenbaihat = lowerText.replace(/(phát|nghe|cho|mở|bật|nhạc|music|play|nghe nhạc|phát nhạc)/g, "").trim();
+      const tenbaihat = text
+        .replace(/(phát|nghe|cho|mở|bật|nhạc)/gi, "")
+        .trim();
+
       try {
-        const song = await searchItunesAndSave(tenbaihat);
+        const song = await searchItunesAndSave(tenbaihat || "V-Pop");
         if (!song) {
           cleanup();
           return res.json({
             success: false,
             type: "music",
-            error: "Khong tim thay bai hat phu hop tren iTunes VN.",
+            error: "Không tìm thấy bài hát phù hợp trên iTunes VN.",
             audio_url: null,
           });
         }
@@ -316,30 +355,20 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       }
     }
 
-    // 5) Nhánh chat
-    console.log("💬 Proceeding to chat branch...");
-
-    const lang = detectLanguage(text);
-    const finalLang = lang === "mixed" ? "vi" : lang;
-
-    let answer = finalLang === "vi" ? "Xin chào!" : "Hello!";
+    // 5) Chat branch (VN only)
+    console.log("💬 Proceeding to chat branch (VI)...");
+    let answer = "Xin chào!";
     try {
       const chat = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
-            content:
-              finalLang === "vi"
-                ? "Bạn là một cô gái trẻ, thân thiện, nói tự nhiên bằng tiếng Việt."
-                : "You are a friendly young woman who speaks natural English.",
+            content: "Bạn là một cô gái trẻ, thân thiện, nói tự nhiên bằng tiếng Việt.",
           },
           {
             role: "user",
-            content:
-              finalLang === "vi"
-                ? `Người dùng nói: "${text}". Trả lời thân thiện, ngắn gọn bằng tiếng Việt.`
-                : `User said: "${text}". Reply briefly in friendly English.`,
+            content: `Người dùng nói: "${text}". Trả lời thân thiện, ngắn gọn bằng tiếng Việt.`,
           },
         ],
       });
@@ -353,7 +382,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
     try {
       const speech = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
-        voice: finalLang === "vi" ? "nova" : "verse",
+        voice: "nova",
         format: "mp3",
         input: answer,
       });
@@ -370,7 +399,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
       type: "chat",
       label,
       text: answer,
-      lang: finalLang,
+      lang: "vi",
       audio_url: `${host}/audio/${filename}`,
       format: "mp3",
     });
@@ -380,7 +409,7 @@ app.post("/ask", upload.single("audio"), async (req, res) => {
   }
 });
 
-// ====== (3) API: /wake  — phát hiện "doremon (ơi)" hoặc "cám ơn bạn" ======
+// ===== /wake =====
 app.post("/wake", upload.single("audio"), async (req, res) => {
   const cleanup = () => {
     try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch { }
@@ -394,7 +423,6 @@ app.post("/wake", upload.single("audio"), async (req, res) => {
     const wavPath = req.file.path;
     let text = "";
 
-    // STT: chuyển âm thanh thành text
     try {
       const tr = await openai.audio.transcriptions.create({
         file: fs.createReadStream(wavPath),
@@ -406,32 +434,34 @@ app.post("/wake", upload.single("audio"), async (req, res) => {
       return res.json({ success: false, label: "none", error: "transcribe_failed" });
     }
 
+    // Chỉ chấp nhận tiếng Việt cho wake
+    if (!isLikelyVietnamese(text) || containsForeignScript(text) || isNonsenseOrTooShort(text)) {
+      cleanup();
+      return res.json({ success: true, label: "none", text, audio_url: null });
+    }
+
     const host = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
-    // So khớp từ khoá
+
     if (hasStop(text)) {
       cleanup();
       return res.json({
         success: true,
-        label: "yen",            // dừng mic ở client
-        text,                    // câu người dùng nói ra (tham khảo)
-        audio_url: null,         // không phát gì
+        label: "yen",
+        text,
+        audio_url: null,
       });
     }
 
     if (hasWake(text)) {
-      // Tạo MP3 câu chào
       const reply = "Dạ, có em. Anh cần giúp gì vậy?";
       let filename = null;
       try {
         filename = await ttsViToFile(reply);
-      } catch (e) {
-        // nếu TTS lỗi vẫn trả wake, nhưng không có audio
-      }
-
+      } catch { }
       cleanup();
       return res.json({
         success: true,
-        label: "wake",           // bật logic gửi /ask ở client
+        label: "wake",
         text,
         reply,
         audio_url: filename ? `${host}/audio/${filename}` : null,
@@ -439,14 +469,8 @@ app.post("/wake", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // Không có từ khoá
     cleanup();
-    return res.json({
-      success: true,
-      label: "none",
-      text,
-      audio_url: null,
-    });
+    return res.json({ success: true, label: "none", text, audio_url: null });
 
   } catch (err) {
     console.error("❌ /wake error:", err);
@@ -456,7 +480,7 @@ app.post("/wake", upload.single("audio"), async (req, res) => {
 
 // ===== ROUTES =====
 app.get("/", (req, res) =>
-  res.send("✅ ESP32 Chatbot server (trim silence + VN music + keyword nhac) is running!")
+  res.send("✅ ESP32 Chatbot server (VN-first, trim silence, VN music) is running!")
 );
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
