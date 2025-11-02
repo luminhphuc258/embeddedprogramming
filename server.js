@@ -108,8 +108,8 @@ function hasWake(text) {
   const t = stripDiacritics(text.toLowerCase());
   // các biến thể phổ biến
   return (
-    t.includes("doremon") || t.includes("do re mon") || t.includes("do remon") ||
-    t.includes("doremon oi") || t.includes("do re mon oi")
+    t.includes("doremon") || t.includes("do re mon") || t.includes("do remon") || t.includes("xin chao") || t.includes("xin chào") ||
+    t.includes("hello") || t.includes("doremon oi") || t.includes("do re mon oi")
   );
 }
 
