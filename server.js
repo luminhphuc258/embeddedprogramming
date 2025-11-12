@@ -56,9 +56,9 @@ function hasWakeWord(text = "") {
 }
 
 /* ========= NEW: Route nhận file từ ESP32 qua HTTP POST ========= */
-const upload = multer(); // nhận binary audio/wav
+const upload = multer({ storage: multer.memoryStorage() }) // nhận binary audio/wav
 
-app.post("/upload_audio", upload.none(), async (req, res) => {
+app.post("/upload_audio", upload.single("audio"), async (req, res) => {
   try {
     // ESP32 gửi raw binary => ta đọc toàn bộ body
     let chunks = [];
