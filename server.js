@@ -54,6 +54,28 @@ function hasWakeWord(text = "") {
   return /(xin chao|hello|hi|nghe|doremon|lily|pipi|bibi)/.test(t);
 }
 
+/* ========= Hàm xác định lại nhãn (label override) ========= */
+function overrideLabelByText(label, text) {
+  const t = stripDiacritics(text.toLowerCase());
+
+  // các nhóm từ khóa và label tương ứng
+  const rules = [
+    { keywords: ["bai hat", "nghe nhac", "phat nhac", "bat nhac", "mo bai", "nghe"], newLabel: "nhac" },
+    { keywords: ["di chuyen sang trai", "qua trai", "ben trai", "di ben trai"], newLabel: "trai" },
+    { keywords: ["quay ben phai", "qua phai", "di ben phai"], newLabel: "phai" },
+    { keywords: ["tien len", "di toi", "di ve phia truoc", "tien toi"], newLabel: "tien" },
+    { keywords: ["lui lai", "di lui", "di ve sau"], newLabel: "lui" },
+  ];
+
+  for (const rule of rules) {
+    if (rule.keywords.some((kw) => t.includes(kw))) {
+      console.log(`🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`);
+      return rule.newLabel;
+    }
+  }
+  return label;
+}
+
 /* ========= Route nhận audio từ Flask client ========= */
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -78,7 +100,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     });
     console.log(`🎵 Converted to WAV: ${wavFile}`);
 
-    // 1️⃣ Speech-to-Text (STT) qua OpenAI
+    // 1️⃣ Speech-to-Text (STT)
     let text = "";
     try {
       const tr = await openai.audio.transcriptions.create({
@@ -92,7 +114,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     }
     console.log("🧠 Transcript:", text);
 
-    // 2️⃣ Nếu không có wake word thì chỉ trả transcript
+    // 2️⃣ Nếu không có wake word → chỉ log transcript
     if (!hasWakeWord(text)) {
       fs.unlinkSync(inputFile);
       fs.unlinkSync(wavFile);
@@ -110,9 +132,13 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     } catch (e) {
       console.warn("⚠️ Python model unreachable:", e.message);
     }
-    console.log("🔹 Label:", label);
 
-    // 4️⃣ Sinh phản hồi TTS
+    // 4️⃣ Override label nếu có từ khóa trong transcript
+    const oldLabel = label;
+    label = overrideLabelByText(label, text);
+    console.log(`🔹 Final Label: ${label} (was ${oldLabel})`);
+
+    // 5️⃣ Sinh phản hồi TTS
     const reply = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
     const filename = `tts_${Date.now()}.mp3`;
     const outPath = path.join(audioDir, filename);
@@ -126,7 +152,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     const buf = Buffer.from(await speech.arrayBuffer());
     fs.writeFileSync(outPath, buf);
 
-    // 5️⃣ Gửi đường dẫn phát âm thanh qua MQTT
+    // 6️⃣ Gửi đường dẫn phát âm thanh qua MQTT
     const host =
       process.env.PUBLIC_BASE_URL ||
       `https://${process.env.RAILWAY_STATIC_URL || "localhost:" + PORT}`;
@@ -143,7 +169,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 
     console.log(`📢 Published audio to robot/music: ${audioUrl}`);
 
-    // 6️⃣ Xoá file tạm
+    // 7️⃣ Xoá file tạm
     fs.unlinkSync(inputFile);
     fs.unlinkSync(wavFile);
 
