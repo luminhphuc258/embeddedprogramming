@@ -23,7 +23,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const audioDir = path.join(__dirname, "public/audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
-/* ========= CORS cho video server ========= */
+/* ========= CORS ========= */
 const allowedOrigins = [
   "https://videoserver-videoserver.up.railway.app",
   "http://localhost:8000",
@@ -43,7 +43,6 @@ app.use(
   })
 );
 
-// preflight cho route upload_audio
 app.options("/upload_audio", cors());
 
 /* ========= Static ========= */
@@ -67,7 +66,7 @@ mqttClient.on("connect", () => {
 });
 mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
 
-/* ========= Helper Functions ========= */
+/* ========= Helpers ========= */
 function stripDiacritics(s = "") {
   return s
     .normalize("NFD")
@@ -76,13 +75,6 @@ function stripDiacritics(s = "") {
     .replace(/Đ/g, "D");
 }
 
-// (Giữ lại nếu muốn dùng sau, nhưng hiện tại không gọi nữa)
-function hasWakeWord(text = "") {
-  const t = stripDiacritics(text.toLowerCase());
-  return /(xin chao|hello|hi|nghe|doremon|lily|pipi|bibi)/.test(t);
-}
-
-/** Tên bài hát từ câu lệnh tiếng Việt */
 function extractSongQuery(text = "") {
   let t = stripDiacritics(text.toLowerCase());
 
@@ -111,12 +103,10 @@ function extractSongQuery(text = "") {
   ];
 
   for (const p of removePhrases) t = t.replace(p, " ");
-
   t = t.replace(/\s+/g, " ").trim();
-  return t; // query để search iTunes
+  return t;
 }
 
-/** Gọi iTunes Search API để tìm nhạc */
 async function searchITunes(query) {
   if (!query) return null;
 
@@ -137,12 +127,11 @@ async function searchITunes(query) {
   return {
     trackName: r.trackName,
     artistName: r.artistName,
-    previewUrl: r.previewUrl, // thường là .m4a 30s
+    previewUrl: r.previewUrl,
     artworkUrl: r.artworkUrl100 || r.artworkUrl60,
   };
 }
 
-/* ========= Helper: host & download / convert ========= */
 function getPublicHost() {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL;
   const railway = process.env.RAILWAY_STATIC_URL;
@@ -162,18 +151,12 @@ async function downloadFile(url, destPath) {
   });
 }
 
+/** convert input -> MP3 kiểu giống server cũ (đã từng chạy OK) */
 async function convertToMp3(inputPath, outputPath) {
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
-      .noVideo()
-      .audioCodec("libmp3lame")
-      .audioChannels(1)          // mono
-      .audioFrequency(24000)     // 24 kHz
-      .audioBitrate("96k")       // 96 kbps
-      .format("mp3")
-      .on("start", (cmd) => {
-        console.log("🎬 ffmpeg start:", cmd);
-      })
+      .toFormat("mp3")
+      .on("start", (cmd) => console.log("🎬 ffmpeg start:", cmd))
       .on("error", (err) => {
         console.error("❌ ffmpeg error:", err.message);
         reject(err);
@@ -186,21 +169,18 @@ async function convertToMp3(inputPath, outputPath) {
   });
 }
 
-
-/** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
 /** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
 async function getMp3FromPreview(previewUrl) {
   const ts = Date.now();
-  const tmpM4a = path.join(audioDir, `itunes_${ts}.m4a`);
-  const mp3FileName = `itunes_${ts}.mp3`;
+  const tmpM4a = path.join(audioDir, `song_${ts}.m4a`);
+  const mp3FileName = `song_${ts}.mp3`;
   const mp3Path = path.join(audioDir, mp3FileName);
 
   console.log("⬇️ Downloading preview:", previewUrl);
   await downloadFile(previewUrl, tmpM4a);
-  console.log("📁 Saved preview:", tmpM4a);
 
+  console.log("🎼 Converting preview → mp3...");
   await convertToMp3(tmpM4a, mp3Path);
-
   try {
     fs.unlinkSync(tmpM4a);
   } catch (e) {
@@ -213,24 +193,22 @@ async function getMp3FromPreview(previewUrl) {
   return url;
 }
 
-
-/* ========= Hàm override label ========= */
+/* ========= Label override ========= */
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
-  // Ưu tiên 1: Question
   const questionKeywords = [
     " la ai",
     " là ai",
-    "?",
     "hay cho toi biet",
     "hãy cho toi biet",
-    "hay cho toi biet",
     "hay cho em biet",
     "hãy cho em biết",
     "hay cho toi biet ve",
     "hãy cho tôi biết",
+    "ban co biet",
     "bạn có biết",
+    "cho toi hoi",
     "cho tôi hỏi",
   ];
   if (questionKeywords.some((kw) => t.includes(kw))) {
@@ -238,7 +216,6 @@ function overrideLabelByText(label, text) {
     return "question";
   }
 
-  // Các rule còn lại như cũ
   const rules = [
     {
       keywords: [
@@ -313,7 +290,7 @@ function overrideLabelByText(label, text) {
   return label;
 }
 
-/* ========= Route nhận audio từ video server ========= */
+/* ========= /upload_audio ========= */
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/upload_audio", upload.single("audio"), async (req, res) => {
@@ -328,7 +305,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       `🎧 Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`
     );
 
-    // 🔄 webm → wav
+    // webm → wav
     const wavFile = inputFile.replace(".webm", ".wav");
     await new Promise((resolve, reject) => {
       ffmpeg(inputFile)
@@ -339,7 +316,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     });
     console.log(`🎵 Converted to WAV: ${wavFile}`);
 
-    // 1️⃣ STT
+    // STT
     let text = "";
     try {
       const tr = await openai.audio.transcriptions.create({
@@ -353,9 +330,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     }
     console.log("🧠 Transcript:", text);
 
-    // === Không còn wake word: luôn xử lý ===
-
-    // 2️⃣ Label chỉ dựa trên text (không gọi Python)
     let label = "unknown";
     label = overrideLabelByText(label, text);
     console.log(`🔹 Final Label: ${label}`);
@@ -364,7 +338,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     let musicMeta = null;
     let replyText = "";
 
-    // 3️⃣ Nhạc: dùng iTunes + convert .m4a → .mp3
+    // Nhạc: iTunes + convert
     if (label === "nhac") {
       const query = extractSongQuery(text) || text;
       console.log("🎼 Music query:", query);
@@ -381,15 +355,18 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
           playbackUrl = mp3Url;
           replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
           console.log("🎧 iTunes hit:", musicMeta);
-          console.log("🎧 MP3 URL:", playbackUrl);
         } catch (e) {
           console.warn("⚠️ Convert preview to mp3 error:", e.message);
+          // fallback: không ngắt request, sẽ dùng TTS mặc định
+          replyText = "Dạ, em không mở được bài nhạc này, anh thử bài khác nhé.";
         }
+      } else {
+        replyText = "Dạ, em không tìm được bài nhạc phù hợp.";
       }
     }
 
-    // 4️⃣ Câu hỏi: gọi ChatGPT trả lời
-    if (label !== "nhac") {
+    // Question: hỏi gì đó → ChatGPT trả lời
+    if (label === "question") {
       try {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
@@ -411,8 +388,12 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       }
     }
 
+    // Các label khác → câu mặc định nếu chưa có replyText
+    if (!replyText && label !== "nhac" && label !== "question") {
+      replyText = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
+    }
 
-    // 6️⃣ Nếu chưa có playbackUrl (không phải nhạc hoặc nhạc fail) → TTS
+    // Nếu vẫn chưa có playbackUrl → TTS replyText
     if (!playbackUrl) {
       const filename = `tts_${Date.now()}.mp3`;
       const outPath = path.join(audioDir, filename);
@@ -421,7 +402,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         model: "gpt-4o-mini-tts",
         voice: "nova",
         format: "mp3",
-        input: replyText,
+        input: replyText || "Dạ, em đây ạ!",
       });
       const buf = Buffer.from(await speech.arrayBuffer());
       fs.writeFileSync(outPath, buf);
@@ -430,7 +411,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       playbackUrl = `${host}/audio/${filename}`;
     }
 
-    // 7️⃣ Publish cho robot
     const payload = {
       audio_url: playbackUrl,
       text: replyText,
@@ -441,7 +421,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     mqttClient.publish("robot/music", JSON.stringify(payload));
     console.log("📢 Published to robot/music:", payload);
 
-    // 8️⃣ Xoá file tạm
     try {
       fs.unlinkSync(inputFile);
       fs.unlinkSync(wavFile);
@@ -449,7 +428,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       console.warn("⚠️ Cannot delete temp files:", e.message);
     }
 
-    // 9️⃣ Trả kết quả cho video server
     res.json({
       status: "ok",
       transcript: text,
@@ -463,7 +441,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
   }
 });
 
-/* ========= Root route ========= */
+/* ========= Root ========= */
 app.get("/", (_, res) => res.send("✅ Node.js Audio+AI Server is running!"));
 
 app.listen(PORT, () => console.log(`🚀 HTTP server running on port ${PORT}`));
