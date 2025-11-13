@@ -165,13 +165,29 @@ async function downloadFile(url, destPath) {
 async function convertToMp3(inputPath, outputPath) {
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
-      .toFormat("mp3")
-      .on("error", reject)
-      .on("end", resolve)
+      .noVideo()
+      .audioCodec("libmp3lame")
+      .audioChannels(1)          // mono
+      .audioFrequency(24000)     // 24 kHz
+      .audioBitrate("96k")       // 96 kbps
+      .format("mp3")
+      .on("start", (cmd) => {
+        console.log("🎬 ffmpeg start:", cmd);
+      })
+      .on("error", (err) => {
+        console.error("❌ ffmpeg error:", err.message);
+        reject(err);
+      })
+      .on("end", () => {
+        console.log("✅ ffmpeg done:", outputPath);
+        resolve();
+      })
       .save(outputPath);
   });
 }
 
+
+/** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
 /** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
 async function getMp3FromPreview(previewUrl) {
   const ts = Date.now();
@@ -179,8 +195,12 @@ async function getMp3FromPreview(previewUrl) {
   const mp3FileName = `itunes_${ts}.mp3`;
   const mp3Path = path.join(audioDir, mp3FileName);
 
+  console.log("⬇️ Downloading preview:", previewUrl);
   await downloadFile(previewUrl, tmpM4a);
+  console.log("📁 Saved preview:", tmpM4a);
+
   await convertToMp3(tmpM4a, mp3Path);
+
   try {
     fs.unlinkSync(tmpM4a);
   } catch (e) {
@@ -188,8 +208,11 @@ async function getMp3FromPreview(previewUrl) {
   }
 
   const host = getPublicHost();
-  return `${host}/audio/${mp3FileName}`;
+  const url = `${host}/audio/${mp3FileName}`;
+  console.log("🎧 Final MP3 URL:", url);
+  return url;
 }
+
 
 /* ========= Hàm override label ========= */
 function overrideLabelByText(label, text) {
@@ -199,6 +222,7 @@ function overrideLabelByText(label, text) {
   const questionKeywords = [
     " la ai",
     " là ai",
+    "?",
     "hay cho toi biet",
     "hãy cho toi biet",
     "hay cho toi biet",
@@ -206,6 +230,8 @@ function overrideLabelByText(label, text) {
     "hãy cho em biết",
     "hay cho toi biet ve",
     "hãy cho tôi biết",
+    "bạn có biết",
+    "cho tôi hỏi",
   ];
   if (questionKeywords.some((kw) => t.includes(kw))) {
     console.log("🔁 Label override → 'question' (detect question)");
@@ -363,7 +389,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     }
 
     // 4️⃣ Câu hỏi: gọi ChatGPT trả lời
-    if (label === "question") {
+    if (label !== "nhac") {
       try {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
@@ -385,10 +411,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       }
     }
 
-    // 5️⃣ Các label khác (tien, lui, trai, phai, unknown...) → câu trả lời mặc định
-    if (!replyText && label !== "nhac") {
-      replyText = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
-    }
 
     // 6️⃣ Nếu chưa có playbackUrl (không phải nhạc hoặc nhạc fail) → TTS
     if (!playbackUrl) {
