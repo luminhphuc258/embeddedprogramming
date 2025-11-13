@@ -10,6 +10,7 @@ import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
+import cors from "cors";              // 👈 THÊM CORS
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -23,6 +24,30 @@ const PYTHON_API = "https://mylocalpythonserver-mypythonserver.up.railway.app/pr
 const audioDir = path.join(__dirname, "public/audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
+/* ========= CORS cho video server ========= */
+// origin của video server trên Railway
+const allowedOrigins = [
+  "https://videoserver-videoserver.up.railway.app",
+  "http://localhost:8080" // để test local, có thể bỏ
+];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
+// đảm bảo preflight cho route upload_audio
+app.options("/upload_audio", cors());
+
+/* ========= Static ========= */
 // Cho phép truy cập file âm thanh qua HTTP
 app.use("/audio", express.static(audioDir));
 
@@ -46,7 +71,11 @@ mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
 
 /* ========= Helper Functions ========= */
 function stripDiacritics(s = "") {
-  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/Đ/g, "D");
+  return s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D");
 }
 
 function hasWakeWord(text = "") {
@@ -58,25 +87,41 @@ function hasWakeWord(text = "") {
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
-  // các nhóm từ khóa và label tương ứng
   const rules = [
-    { keywords: ["bai hat", "nghe nhac", "phat nhac", "bat nhac", "mo bai", "nghe"], newLabel: "nhac" },
-    { keywords: ["di chuyen sang trai", "qua trai", "ben trai", "di ben trai"], newLabel: "trai" },
-    { keywords: ["quay ben phai", "qua phai", "di ben phai"], newLabel: "phai" },
-    { keywords: ["tien len", "di toi", "di ve phia truoc", "tien toi"], newLabel: "tien" },
-    { keywords: ["lui lai", "di lui", "di ve sau"], newLabel: "lui" },
+    {
+      keywords: ["bai hat", "nghe nhac", "phat nhac", "bat nhac", "mo bai", "nghe"],
+      newLabel: "nhac",
+    },
+    {
+      keywords: ["di chuyen sang trai", "qua trai", "ben trai", "di ben trai"],
+      newLabel: "trai",
+    },
+    {
+      keywords: ["quay ben phai", "qua phai", "di ben phai"],
+      newLabel: "phai",
+    },
+    {
+      keywords: ["tien len", "di toi", "di ve phia truoc", "tien toi"],
+      newLabel: "tien",
+    },
+    {
+      keywords: ["lui lai", "di lui", "di ve sau"],
+      newLabel: "lui",
+    },
   ];
 
   for (const rule of rules) {
     if (rule.keywords.some((kw) => t.includes(kw))) {
-      console.log(`🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`);
+      console.log(
+        `🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`
+      );
       return rule.newLabel;
     }
   }
   return label;
 }
 
-/* ========= Route nhận audio từ Flask client ========= */
+/* ========= Route nhận audio từ Flask / video server ========= */
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/upload_audio", upload.single("audio"), async (req, res) => {
@@ -87,7 +132,9 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 
     const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
     fs.writeFileSync(inputFile, req.file.buffer);
-    console.log(`🎧 Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`);
+    console.log(
+      `🎧 Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`
+    );
 
     // 🔄 Chuyển webm → wav để gửi lên OpenAI
     const wavFile = inputFile.replace(".webm", ".wav");
@@ -173,6 +220,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     fs.unlinkSync(inputFile);
     fs.unlinkSync(wavFile);
 
+    // Trả kết quả cho frontend (video server) dùng để hiển thị transcript
     res.json({ status: "ok", transcript: text, label, audio_url: audioUrl });
   } catch (err) {
     console.error("❌ Upload error:", err);
