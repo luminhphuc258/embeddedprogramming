@@ -5,7 +5,6 @@ import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import FormData from "form-data";
 import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
@@ -20,7 +19,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const PYTHON_API = "https://mylocalpythonserver-mypythonserver.up.railway.app/predict";
+
 const audioDir = path.join(__dirname, "public/audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
@@ -77,12 +76,13 @@ function stripDiacritics(s = "") {
     .replace(/Đ/g, "D");
 }
 
+// (Giữ lại nếu muốn dùng sau, nhưng hiện tại không gọi nữa)
 function hasWakeWord(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   return /(xin chao|hello|hi|nghe|doremon|lily|pipi|bibi)/.test(t);
 }
 
-/** Lấy phần tên bài hát từ câu lệnh tiếng Việt */
+/** Tên bài hát từ câu lệnh tiếng Việt */
 function extractSongQuery(text = "") {
   let t = stripDiacritics(text.toLowerCase());
 
@@ -137,29 +137,96 @@ async function searchITunes(query) {
   return {
     trackName: r.trackName,
     artistName: r.artistName,
-    previewUrl: r.previewUrl, // mp3 30s
+    previewUrl: r.previewUrl, // thường là .m4a 30s
     artworkUrl: r.artworkUrl100 || r.artworkUrl60,
   };
+}
+
+/* ========= Helper: host & download / convert ========= */
+function getPublicHost() {
+  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL;
+  const railway = process.env.RAILWAY_STATIC_URL;
+  if (railway) return `https://${railway}`;
+  return `http://localhost:${PORT}`;
+}
+
+async function downloadFile(url, destPath) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+
+  await new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(destPath);
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
+}
+
+async function convertToMp3(inputPath, outputPath) {
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .toFormat("mp3")
+      .on("error", reject)
+      .on("end", resolve)
+      .save(outputPath);
+  });
+}
+
+/** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
+async function getMp3FromPreview(previewUrl) {
+  const ts = Date.now();
+  const tmpM4a = path.join(audioDir, `itunes_${ts}.m4a`);
+  const mp3FileName = `itunes_${ts}.mp3`;
+  const mp3Path = path.join(audioDir, mp3FileName);
+
+  await downloadFile(previewUrl, tmpM4a);
+  await convertToMp3(tmpM4a, mp3Path);
+  try {
+    fs.unlinkSync(tmpM4a);
+  } catch (e) {
+    console.warn("⚠️ Cannot delete temp m4a:", e.message);
+  }
+
+  const host = getPublicHost();
+  return `${host}/audio/${mp3FileName}`;
 }
 
 /* ========= Hàm override label ========= */
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
+  // Ưu tiên 1: Question
+  const questionKeywords = [
+    " la ai",
+    " là ai",
+    "hay cho toi biet",
+    "hãy cho toi biet",
+    "hay cho toi biet",
+    "hay cho em biet",
+    "hãy cho em biết",
+    "hay cho toi biet ve",
+    "hãy cho tôi biết",
+  ];
+  if (questionKeywords.some((kw) => t.includes(kw))) {
+    console.log("🔁 Label override → 'question' (detect question)");
+    return "question";
+  }
+
+  // Các rule còn lại như cũ
   const rules = [
     {
       keywords: [
-        "nghe bài hát",
         "nghe bai hat",
-        "phát nhạc",
+        "nghe bài hát",
         "phat nhac",
-        "nghe nhạc",
+        "phát nhạc",
         "nghe nhac",
-        "bật nhạc",
+        "nghe nhạc",
         "bat nhac",
+        "bật nhạc",
         "mo bai",
         "mở bài",
-        "nghe bài",
+        "nghe bai",
         "toi muon nghe",
         "tôi muốn nghe",
       ],
@@ -167,10 +234,11 @@ function overrideLabelByText(label, text) {
     },
     {
       keywords: [
+        "qua trai",
         "qua trái",
+        "qua ben trai",
         "qua bên trái",
         "di chuyen sang trai",
-        "qua trai",
         "ben trai",
         "di ben trai",
       ],
@@ -178,21 +246,32 @@ function overrideLabelByText(label, text) {
     },
     {
       keywords: [
-        "qua phải",
-        "xoay bên phải",
-        "qua bên phải",
-        "quay ben phai",
         "qua phai",
+        "qua phải",
+        "xoay ben phai",
+        "xoay bên phải",
+        "qua ben phai",
+        "qua bên phải",
         "di ben phai",
       ],
       newLabel: "phai",
     },
     {
-      keywords: ["tiến lên", "đi lên", "tien len", "di toi", "di ve phia truoc", "tien toi"],
+      keywords: [
+        "tien len",
+        "tiến lên",
+        "di len",
+        "đi lên",
+        "di toi",
+        "đi tới",
+        "di ve phia truoc",
+        "đi về phía trước",
+        "tien toi",
+      ],
       newLabel: "tien",
     },
     {
-      keywords: ["lui lai", "di lui", "di ve sau", "lùi lại", "ve lại", "lùi"],
+      keywords: ["lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
       newLabel: "lui",
     },
   ];
@@ -248,35 +327,18 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     }
     console.log("🧠 Transcript:", text);
 
-    // Không có wake word thì chỉ trả transcript
-    if (!hasWakeWord(text)) {
-      fs.unlinkSync(inputFile);
-      fs.unlinkSync(wavFile);
-      return res.json({ status: "ok", transcript: text });
-    }
+    // === Không còn wake word: luôn xử lý ===
 
-    // 3️⃣ Gửi sang Python model
+    // 2️⃣ Label chỉ dựa trên text (không gọi Python)
     let label = "unknown";
-    try {
-      const form = new FormData();
-      form.append("file", fs.createReadStream(wavFile));
-      const r = await fetch(PYTHON_API, { method: "POST", body: form });
-      const j = await r.json();
-      label = j.label || "unknown";
-    } catch (e) {
-      console.warn("⚠️ Python model unreachable:", e.message);
-    }
-
-    // 4️⃣ Override label
-    const oldLabel = label;
     label = overrideLabelByText(label, text);
-    console.log(`🔹 Final Label: ${label} (was ${oldLabel})`);
+    console.log(`🔹 Final Label: ${label}`);
 
     let playbackUrl = null;
     let musicMeta = null;
     let replyText = "";
 
-    // 5️⃣ Nếu là nhạc → search iTunes
+    // 3️⃣ Nhạc: dùng iTunes + convert .m4a → .mp3
     if (label === "nhac") {
       const query = extractSongQuery(text) || text;
       console.log("🎼 Music query:", query);
@@ -288,15 +350,48 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       }
 
       if (musicMeta && musicMeta.previewUrl) {
-        playbackUrl = musicMeta.previewUrl;
-        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
-        console.log("🎧 iTunes hit:", musicMeta);
+        try {
+          const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
+          playbackUrl = mp3Url;
+          replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
+          console.log("🎧 iTunes hit:", musicMeta);
+          console.log("🎧 MP3 URL:", playbackUrl);
+        } catch (e) {
+          console.warn("⚠️ Convert preview to mp3 error:", e.message);
+        }
       }
     }
 
-    // 6️⃣ Nếu không phải nhạc, hoặc search thất bại → dùng TTS như cũ
+    // 4️⃣ Câu hỏi: gọi ChatGPT trả lời
+    if (label === "question") {
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Bạn là trợ lý nói tiếng Việt cho một robot nhỏ. Trả lời ngắn gọn, dễ hiểu.",
+            },
+            { role: "user", content: text },
+          ],
+        });
+        replyText =
+          completion.choices?.[0]?.message?.content?.trim() ||
+          "Dạ, em chưa chắc lắm, nhưng em sẽ cố gắng tìm hiểu thêm.";
+      } catch (e) {
+        console.error("⚠️ Chat completion error:", e.message);
+        replyText = "Dạ, em bị lỗi khi trả lời câu hỏi này.";
+      }
+    }
+
+    // 5️⃣ Các label khác (tien, lui, trai, phai, unknown...) → câu trả lời mặc định
+    if (!replyText && label !== "nhac") {
+      replyText = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
+    }
+
+    // 6️⃣ Nếu chưa có playbackUrl (không phải nhạc hoặc nhạc fail) → TTS
     if (!playbackUrl) {
-      replyText = replyText || "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
       const filename = `tts_${Date.now()}.mp3`;
       const outPath = path.join(audioDir, filename);
 
@@ -309,9 +404,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       const buf = Buffer.from(await speech.arrayBuffer());
       fs.writeFileSync(outPath, buf);
 
-      const host =
-        process.env.PUBLIC_BASE_URL ||
-        `https://${process.env.RAILWAY_STATIC_URL || "localhost:" + PORT}`;
+      const host = getPublicHost();
       playbackUrl = `${host}/audio/${filename}`;
     }
 
@@ -327,8 +420,12 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     console.log("📢 Published to robot/music:", payload);
 
     // 8️⃣ Xoá file tạm
-    fs.unlinkSync(inputFile);
-    fs.unlinkSync(wavFile);
+    try {
+      fs.unlinkSync(inputFile);
+      fs.unlinkSync(wavFile);
+    } catch (e) {
+      console.warn("⚠️ Cannot delete temp files:", e.message);
+    }
 
     // 9️⃣ Trả kết quả cho video server
     res.json({
