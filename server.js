@@ -338,7 +338,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     let musicMeta = null;
     let replyText = "";
 
-    // Nhạc: iTunes + convert
+    // 1️⃣ Nhạc: iTunes + convert
     if (label === "nhac") {
       const query = extractSongQuery(text) || text;
       console.log("🎼 Music query:", query);
@@ -357,7 +357,6 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
           console.log("🎧 iTunes hit:", musicMeta);
         } catch (e) {
           console.warn("⚠️ Convert preview to mp3 error:", e.message);
-          // fallback: không ngắt request, sẽ dùng TTS mặc định
           replyText = "Dạ, em không mở được bài nhạc này, anh thử bài khác nhé.";
         }
       } else {
@@ -365,8 +364,8 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       }
     }
 
-    // Question: hỏi gì đó → ChatGPT trả lời
-    if (label === "question") {
+    // 2️⃣ MỌI LABEL KHÁC → ChatGPT trả lời
+    if (label !== "nhac") {
       try {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
@@ -384,16 +383,16 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
           "Dạ, em chưa chắc lắm, nhưng em sẽ cố gắng tìm hiểu thêm.";
       } catch (e) {
         console.error("⚠️ Chat completion error:", e.message);
-        replyText = "Dạ, em bị lỗi khi trả lời câu hỏi này.";
+        replyText = "Dạ, em bị lỗi khi trả lời câu này.";
       }
     }
 
-    // Các label khác → câu mặc định nếu chưa có replyText
-    if (!replyText && label !== "nhac" && label !== "question") {
+    // 3️⃣ Fallback nếu vẫn trống (phòng trường hợp hiếm)
+    if (!replyText) {
       replyText = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
     }
 
-    // Nếu vẫn chưa có playbackUrl → TTS replyText
+    // 4️⃣ Nếu chưa có playbackUrl → TTS replyText
     if (!playbackUrl) {
       const filename = `tts_${Date.now()}.mp3`;
       const outPath = path.join(audioDir, filename);
@@ -411,12 +410,12 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       playbackUrl = `${host}/audio/${filename}`;
     }
 
+    // 5️⃣ MQTT payload: luôn chỉ có 3 field
     const payload = {
       audio_url: playbackUrl,
       text: replyText,
       label,
     };
-    if (musicMeta) payload.music = musicMeta;
 
     mqttClient.publish("robot/music", JSON.stringify(payload));
     console.log("📢 Published to robot/music:", payload);
@@ -428,6 +427,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       console.warn("⚠️ Cannot delete temp files:", e.message);
     }
 
+    // HTTP response có thể trả thêm field music nếu bạn muốn dùng trên web sau này
     res.json({
       status: "ok",
       transcript: text,
