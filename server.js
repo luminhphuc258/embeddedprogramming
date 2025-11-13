@@ -89,23 +89,23 @@ function overrideLabelByText(label, text) {
 
   const rules = [
     {
-      keywords: ["bai hat", "nghe nhac", "phat nhac", "bat nhac", "mo bai", "nghe"],
+      keywords: ["nghe bài hát", "bai hat", "phát nhạc", "nghe nhạc", "phat nhac", "bật nhạc", "bat nhac", "mo bai", "nghe", "nghe bài", "mở bài", "tôi muốn nghe"],
       newLabel: "nhac",
     },
     {
-      keywords: ["di chuyen sang trai", "qua trai", "ben trai", "di ben trai"],
+      keywords: ["qua trái", "qua bên trái", "di chuyen sang trai", "qua trai", "ben trai", "di ben trai"],
       newLabel: "trai",
     },
     {
-      keywords: ["quay ben phai", "qua phai", "di ben phai"],
+      keywords: ["qua phải", "xoay bên phải", "qua bên phải", "quay ben phai", "qua phai", "di ben phai"],
       newLabel: "phai",
     },
     {
-      keywords: ["tien len", "di toi", "di ve phia truoc", "tien toi"],
+      keywords: ["tiến lên", "đi lên", "tien len", "di toi", "di ve phia truoc", "tien toi"],
       newLabel: "tien",
     },
     {
-      keywords: ["lui lai", "di lui", "di ve sau"],
+      keywords: ["lui lai", "di lui", "di ve sau", "lùi lại", "ve lại", "lùi"],
       newLabel: "lui",
     },
   ];
