@@ -232,6 +232,10 @@ function overrideLabelByText(label, text) {
         "nghe bai",
         "toi muon nghe",
         "tôi muốn nghe",
+        "nghe",
+        "bật nhạc",
+        "phát nhạc",
+        "cho tôi nghe"
       ],
       newLabel: "nhac",
     },
@@ -243,7 +247,11 @@ function overrideLabelByText(label, text) {
         "qua bên trái",
         "di chuyen sang trai",
         "ben trai",
+        "bên trái",
         "di ben trai",
+        "xoay trái",
+        "bên trái xoay",
+        "di chuyển qua trái"
       ],
       newLabel: "trai",
     },
@@ -251,11 +259,16 @@ function overrideLabelByText(label, text) {
       keywords: [
         "qua phai",
         "qua phải",
+        "bên phải",
+        "bên phải xoay",
         "xoay ben phai",
         "xoay bên phải",
         "qua ben phai",
         "qua bên phải",
         "di ben phai",
+        "đi sang phải",
+        "di chuyen sang phai",
+        "di chuyển sang phải"
       ],
       newLabel: "phai",
     },
@@ -263,6 +276,9 @@ function overrideLabelByText(label, text) {
       keywords: [
         "tien len",
         "tiến lên",
+        "di chuyển lên",
+        "di chuyen len",
+        "đi lên phía trước",
         "di len",
         "đi lên",
         "di toi",
@@ -270,11 +286,14 @@ function overrideLabelByText(label, text) {
         "di ve phia truoc",
         "đi về phía trước",
         "tien toi",
+        "tiến tới",
+        "đi lên",
+        "di chuyển lên"
       ],
       newLabel: "tien",
     },
     {
-      keywords: ["lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
+      keywords: ["di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
       newLabel: "lui",
     },
   ];
