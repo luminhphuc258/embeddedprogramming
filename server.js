@@ -429,15 +429,21 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       playbackUrl = `${host}/audio/${filename}`;
     }
 
-    // 5️⃣ MQTT payload: luôn chỉ có 3 field
-    const payload = {
-      audio_url: playbackUrl,
-      text: replyText,
-      label,
-    };
-
-    mqttClient.publish("robot/music", JSON.stringify(payload));
-    console.log("📢 Published to robot/music:", payload);
+    // publish label for robot di chuyen 
+    if (["tien", "lui", "trai", "phai"].includes(label)) {
+      const movePayload = { label };
+      mqttClient.publish("robot/label", JSON.stringify(movePayload), { qos: 1, retain: true });
+      console.log(" Published move label → robot/label:", movePayload);
+    } else {
+      // 5 MQTT payload: luôn chỉ có 3 field
+      const payload = {
+        audio_url: playbackUrl,
+        text: replyText,
+        label,
+      };
+      mqttClient.publish("robot/music", JSON.stringify(payload));
+      console.log(" Published to robot/music:", payload);
+    }
 
     try {
       fs.unlinkSync(inputFile);
