@@ -281,6 +281,9 @@ function overrideLabelByText(label, text) {
     {
       keywords: [
         "lên",
+        "tiến",
+        "chạy về trước",
+        "phía trước",
         "tien len",
         "tiến lên",
         "di chuyển lên",
@@ -300,7 +303,7 @@ function overrideLabelByText(label, text) {
       newLabel: "tien",
     },
     {
-      keywords: ["lùi về", "phía sau", "đằng sau", "di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
+      keywords: ["ngược lại", "về sau", "sau", "lui", "lùi về", "phía sau", "đằng sau", "di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
       newLabel: "lui",
     },
   ];
