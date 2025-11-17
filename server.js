@@ -229,6 +229,7 @@ function overrideLabelByText(label, text) {
         "bật nhạc",
         "mo bai",
         "mở bài",
+        "mở nhạc",
         "nghe bai",
         "toi muon nghe",
         "tôi muốn nghe",
