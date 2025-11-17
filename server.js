@@ -667,6 +667,41 @@ app.get("/trigger_scan45", (req, res) => {
   }
 });
 
+/* ==========================================================
+   GLOBAL SCAN STATUS
+   "idle" | "scanning" | "done"
+========================================================== */
+let scanStatus = "idle";
+
+/* ESP32 sẽ publish lên topic này khi nó scan xong:
+   mqttClient.publish("robot/scanning_done", "done");
+*/
+mqttClient.subscribe("robot/scanning_done");
+
+mqttClient.on("message", (topic, msgBuffer) => {
+  const msg = msgBuffer.toString();
+  console.log(`📩 MQTT recv [${topic}] → ${msg}`);
+
+  if (topic === "robot/scanning_done") {
+    scanStatus = "done";
+  }
+});
+
+/* ==========================================================
+   Endpoint: GET /get_scanningstatus
+   → ESP32 sẽ gọi để kiểm tra khi nào scan xong
+========================================================== */
+app.get("/get_scanningstatus", (req, res) => {
+  try {
+    res.json({
+      status: scanStatus
+    });
+  } catch (e) {
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+
 /* ========= Root ========= */
 app.get("/", (_, res) => res.send("✅ Node.js Audio+AI Server is running!"));
 
