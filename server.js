@@ -270,6 +270,7 @@ function overrideLabelByText(label, text) {
     },
     {
       keywords: [
+        "qua phía bên phải",
         "qua phai",
         "qua phải",
         "bên phải",
@@ -289,6 +290,7 @@ function overrideLabelByText(label, text) {
       keywords: [
         "lên",
         "tiến",
+        "chuyển về phía trước",
         "chạy về trước",
         "phía trước",
         "tien len",
@@ -302,6 +304,7 @@ function overrideLabelByText(label, text) {
         "đi tới",
         "di ve phia truoc",
         "đi về phía trước",
+        "di chuyển về phía trước",
         "tien toi",
         "tiến tới",
         "đi lên",
@@ -316,7 +319,11 @@ function overrideLabelByText(label, text) {
   ];
 
   for (const rule of rules) {
-    if (rule.keywords.some((kw) => t.includes(kw))) {
+    if (
+      rule.keywords.some((kw) =>
+        t.includes(stripDiacritics(kw.toLowerCase()))
+      )
+    ) {
       console.log(
         `🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`
       );
