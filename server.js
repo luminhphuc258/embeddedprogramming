@@ -461,12 +461,12 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       //   input: replyText || "Dạ, em đây ạ!",
       // });
 
-      // const speech = await openai.audio.speech.create({
-      //   model: "gpt-4o-audio-preview",
-      //   voice: "alloy",
-      //   format: "mp3",
-      //   input: replyText
-      // });
+      const speech = await openai.audio.speech.create({
+        model: "gpt-4o-audio-preview",
+        voice: "alloy",
+        format: "mp3",
+        input: replyText
+      });
 
       // alloy
       // ash
@@ -479,12 +479,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       // sage
       // shimmer
 
-      const speech = await openai.audio.speech.create({
-        model: "gpt-4o-realtime-preview",
-        voice: "nova",
-        format: "mp3",
-        input: replyText
-      });
+
 
 
       const buf = Buffer.from(await speech.arrayBuffer());
