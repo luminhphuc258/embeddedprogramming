@@ -624,14 +624,14 @@ app.get("/trigger_scan30", (req, res) => {
       time: Date.now(),
     });
 
-    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
+    mqttClient.publish("robot/scanning30", payload, { qos: 1 });
 
-    console.log("📡 Triggered 90° scan → robot/scanning90");
+    console.log("📡 Triggered 30° scan → robot/scanning90");
 
     res.json({
       status: "ok",
       message: "30° scan started",
-      topic: "robot/scanning90",
+      topic: "robot/scanning30",
       payload: JSON.parse(payload),
     });
 
@@ -650,14 +650,14 @@ app.get("/trigger_scan45", (req, res) => {
       time: Date.now(),
     });
 
-    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
+    mqttClient.publish("robot/scanning45", payload, { qos: 1 });
 
-    console.log("📡 Triggered 90° scan → robot/scanning90");
+    console.log("📡 Triggered 45° scan → robot/scanning90");
 
     res.json({
       status: "ok",
       message: "45° scan started",
-      topic: "robot/scanning90",
+      topic: "robot/scanning45",
       payload: JSON.parse(payload),
     });
 
