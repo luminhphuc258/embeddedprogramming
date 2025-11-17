@@ -235,7 +235,10 @@ function overrideLabelByText(label, text) {
         "nghe",
         "bật nhạc",
         "phát nhạc",
-        "cho tôi nghe"
+        "cho tôi nghe",
+        "play",
+        "music",
+        "song"
       ],
       newLabel: "nhac",
     },
@@ -274,6 +277,7 @@ function overrideLabelByText(label, text) {
     },
     {
       keywords: [
+        "lên",
         "tien len",
         "tiến lên",
         "di chuyển lên",
@@ -293,7 +297,7 @@ function overrideLabelByText(label, text) {
       newLabel: "tien",
     },
     {
-      keywords: ["di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
+      keywords: ["lùi về", "phía sau", "đằng sau", "di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
       newLabel: "lui",
     },
   ];
