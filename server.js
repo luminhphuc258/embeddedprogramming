@@ -328,18 +328,46 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
     fs.writeFileSync(inputFile, req.file.buffer);
     console.log(
-      `🎧 Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`
+      ` Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`
     );
 
     // webm → wav
+    // check neu file nho thi bo qua lun 
+    // Skip very small files
+    if (req.file.buffer.length < 2000) {
+      console.log("Audio too small, skip convert");
+      return res.json({
+        status: "ok",
+        transcript: "",
+        label: "unknown",
+        audio_url: null
+      });
+    }
+
+    // Write file fully
+    await fs.promises.writeFile(inputFile, req.file.buffer);
+
     const wavFile = inputFile.replace(".webm", ".wav");
+    console.log("Converting WebM → WAV...");
+
     await new Promise((resolve, reject) => {
       ffmpeg(inputFile)
-        .toFormat("wav")
-        .on("error", reject)
-        .on("end", resolve)
+        .inputOptions("-fflags +genpts")
+        .outputOptions("-vn")
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .on("error", err => {
+          console.error("ffmpeg error:", err.message);
+          reject(err);
+        })
+        .on("end", () => {
+          console.log("Converted to WAV:", wavFile);
+          resolve();
+        })
         .save(wavFile);
     });
+
     console.log(`🎵 Converted to WAV: ${wavFile}`);
 
     // STT
