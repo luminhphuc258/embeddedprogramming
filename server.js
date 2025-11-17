@@ -263,6 +263,10 @@ function overrideLabelByText(label, text) {
         "bên trái",
         "di ben trai",
         "xoay trái",
+        "xoay trai",
+        "di chuyen ve ben trai",
+        "đi sang trái",
+        "di ve ben trai",
         "bên trái xoay",
         "di chuyển qua trái"
       ],
@@ -273,6 +277,7 @@ function overrideLabelByText(label, text) {
         "qua phía bên phải",
         "qua phai",
         "qua phải",
+        "ben phai",
         "bên phải",
         "bên phải xoay",
         "xoay ben phai",
@@ -530,6 +535,135 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
   } catch (err) {
     console.error("❌ Upload error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ========= Trigger Scan Endpoint ========= */
+app.get("/trigger_scan", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "start_scan",
+      time: Date.now()
+    });
+
+    mqttClient.publish("robot/scanning360", payload, { qos: 1 });
+
+    console.log("📡 Triggered 360° scan → robot/scanning360");
+
+    res.json({
+      status: "ok",
+      message: "Scan started",
+      topic: "robot/scanning360",
+      payload: JSON.parse(payload)
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
+  }
+});
+
+/* ========= Trigger 180° Scan ========= */
+app.get("/trigger_scan180", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "scan_180",
+      degree: 180,
+      time: Date.now(),
+    });
+
+    mqttClient.publish("robot/scanning180", payload, { qos: 1 });
+
+    console.log("📡 Triggered 180° scan → robot/scanning180");
+
+    res.json({
+      status: "ok",
+      message: "180° scan started",
+      topic: "robot/scanning180",
+      payload: JSON.parse(payload),
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering 180 scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
+  }
+});
+
+
+/* ========= Trigger 90° Scan ========= */
+app.get("/trigger_scan90", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "scan_90",
+      degree: 90,
+      time: Date.now(),
+    });
+
+    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
+
+    console.log("📡 Triggered 90° scan → robot/scanning90");
+
+    res.json({
+      status: "ok",
+      message: "90° scan started",
+      topic: "robot/scanning90",
+      payload: JSON.parse(payload),
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering 90 scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
+  }
+});
+
+app.get("/trigger_scan30", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "scan_30",
+      degree: 30,
+      time: Date.now(),
+    });
+
+    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
+
+    console.log("📡 Triggered 90° scan → robot/scanning90");
+
+    res.json({
+      status: "ok",
+      message: "30° scan started",
+      topic: "robot/scanning90",
+      payload: JSON.parse(payload),
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering 90 scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
+  }
+});
+
+
+app.get("/trigger_scan45", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "scan_45",
+      degree: 45,
+      time: Date.now(),
+    });
+
+    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
+
+    console.log("📡 Triggered 90° scan → robot/scanning90");
+
+    res.json({
+      status: "ok",
+      message: "45° scan started",
+      topic: "robot/scanning90",
+      payload: JSON.parse(payload),
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering 90 scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
   }
 });
 
