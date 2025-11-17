@@ -454,18 +454,11 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       const filename = `tts_${Date.now()}.mp3`;
       const outPath = path.join(audioDir, filename);
 
-      // const speech = await openai.audio.speech.create({
-      //   model: "gpt-4o-mini-tts",
-      //   voice: "nova",
-      //   format: "mp3",
-      //   input: replyText || "Dạ, em đây ạ!",
-      // });
-
       const speech = await openai.audio.speech.create({
-        model: "gpt-4o-audio-preview",
-        voice: "alloy",
+        model: "gpt-4o-mini-tts",
+        voice: "shimmer",
         format: "mp3",
-        input: replyText
+        input: replyText || "Dạ, em đây ạ!",
       });
 
       // alloy
