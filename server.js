@@ -241,7 +241,9 @@ function overrideLabelByText(label, text) {
         "song",
         "nhạc",
         "hát",
-        "cho tôi nghe"
+        "cho tôi nghe",
+        "nghe bài",
+        "bài hát"
       ],
       newLabel: "nhac",
     },
