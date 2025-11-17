@@ -198,8 +198,8 @@ function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
   const questionKeywords = [
-    " la ai",
-    " là ai",
+    "la ai",
+    "là ai",
     "hay cho toi biet",
     "hãy cho toi biet",
     "hay cho em biet",
@@ -210,6 +210,10 @@ function overrideLabelByText(label, text) {
     "bạn có biết",
     "cho toi hoi",
     "cho tôi hỏi",
+    "bạn có biết",
+    "tôi muốn biết",
+    "cho biết",
+    "mình muốn hỏi"
   ];
   if (questionKeywords.some((kw) => t.includes(kw))) {
     console.log("🔁 Label override → 'question' (detect question)");
@@ -312,7 +316,7 @@ function overrideLabelByText(label, text) {
   ];
 
   for (const rule of rules) {
-    if (rule.keywords.some((kw) => t.includes(kw.toLowerCase()))) {
+    if (rule.keywords.some((kw) => t.includes(kw))) {
       console.log(
         `🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`
       );
