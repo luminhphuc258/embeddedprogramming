@@ -61,7 +61,7 @@ const mqttClient = mqtt.connect(mqttUrl, {
 });
 
 mqttClient.on("connect", () => {
-  console.log("✅ Connected to MQTT Broker");
+  console.log(" Connected to MQTT Broker");
   mqttClient.subscribe("robot/audio_in");
 });
 mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
@@ -311,7 +311,7 @@ function overrideLabelByText(label, text) {
   ];
 
   for (const rule of rules) {
-    if (rule.keywords.some((kw) => t.includes(kw))) {
+    if (rule.keywords.some((kw) => t.includes(kw.toLowerCase()))) {
       console.log(
         `🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`
       );
@@ -387,11 +387,11 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       console.error("⚠️ STT error:", err.message);
       return res.status(500).json({ error: "STT failed" });
     }
-    console.log("🧠 Transcript:", text);
+    // console.log("🧠 Transcript:", text);
 
     let label = "unknown";
     label = overrideLabelByText(label, text);
-    console.log(`🔹 Final Label: ${label}`);
+    // console.log(`🔹 Final Label: ${label}`);
 
     let playbackUrl = null;
     let musicMeta = null;
@@ -488,7 +488,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
     if (["tien", "lui", "trai", "phai"].includes(label)) {
       const movePayload = { label };
       mqttClient.publish("robot/label", JSON.stringify(movePayload), { qos: 1, retain: true });
-      console.log(" Published move label → robot/label:", movePayload);
+      // console.log(" Published move label → robot/label:", movePayload);
     } else {
       // 5 MQTT payload: luôn chỉ có 3 field
       const payload = {
@@ -497,7 +497,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         label,
       };
       mqttClient.publish("robot/music", JSON.stringify(payload));
-      console.log(" Published to robot/music:", payload);
+      //console.log(" Published to robot/music:", payload);
     }
 
     try {
