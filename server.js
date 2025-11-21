@@ -54,7 +54,7 @@ const MQTT_PORT = 8883;
 const MQTT_USER = "robot_matthew";
 const MQTT_PASS = "29061992abCD!yesokmen";
 
-const mqttUrl = `mqtts://${MQTT_HOST}:${MQ_PORT}`;
+const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`
 const mqttClient = mqtt.connect(mqttUrl, {
   username: MQTT_USER,
   password: MQTT_PASS,
