@@ -154,7 +154,7 @@ async function downloadFile(url, destPath) {
   });
 }
 
-/** convert input -> MP3 kiểu giống server cũ (đã từng chạy OK) */
+/** convert input -> MP3 */
 async function convertToMp3(inputPath, outputPath) {
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
@@ -194,6 +194,7 @@ async function getMp3FromPreview(previewUrl) {
   console.log("🎧 Final MP3 URL:", url);
   return url;
 }
+
 /* ========= Label override ========= */
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
@@ -369,14 +370,28 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 
 /* ========= Auto Navigation /dieuhuongrobot ========= */
 
-const OBSTACLE_THRESHOLD_CM = 19;
+/** Ngưỡng vật cản mới: > 20cm = coi như KHÔNG có vật cản */
+const OBSTACLE_THRESHOLD_CM = 20;
 
+/** 
+ * Tính khoảng cách hiệu dụng:
+ * - ultra_cm = -1 (hoặc <=0) → BỎ QUA
+ * - lidar_cm <=0           → BỎ QUA
+ * - nếu sensor không hợp lệ → Infinity
+ */
 function getEffectiveDistanceCm(payload) {
-  const lidar = typeof payload.lidar_cm === "number" ? payload.lidar_cm : Infinity;
-  const ultra = typeof payload.ultra_cm === "number" ? payload.ultra_cm : Infinity;
+  const lidarValid =
+    typeof payload.lidar_cm === "number" && payload.lidar_cm > 0;
+  const ultraValid =
+    typeof payload.ultra_cm === "number" && payload.ultra_cm > 0;
+
+  const lidar = lidarValid ? payload.lidar_cm : Infinity;
+  const ultra = ultraValid ? payload.ultra_cm : Infinity;
+
   return Math.min(lidar, ultra);
 }
 
+/* ========= AUTO NAV MESSAGE HANDLER ========= */
 mqttClient.on("message", (topic, msgBuffer) => {
   if (topic !== "/dieuhuongrobot") return;
 
@@ -393,19 +408,38 @@ mqttClient.on("message", (topic, msgBuffer) => {
   const dist = getEffectiveDistanceCm(payload);
   const hasObstacle = dist < OBSTACLE_THRESHOLD_CM;
 
-  console.log(`📡 [AUTO] phase=${phase}, dist=${dist}cm, obstacle=${hasObstacle}`);
+  console.log(
+    `📡 [AUTO] phase=${phase}, dist=${dist}cm, obstacle=${hasObstacle}`
+  );
+
+  // Helper: đưa lidar về neutral khi đường clear
+  const sendLidarNeutral = (reason) => {
+    const p = JSON.stringify({ action: "scan_neutral", reason });
+    mqttClient.publish("robot/lidar_neutralpoint", p, { qos: 1 });
+    console.log("→ LIDAR NEUTRAL:", reason);
+  };
 
   /* =============================
-       PHASE: FRONT (SONAR)
+       PHASE: FRONT (SONAR + LIDAR)
      ============================= */
   if (phase === "front") {
     if (!hasObstacle) {
-      mqttClient.publish("/robot/goahead", JSON.stringify({ action: "goahead" }), { qos: 1 });
-      console.log("→ GO AHEAD");
+      // Đường phía trước clear → đi thẳng + đảm bảo lidar đứng im
+      sendLidarNeutral("front_clear");
+      mqttClient.publish(
+        "/robot/goahead",
+        JSON.stringify({ action: "goahead" }),
+        { qos: 1 }
+      );
+      console.log("→ FRONT CLEAR → GO AHEAD");
     } else {
-      // Ưu tiên quét PHẢI ROBOT → lidar xoay LEFT
-      mqttClient.publish("robot/lidar45_turnleft", JSON.stringify({ action: "scan_right" }), { qos: 1 });
-      console.log("→ FRONT BLOCKED → CHECK RIGHT SIDE");
+      // Có vật cản phía trước → quét PHẢI robot (LIDAR xoay LEFT)
+      mqttClient.publish(
+        "robot/lidar45_turnleft",
+        JSON.stringify({ action: "scan_right" }),
+        { qos: 1 }
+      );
+      console.log("→ FRONT BLOCKED → CHECK RIGHT SIDE (LIDAR LEFT)");
     }
     return;
   }
@@ -416,11 +450,22 @@ mqttClient.on("message", (topic, msgBuffer) => {
      ============================= */
   if (phase === "left45") {
     if (!hasObstacle) {
-      mqttClient.publish("/robot/turnright45_goahead", JSON.stringify({ action: "turnright45_goahead" }), { qos: 1 });
+      // Phía phải robot clear → quay phải + đi tới, đồng thời ngưng quay lidar
+      sendLidarNeutral("right_side_clear");
+      mqttClient.publish(
+        "/robot/turnright45_goahead",
+        JSON.stringify({ action: "turnright45_goahead" }),
+        { qos: 1 }
+      );
       console.log("→ RIGHT SIDE CLEAR → TURN RIGHT + GO");
     } else {
-      mqttClient.publish("robot/lidar45_turnright", JSON.stringify({ action: "scan_left" }), { qos: 1 });
-      console.log("→ RIGHT BLOCKED → CHECK LEFT SIDE");
+      // Phải bị chặn → kiểm tra TRÁI robot
+      mqttClient.publish(
+        "robot/lidar45_turnright",
+        JSON.stringify({ action: "scan_left" }),
+        { qos: 1 }
+      );
+      console.log("→ RIGHT BLOCKED → CHECK LEFT SIDE (LIDAR RIGHT)");
     }
     return;
   }
@@ -431,29 +476,53 @@ mqttClient.on("message", (topic, msgBuffer) => {
      ============================= */
   if (phase === "right45") {
     if (!hasObstacle) {
-      mqttClient.publish("/robot/turnleft45_goahead", JSON.stringify({ action: "turnleft45_goahead" }), { qos: 1 });
+      // Phía trái clear → quay trái + đi tới, đồng thời đưa lidar về neutral
+      sendLidarNeutral("left_side_clear");
+      mqttClient.publish(
+        "/robot/turnleft45_goahead",
+        JSON.stringify({ action: "turnleft45_goahead" }),
+        { qos: 1 }
+      );
       console.log("→ LEFT SIDE CLEAR → TURN LEFT + GO");
     } else {
-      mqttClient.publish("robot/lidar_neutralpoint", JSON.stringify({ action: "scan_neutral" }), { qos: 1 });
-      console.log("→ LEFT BLOCKED → CHECK NEUTRAL");
+      // Trái cũng bị chặn → kiểm tra neutral phía sau
+      mqttClient.publish(
+        "robot/lidar_neutralpoint",
+        JSON.stringify({ action: "scan_neutral" }),
+        { qos: 1 }
+      );
+      console.log("→ LEFT BLOCKED → CHECK NEUTRAL (BACK)");
     }
     return;
   }
 
   /* =============================
-             NEUTRAL → LÙI
+             NEUTRAL
      ============================= */
   if (phase === "neutral") {
     if (!hasObstacle) {
-      mqttClient.publish("/robot/goback", JSON.stringify({ action: "goback" }), { qos: 1 });
+      // Phía sau clear → lùi, đồng thời đảm bảo lidar đứng neutral
+      sendLidarNeutral("back_clear");
+      mqttClient.publish(
+        "/robot/goback",
+        JSON.stringify({ action: "goback" }),
+        { qos: 1 }
+      );
       console.log("→ BACK CLEAR → GO BACK");
     } else {
-      mqttClient.publish("/robot/stop", JSON.stringify({ action: "stop" }), { qos: 1 });
+      // Tất cả hướng đều có vật cản → dừng & neutral
+      sendLidarNeutral("all_blocked");
+      mqttClient.publish(
+        "/robot/stop",
+        JSON.stringify({ action: "stop" }),
+        { qos: 1 }
+      );
       console.log("→ ALL BLOCKED → STOP");
     }
     return;
   }
 });
+
 /* ========= Trigger Scan Endpoint ========= */
 app.get("/trigger_scan", (req, res) => {
   try {
@@ -608,8 +677,9 @@ app.get("/get_scanningstatus", (req, res) => {
 });
 
 /* ========= Root Endpoint ========= */
-app.get("/", (_, res) => res.send("Node.js Audio + AI + Auto Navigation Server is running!"));
-
+app.get("/", (_, res) =>
+  res.send("Node.js Audio + AI + Auto Navigation Server is running!")
+);
 
 /* ========= START SERVER ========= */
 app.listen(PORT, () => {
