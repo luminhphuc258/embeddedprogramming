@@ -63,7 +63,10 @@ const mqttClient = mqtt.connect(mqttUrl, {
 mqttClient.on("connect", () => {
   console.log(" Connected to MQTT Broker");
   mqttClient.subscribe("robot/audio_in");
+  mqttClient.subscribe("robot/scanning_done");
+  mqttClient.subscribe("/dieuhuongrobot");   // subscribe mới cho điều hướng tự động
 });
+
 mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
 
 /* ========= Helpers ========= */
@@ -169,7 +172,6 @@ async function convertToMp3(inputPath, outputPath) {
   });
 }
 
-/** Từ preview (.m4a) → .mp3 trong /audio và trả về URL .mp3 */
 async function getMp3FromPreview(previewUrl) {
   const ts = Date.now();
   const tmpM4a = path.join(audioDir, `song_${ts}.m4a`);
@@ -192,7 +194,6 @@ async function getMp3FromPreview(previewUrl) {
   console.log("🎧 Final MP3 URL:", url);
   return url;
 }
-
 /* ========= Label override ========= */
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
@@ -216,122 +217,37 @@ function overrideLabelByText(label, text) {
     "mình muốn hỏi"
   ];
   if (questionKeywords.some((kw) => t.includes(kw))) {
-    console.log("🔁 Label override → 'question' (detect question)");
+    console.log("🔁 Label override → 'question'");
     return "question";
   }
 
   const rules = [
     {
       keywords: [
-        "nghe bai hat",
-        "nghe bài hát",
-        "phat nhac",
-        "phát nhạc",
-        "nghe nhac",
-        "nghe nhạc",
-        "bat nhac",
-        "bật nhạc",
-        "mo bai",
-        "mở bài",
-        "mở nhạc",
-        "nghe bai",
-        "toi muon nghe",
-        "tôi muốn nghe",
-        "nghe",
-        "bật nhạc",
-        "phát nhạc",
-        "cho tôi nghe",
-        "play",
-        "music",
-        "song",
-        "nhạc",
-        "hát",
-        "cho tôi nghe",
-        "nghe bài",
-        "bài hát"
+        "nghe bai hat", "nghe nhac", "phat nhac", "mo bai", "play", "music", "song", "nhạc"
       ],
       newLabel: "nhac",
     },
     {
-      keywords: [
-        "qua trai",
-        "qua trái",
-        "qua ben trai",
-        "qua bên trái",
-        "di chuyen sang trai",
-        "ben trai",
-        "bên trái",
-        "di ben trai",
-        "xoay trái",
-        "xoay trai",
-        "di chuyen ve ben trai",
-        "đi sang trái",
-        "di ve ben trai",
-        "bên trái xoay",
-        "di chuyển qua trái"
-      ],
+      keywords: ["qua trai", "xoay trái", "đi trái", "qua bên trái"],
       newLabel: "trai",
     },
     {
-      keywords: [
-        "qua phía bên phải",
-        "qua phai",
-        "qua phải",
-        "ben phai",
-        "bên phải",
-        "bên phải xoay",
-        "xoay ben phai",
-        "xoay bên phải",
-        "qua ben phai",
-        "qua bên phải",
-        "di ben phai",
-        "đi sang phải",
-        "di chuyen sang phai",
-        "di chuyển sang phải"
-      ],
+      keywords: ["qua phải", "xoay phải", "đi phải", "qua bên phải"],
       newLabel: "phai",
     },
     {
-      keywords: [
-        "lên",
-        "tiến",
-        "chuyển về phía trước",
-        "chạy về trước",
-        "phía trước",
-        "tien len",
-        "tiến lên",
-        "di chuyển lên",
-        "di chuyen len",
-        "đi lên phía trước",
-        "di len",
-        "đi lên",
-        "di toi",
-        "đi tới",
-        "di ve phia truoc",
-        "đi về phía trước",
-        "di chuyển về phía trước",
-        "tien toi",
-        "tiến tới",
-        "đi lên",
-        "di chuyển lên"
-      ],
+      keywords: ["tiến", "đi lên", "phía trước", "tới", "tiến lên"],
       newLabel: "tien",
     },
     {
-      keywords: ["ngược lại", "về sau", "sau", "lui", "lùi về", "phía sau", "đằng sau", "di chuyển về sau", "đi ngược lại", "ve lại", "lui lai", "lùi lại", "di lui", "đi lùi", "di ve sau", "đi về sau", "lùi"],
+      keywords: ["lùi", "đi lùi", "phía sau", "ngược lại"],
       newLabel: "lui",
     },
   ];
 
   for (const rule of rules) {
-    if (
-      rule.keywords.some((kw) =>
-        t.includes(stripDiacritics(kw.toLowerCase()))
-      )
-    ) {
-      console.log(
-        `🔁 Label override: '${label}' → '${rule.newLabel}' (matched '${rule.keywords[0]}')`
-      );
+    if (rule.keywords.some((kw) => t.includes(stripDiacritics(kw.toLowerCase())))) {
       return rule.newLabel;
     }
   }
@@ -349,15 +265,8 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 
     const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
     fs.writeFileSync(inputFile, req.file.buffer);
-    console.log(
-      ` Received audio (${(req.file.buffer.length / 1024).toFixed(1)} KB): ${inputFile}`
-    );
 
-    // webm → wav
-    // check neu file nho thi bo qua lun 
-    // Skip very small files
     if (req.file.buffer.length < 2000) {
-      console.log("Audio too small, skip convert");
       return res.json({
         status: "ok",
         transcript: "",
@@ -366,11 +275,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // Write file fully
-    await fs.promises.writeFile(inputFile, req.file.buffer);
-
     const wavFile = inputFile.replace(".webm", ".wav");
-    console.log("Converting WebM → WAV...");
 
     await new Promise((resolve, reject) => {
       ffmpeg(inputFile)
@@ -379,20 +284,11 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         .audioCodec("pcm_s16le")
         .audioChannels(1)
         .audioFrequency(16000)
-        .on("error", err => {
-          console.error("ffmpeg error:", err.message);
-          reject(err);
-        })
-        .on("end", () => {
-          console.log("Converted to WAV:", wavFile);
-          resolve();
-        })
+        .on("error", err => reject(err))
+        .on("end", resolve)
         .save(wavFile);
     });
 
-    console.log(`🎵 Converted to WAV: ${wavFile}`);
-
-    // STT
     let text = "";
     try {
       const tr = await openai.audio.transcriptions.create({
@@ -401,143 +297,163 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       });
       text = (tr.text || "").trim();
     } catch (err) {
-      console.error("⚠️ STT error:", err.message);
       return res.status(500).json({ error: "STT failed" });
     }
-    // console.log("🧠 Transcript:", text);
 
-    let label = "unknown";
-    label = overrideLabelByText(label, text);
-    // console.log(`🔹 Final Label: ${label}`);
-
+    let label = overrideLabelByText("unknown", text);
     let playbackUrl = null;
-    let musicMeta = null;
     let replyText = "";
 
-    // 1️⃣ Nhạc: iTunes + convert
     if (label === "nhac") {
       const query = extractSongQuery(text) || text;
-      console.log("🎼 Music query:", query);
-
-      try {
-        musicMeta = await searchITunes(query);
-      } catch (e) {
-        console.warn("⚠️ iTunes search error:", e.message);
-      }
-
-      if (musicMeta && musicMeta.previewUrl) {
-        try {
-          const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
-          playbackUrl = mp3Url;
-          replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
-          console.log("🎧 iTunes hit:", musicMeta);
-        } catch (e) {
-          console.warn("⚠️ Convert preview to mp3 error:", e.message);
-          replyText = "Dạ, em không mở được bài nhạc này, anh thử bài khác nhé.";
-        }
+      const musicMeta = await searchITunes(query);
+      if (musicMeta?.previewUrl) {
+        const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
+        playbackUrl = mp3Url;
+        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
       } else {
-        replyText = "Dạ, em không tìm được bài nhạc phù hợp.";
+        replyText = "Không tìm thấy bài phù hợp.";
       }
+    } else {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "Bạn là trợ lý của robot." },
+          { role: "user", content: text },
+        ],
+      });
+      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
     }
 
-    // 2️⃣ MỌI LABEL KHÁC → ChatGPT trả lời
-    if (label !== "nhac") {
-      try {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          messages: [
-            {
-              role: "system",
-              content:
-                "Bạn là trợ lý nói tiếng Việt cho một robot nhỏ. Trả lời ngắn gọn, dễ hiểu.",
-            },
-            { role: "user", content: text },
-          ],
-        });
-        replyText =
-          completion.choices?.[0]?.message?.content?.trim() ||
-          "Dạ, em chưa chắc lắm, nhưng em sẽ cố gắng tìm hiểu thêm.";
-      } catch (e) {
-        console.error("⚠️ Chat completion error:", e.message);
-        replyText = "Dạ, em bị lỗi khi trả lời câu này.";
-      }
-    }
-
-    // 3️⃣ Fallback nếu vẫn trống (phòng trường hợp hiếm)
-    if (!replyText) {
-      replyText = "Dạ, em đây ạ! Em sẵn sàng nghe lệnh.";
-    }
-
-    // 4️⃣ Nếu chưa có playbackUrl → TTS replyText
     if (!playbackUrl) {
       const filename = `tts_${Date.now()}.mp3`;
       const outPath = path.join(audioDir, filename);
-
       const speech = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts",
         voice: "ballad",
         format: "mp3",
-        input: replyText || "Dạ, em đây ạ!",
+        input: replyText,
       });
-
-      // alloy
-      // ash
-      // ballad
-      // coral
-      // echo
-      // fable
-      // nova
-      // onyx
-      // sage
-      // shimmer
-
-
-
-
       const buf = Buffer.from(await speech.arrayBuffer());
       fs.writeFileSync(outPath, buf);
-
-      const host = getPublicHost();
-      playbackUrl = `${host}/audio/${filename}`;
+      playbackUrl = `${getPublicHost()}/audio/${filename}`;
     }
 
-    // publish label for robot di chuyen 
     if (["tien", "lui", "trai", "phai"].includes(label)) {
-      const movePayload = { label };
-      mqttClient.publish("robot/label", JSON.stringify(movePayload), { qos: 1, retain: true });
-      // console.log(" Published move label → robot/label:", movePayload);
+      mqttClient.publish(
+        "robot/label",
+        JSON.stringify({ label }),
+        { qos: 1, retain: true }
+      );
     } else {
-      // 5 MQTT payload: luôn chỉ có 3 field
-      const payload = {
-        audio_url: playbackUrl,
-        text: replyText,
-        label,
-      };
-      mqttClient.publish("robot/music", JSON.stringify(payload));
-      //console.log(" Published to robot/music:", payload);
+      mqttClient.publish(
+        "robot/music",
+        JSON.stringify({ audio_url: playbackUrl, text: replyText, label }),
+        { qos: 1 }
+      );
     }
 
-    try {
-      fs.unlinkSync(inputFile);
-      fs.unlinkSync(wavFile);
-    } catch (e) {
-      console.warn("⚠️ Cannot delete temp files:", e.message);
-    }
+    fs.unlinkSync(inputFile);
+    fs.unlinkSync(wavFile);
 
-    // HTTP response có thể trả thêm field music nếu bạn muốn dùng trên web sau này
     res.json({
       status: "ok",
       transcript: text,
       label,
       audio_url: playbackUrl,
-      music: musicMeta,
     });
   } catch (err) {
-    console.error("❌ Upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+/* ========= Auto Navigation /dieuhuongrobot ========= */
+
+const OBSTACLE_THRESHOLD_CM = 19;
+
+function getEffectiveDistanceCm(payload) {
+  const lidar = typeof payload.lidar_cm === "number" ? payload.lidar_cm : Infinity;
+  const ultra = typeof payload.ultra_cm === "number" ? payload.ultra_cm : Infinity;
+  return Math.min(lidar, ultra);
+}
+
+mqttClient.on("message", (topic, msgBuffer) => {
+  if (topic !== "/dieuhuongrobot") return;
+
+  const msg = msgBuffer.toString();
+  let payload;
+  try {
+    payload = JSON.parse(msg);
+  } catch (e) {
+    console.log("Invalid JSON:", msg);
+    return;
+  }
+
+  const phase = payload.phase || "front";
+  const dist = getEffectiveDistanceCm(payload);
+  const hasObstacle = dist < OBSTACLE_THRESHOLD_CM;
+
+  console.log(`📡 [AUTO] phase=${phase}, dist=${dist}cm, obstacle=${hasObstacle}`);
+
+  /* =============================
+       PHASE: FRONT (SONAR)
+     ============================= */
+  if (phase === "front") {
+    if (!hasObstacle) {
+      mqttClient.publish("/robot/goahead", JSON.stringify({ action: "goahead" }), { qos: 1 });
+      console.log("→ GO AHEAD");
+    } else {
+      // Ưu tiên quét PHẢI ROBOT → lidar xoay LEFT
+      mqttClient.publish("robot/lidar45_turnleft", JSON.stringify({ action: "scan_right" }), { qos: 1 });
+      console.log("→ FRONT BLOCKED → CHECK RIGHT SIDE");
+    }
+    return;
+  }
+
+  /* =============================
+        LEFT45 = LiDAR xoay LEFT
+        → Quét PHÍA PHẢI robot
+     ============================= */
+  if (phase === "left45") {
+    if (!hasObstacle) {
+      mqttClient.publish("/robot/turnright45_goahead", JSON.stringify({ action: "turnright45_goahead" }), { qos: 1 });
+      console.log("→ RIGHT SIDE CLEAR → TURN RIGHT + GO");
+    } else {
+      mqttClient.publish("robot/lidar45_turnright", JSON.stringify({ action: "scan_left" }), { qos: 1 });
+      console.log("→ RIGHT BLOCKED → CHECK LEFT SIDE");
+    }
+    return;
+  }
+
+  /* =============================
+        RIGHT45 = LiDAR xoay RIGHT
+        → Quét PHÍA TRÁI robot
+     ============================= */
+  if (phase === "right45") {
+    if (!hasObstacle) {
+      mqttClient.publish("/robot/turnleft45_goahead", JSON.stringify({ action: "turnleft45_goahead" }), { qos: 1 });
+      console.log("→ LEFT SIDE CLEAR → TURN LEFT + GO");
+    } else {
+      mqttClient.publish("robot/lidar_neutralpoint", JSON.stringify({ action: "scan_neutral" }), { qos: 1 });
+      console.log("→ LEFT BLOCKED → CHECK NEUTRAL");
+    }
+    return;
+  }
+
+  /* =============================
+             NEUTRAL → LÙI
+     ============================= */
+  if (phase === "neutral") {
+    if (!hasObstacle) {
+      mqttClient.publish("/robot/goback", JSON.stringify({ action: "goback" }), { qos: 1 });
+      console.log("→ BACK CLEAR → GO BACK");
+    } else {
+      mqttClient.publish("/robot/stop", JSON.stringify({ action: "stop" }), { qos: 1 });
+      console.log("→ ALL BLOCKED → STOP");
+    }
+    return;
+  }
+});
 /* ========= Trigger Scan Endpoint ========= */
 app.get("/trigger_scan", (req, res) => {
   try {
@@ -589,7 +505,6 @@ app.get("/trigger_scan180", (req, res) => {
   }
 });
 
-
 /* ========= Trigger 90° Scan ========= */
 app.get("/trigger_scan90", (req, res) => {
   try {
@@ -616,32 +531,7 @@ app.get("/trigger_scan90", (req, res) => {
   }
 });
 
-app.get("/trigger_scan30", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "scan_30",
-      degree: 30,
-      time: Date.now(),
-    });
-
-    mqttClient.publish("robot/scanning30", payload, { qos: 1 });
-
-    console.log("📡 Triggered 30° scan → robot/scanning90");
-
-    res.json({
-      status: "ok",
-      message: "30° scan started",
-      topic: "robot/scanning30",
-      payload: JSON.parse(payload),
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering 90 scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-
+/* ========= Trigger 45° Scan ========= */
 app.get("/trigger_scan45", (req, res) => {
   try {
     const payload = JSON.stringify({
@@ -652,7 +542,7 @@ app.get("/trigger_scan45", (req, res) => {
 
     mqttClient.publish("robot/scanning45", payload, { qos: 1 });
 
-    console.log("📡 Triggered 45° scan → robot/scanning90");
+    console.log("📡 Triggered 45° scan → robot/scanning45");
 
     res.json({
       status: "ok",
@@ -662,35 +552,51 @@ app.get("/trigger_scan45", (req, res) => {
     });
 
   } catch (e) {
-    console.error("❌ Error triggering 90 scan:", e.message);
+    console.error("❌ Error triggering 45 scan:", e.message);
+    res.status(500).json({ error: "Trigger failed" });
+  }
+});
+
+/* ========= Trigger 30° Scan ========= */
+app.get("/trigger_scan30", (req, res) => {
+  try {
+    const payload = JSON.stringify({
+      action: "scan_30",
+      degree: 30,
+      time: Date.now(),
+    });
+
+    mqttClient.publish("robot/scanning30", payload, { qos: 1 });
+
+    console.log("📡 Triggered 30° scan → robot/scanning30");
+
+    res.json({
+      status: "ok",
+      message: "30° scan started",
+      topic: "robot/scanning30",
+      payload: JSON.parse(payload),
+    });
+
+  } catch (e) {
+    console.error("❌ Error triggering 30 scan:", e.message);
     res.status(500).json({ error: "Trigger failed" });
   }
 });
 
 /* ==========================================================
    GLOBAL SCAN STATUS
-   "idle" | "scanning" | "done"
 ========================================================== */
+
 let scanStatus = "idle";
 
-/* ESP32 sẽ publish lên topic này khi nó scan xong:
-   mqttClient.publish("robot/scanning_done", "done");
-*/
-mqttClient.subscribe("robot/scanning_done");
-
+/* ESP32 báo scan hoàn tất qua MQTT */
 mqttClient.on("message", (topic, msgBuffer) => {
-  const msg = msgBuffer.toString();
-  console.log(`📩 MQTT recv [${topic}] → ${msg}`);
-
   if (topic === "robot/scanning_done") {
     scanStatus = "done";
   }
 });
 
-/* ==========================================================
-   Endpoint: GET /get_scanningstatus
-   → ESP32 sẽ gọi để kiểm tra khi nào scan xong
-========================================================== */
+/* Endpoint để client kiểm tra scan đã xong chưa */
 app.get("/get_scanningstatus", (req, res) => {
   try {
     res.json({
@@ -701,8 +607,11 @@ app.get("/get_scanningstatus", (req, res) => {
   }
 });
 
+/* ========= Root Endpoint ========= */
+app.get("/", (_, res) => res.send("Node.js Audio + AI + Auto Navigation Server is running!"));
 
-/* ========= Root ========= */
-app.get("/", (_, res) => res.send("✅ Node.js Audio+AI Server is running!"));
 
-app.listen(PORT, () => console.log(`🚀 HTTP server running on port ${PORT}`));
+/* ========= START SERVER ========= */
+app.listen(PORT, () => {
+  console.log(`🚀 HTTP server running on port ${PORT}`);
+});
