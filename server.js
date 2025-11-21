@@ -475,37 +475,53 @@ mqttClient.on("message", (topic, msgBuf) => {
     console.log("✔ DONE ROTATE LEFT, lidar =", lastLidar);
 
     if (isLidarClear(lastLidar)) {
+
+      // NEW: reset lidar về 110° trước khi đi
+      send("robot/lidar_neutralpoint", { action: "neutral" });
+      console.log("→ RESET LIDAR TO NEUTRAL");
+
+      // NEW: sau đó mới đi thẳng (quẹo phải)
       send("/robot/turnright45_goahead", { action: "turnright45_goahead" });
-      console.log("→ RIGHT SIDE CLEAR → TURN RIGHT + GOAHEAD");
+      console.log("→ RIGHT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
+
       STATE = "idle";
       return;
     }
 
-    // phải vẫn blocked → thử quét TRÁI (LIDAR xoay phải)
+    // phải blocked → thử LIDAR quay sang phải
     send("robot/lidar45_turnright", { action: "scan_left" });
     STATE = "wait_right_done";
-    console.log("→ RIGHT BLOCKED → REQUEST LIDAR TURN RIGHT (SCAN LEFT)");
+    console.log("→ RIGHT BLOCKED → REQUEST TURN RIGHT (SCAN LEFT)");
     return;
   }
+
 
   // DONE ROTATE RIGHT
   if (topic === "/done_rotate_lidarright" && STATE === "wait_right_done") {
     console.log("✔ DONE ROTATE RIGHT, lidar =", lastLidar);
 
     if (isLidarClear(lastLidar)) {
+
+      // RESET LIDAR trước khi đi
+      send("robot/lidar_neutralpoint", { action: "neutral" });
+      console.log("→ RESET LIDAR TO NEUTRAL");
+
+      // quẹo trái + đi thẳng
       send("/robot/turnleft45_goahead", { action: "turnleft45_goahead" });
-      console.log("→ LEFT SIDE CLEAR → TURN LEFT + GOAHEAD");
+      console.log("→ LEFT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
+
       STATE = "idle";
       return;
     }
 
-    // cả trái/phải đều blocked → lùi + stop
+    // trái và phải đều blocked
     send("/robot/goback", { action: "goback" });
     send("/robot/stop", { action: "stop" });
     console.log("⛔ ALL BLOCKED → GO BACK + STOP");
     STATE = "idle";
     return;
   }
+
 });
 
 /* ===========================================================================
