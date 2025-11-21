@@ -54,17 +54,17 @@ const MQTT_PORT = 8883;
 const MQTT_USER = "robot_matthew";
 const MQTT_PASS = "29061992abCD!yesokmen";
 
-const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
+const mqttUrl = `mqtts://${MQTT_HOST}:${MQ_PORT}`;
 const mqttClient = mqtt.connect(mqttUrl, {
   username: MQTT_USER,
   password: MQTT_PASS,
 });
 
 mqttClient.on("connect", () => {
-  console.log(" Connected to MQTT Broker");
+  console.log("✅ Connected to MQTT Broker");
   mqttClient.subscribe("robot/audio_in");
   mqttClient.subscribe("robot/scanning_done");
-  mqttClient.subscribe("/dieuhuongrobot");   // subscribe mới cho điều hướng tự động
+  mqttClient.subscribe("/dieuhuongrobot");   // dùng cho điều hướng tự động
 });
 
 mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
@@ -212,7 +212,6 @@ function overrideLabelByText(label, text) {
     "bạn có biết",
     "cho toi hoi",
     "cho tôi hỏi",
-    "bạn có biết",
     "tôi muốn biết",
     "cho biết",
     "mình muốn hỏi"
@@ -391,16 +390,31 @@ function getEffectiveDistanceCm(payload) {
   return Math.min(lidar, ultra);
 }
 
-/* ========= AUTO NAV MESSAGE HANDLER ========= */
+/* ==========================================================
+   GLOBAL SCAN STATUS
+========================================================== */
+
+let scanStatus = "idle";
+
+/* ========= AUTO NAV + SCAN DONE MESSAGE HANDLER ========= */
 mqttClient.on("message", (topic, msgBuffer) => {
+  const msgStr = msgBuffer.toString();
+
+  // 1) Cập nhật trạng thái scan
+  if (topic === "robot/scanning_done") {
+    scanStatus = "done";
+    console.log("📩 robot/scanning_done → scanStatus = done");
+    return;
+  }
+
+  // 2) Xử lý điều hướng tự động
   if (topic !== "/dieuhuongrobot") return;
 
-  const msg = msgBuffer.toString();
   let payload;
   try {
-    payload = JSON.parse(msg);
+    payload = JSON.parse(msgStr);
   } catch (e) {
-    console.log("Invalid JSON:", msg);
+    console.log("Invalid JSON on /dieuhuongrobot:", msgStr);
     return;
   }
 
@@ -520,6 +534,58 @@ mqttClient.on("message", (topic, msgBuffer) => {
       console.log("→ ALL BLOCKED → STOP");
     }
     return;
+  }
+});
+
+/* ========= CAMERA ROTATE ENDPOINT ========= */
+/*
+   HTTP GET:
+      /camera_rotate?direction=left&angle=60
+
+   JSON gửi lên MQTT:
+      { "direction": "left", "angle": 60, "time": 1732... }
+*/
+app.get("/camera_rotate", (req, res) => {
+  try {
+    const direction = (req.query.direction || "").toLowerCase();
+    const angle = parseInt(req.query.angle || "0", 10);
+
+    if (!["left", "right"].includes(direction)) {
+      return res.status(400).json({
+        error: "direction must be 'left' or 'right'"
+      });
+    }
+
+    if (isNaN(angle) || angle < 0 || angle > 180) {
+      return res.status(400).json({
+        error: "angle must be a number 0–180"
+      });
+    }
+
+    const payload = JSON.stringify({
+      direction,
+      angle,
+      time: Date.now()
+    });
+
+    mqttClient.publish(
+      "/robot/camera_rotate",
+      payload,
+      { qos: 1 }
+    );
+
+    console.log("📡 Sent /robot/camera_rotate →", payload);
+
+    res.json({
+      status: "ok",
+      message: "Camera rotate command sent",
+      topic: "/robot/camera_rotate",
+      payload: JSON.parse(payload)
+    });
+
+  } catch (e) {
+    console.error("❌ /camera_rotate error:", e.message);
+    res.status(500).json({ error: "server error" });
   }
 });
 
@@ -649,19 +715,6 @@ app.get("/trigger_scan30", (req, res) => {
   } catch (e) {
     console.error("❌ Error triggering 30 scan:", e.message);
     res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* ==========================================================
-   GLOBAL SCAN STATUS
-========================================================== */
-
-let scanStatus = "idle";
-
-/* ESP32 báo scan hoàn tất qua MQTT */
-mqttClient.on("message", (topic, msgBuffer) => {
-  if (topic === "robot/scanning_done") {
-    scanStatus = "done";
   }
 });
 
