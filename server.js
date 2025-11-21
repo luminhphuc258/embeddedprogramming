@@ -54,7 +54,7 @@ const MQTT_PORT = 8883;
 const MQTT_USER = "robot_matthew";
 const MQTT_PASS = "29061992abCD!yesokmen";
 
-const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`
+const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
 const mqttClient = mqtt.connect(mqttUrl, {
   username: MQTT_USER,
   password: MQTT_PASS,
@@ -64,7 +64,7 @@ mqttClient.on("connect", () => {
   console.log("✅ Connected to MQTT Broker");
   mqttClient.subscribe("robot/audio_in");
   mqttClient.subscribe("robot/scanning_done");
-  mqttClient.subscribe("/dieuhuongrobot");   // dùng cho điều hướng tự động
+  mqttClient.subscribe("/dieuhuongrobot"); // auto nav
 });
 
 mqttClient.on("error", (err) => console.error("❌ MQTT error:", err.message));
@@ -118,10 +118,7 @@ async function searchITunes(query) {
   )}`;
 
   const resp = await fetch(url);
-  if (!resp.ok) {
-    console.warn("⚠️ iTunes search failed status:", resp.status);
-    return null;
-  }
+  if (!resp.ok) return null;
 
   const data = await resp.json();
   if (!data.results || !data.results.length) return null;
@@ -144,30 +141,22 @@ function getPublicHost() {
 
 async function downloadFile(url, destPath) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error("Download failed!");
 
   await new Promise((resolve, reject) => {
-    const fileStream = fs.createWriteStream(destPath);
-    res.body.pipe(fileStream);
+    const stream = fs.createWriteStream(destPath);
+    res.body.pipe(stream);
     res.body.on("error", reject);
-    fileStream.on("finish", resolve);
+    stream.on("finish", resolve);
   });
 }
 
-/** convert input -> MP3 */
 async function convertToMp3(inputPath, outputPath) {
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .toFormat("mp3")
-      .on("start", (cmd) => console.log("🎬 ffmpeg start:", cmd))
-      .on("error", (err) => {
-        console.error("❌ ffmpeg error:", err.message);
-        reject(err);
-      })
-      .on("end", () => {
-        console.log("✅ ffmpeg done:", outputPath);
-        resolve();
-      })
+      .on("error", reject)
+      .on("end", resolve)
       .save(outputPath);
   });
 }
@@ -175,104 +164,31 @@ async function convertToMp3(inputPath, outputPath) {
 async function getMp3FromPreview(previewUrl) {
   const ts = Date.now();
   const tmpM4a = path.join(audioDir, `song_${ts}.m4a`);
-  const mp3FileName = `song_${ts}.mp3`;
-  const mp3Path = path.join(audioDir, mp3FileName);
+  const mp3Path = path.join(audioDir, `song_${ts}.mp3`);
 
-  console.log("⬇️ Downloading preview:", previewUrl);
   await downloadFile(previewUrl, tmpM4a);
-
-  console.log("🎼 Converting preview → mp3...");
   await convertToMp3(tmpM4a, mp3Path);
+
   try {
     fs.unlinkSync(tmpM4a);
-  } catch (e) {
-    console.warn("⚠️ Cannot delete temp m4a:", e.message);
-  }
+  } catch { }
 
-  const host = getPublicHost();
-  const url = `${host}/audio/${mp3FileName}`;
-  console.log("🎧 Final MP3 URL:", url);
-  return url;
+  return `${getPublicHost()}/audio/song_${ts}.mp3`;
 }
 
-/* ========= Label override ========= */
-function overrideLabelByText(label, text) {
-  const t = stripDiacritics(text.toLowerCase());
-
-  const questionKeywords = [
-    "la ai",
-    "là ai",
-    "hay cho toi biet",
-    "hãy cho toi biet",
-    "hay cho em biet",
-    "hãy cho em biết",
-    "hay cho toi biet ve",
-    "hãy cho tôi biết",
-    "ban co biet",
-    "bạn có biết",
-    "cho toi hoi",
-    "cho tôi hỏi",
-    "tôi muốn biết",
-    "cho biết",
-    "mình muốn hỏi"
-  ];
-  if (questionKeywords.some((kw) => t.includes(kw))) {
-    console.log("🔁 Label override → 'question'");
-    return "question";
-  }
-
-  const rules = [
-    {
-      keywords: [
-        "nghe bai hat", "nghe nhac", "phat nhac", "mo bai", "play", "music", "song", "nhạc"
-      ],
-      newLabel: "nhac",
-    },
-    {
-      keywords: ["qua trai", "xoay trái", "đi trái", "qua bên trái"],
-      newLabel: "trai",
-    },
-    {
-      keywords: ["qua phải", "xoay phải", "đi phải", "qua bên phải"],
-      newLabel: "phai",
-    },
-    {
-      keywords: ["tiến", "đi lên", "phía trước", "tới", "tiến lên"],
-      newLabel: "tien",
-    },
-    {
-      keywords: ["lùi", "đi lùi", "phía sau", "ngược lại"],
-      newLabel: "lui",
-    },
-  ];
-
-  for (const rule of rules) {
-    if (rule.keywords.some((kw) => t.includes(stripDiacritics(kw.toLowerCase())))) {
-      return rule.newLabel;
-    }
-  }
-  return label;
-}
-
-/* ========= /upload_audio ========= */
+/* ========= Speech ========= */
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/upload_audio", upload.single("audio"), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) {
+    if (!req.file || !req.file.buffer)
       return res.status(400).json({ error: "No audio uploaded" });
-    }
 
     const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
     fs.writeFileSync(inputFile, req.file.buffer);
 
     if (req.file.buffer.length < 2000) {
-      return res.json({
-        status: "ok",
-        transcript: "",
-        label: "unknown",
-        audio_url: null
-      });
+      return res.json({ status: "ok", transcript: "", label: "unknown" });
     }
 
     const wavFile = inputFile.replace(".webm", ".wav");
@@ -284,7 +200,7 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         .audioCodec("pcm_s16le")
         .audioChannels(1)
         .audioFrequency(16000)
-        .on("error", err => reject(err))
+        .on("error", reject)
         .on("end", resolve)
         .save(wavFile);
     });
@@ -296,255 +212,136 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         model: "gpt-4o-mini-transcribe",
       });
       text = (tr.text || "").trim();
-    } catch (err) {
+    } catch {
       return res.status(500).json({ error: "STT failed" });
-    }
-
-    let label = overrideLabelByText("unknown", text);
-    let playbackUrl = null;
-    let replyText = "";
-
-    if (label === "nhac") {
-      const query = extractSongQuery(text) || text;
-      const musicMeta = await searchITunes(query);
-      if (musicMeta?.previewUrl) {
-        const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
-        playbackUrl = mp3Url;
-        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
-      } else {
-        replyText = "Không tìm thấy bài phù hợp.";
-      }
-    } else {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "Bạn là trợ lý của robot." },
-          { role: "user", content: text },
-        ],
-      });
-      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
-    }
-
-    if (!playbackUrl) {
-      const filename = `tts_${Date.now()}.mp3`;
-      const outPath = path.join(audioDir, filename);
-      const speech = await openai.audio.speech.create({
-        model: "gpt-4o-mini-tts",
-        voice: "ballad",
-        format: "mp3",
-        input: replyText,
-      });
-      const buf = Buffer.from(await speech.arrayBuffer());
-      fs.writeFileSync(outPath, buf);
-      playbackUrl = `${getPublicHost()}/audio/${filename}`;
-    }
-
-    if (["tien", "lui", "trai", "phai"].includes(label)) {
-      mqttClient.publish(
-        "robot/label",
-        JSON.stringify({ label }),
-        { qos: 1, retain: true }
-      );
-    } else {
-      mqttClient.publish(
-        "robot/music",
-        JSON.stringify({ audio_url: playbackUrl, text: replyText, label }),
-        { qos: 1 }
-      );
     }
 
     fs.unlinkSync(inputFile);
     fs.unlinkSync(wavFile);
 
-    res.json({
-      status: "ok",
-      transcript: text,
-      label,
-      audio_url: playbackUrl,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.json({ status: "ok", transcript: text });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ========= Auto Navigation /dieuhuongrobot ========= */
+/* ========= Auto Navigation ========= */
 
-/** Ngưỡng vật cản mới: > 20cm = coi như KHÔNG có vật cản */
-const OBSTACLE_THRESHOLD_CM = 20;
+const THRESHOLD = 20;
 
-/** 
- * Tính khoảng cách hiệu dụng:
- * - ultra_cm = -1 (hoặc <=0) → BỎ QUA
- * - lidar_cm <=0           → BỎ QUA
- * - nếu sensor không hợp lệ → Infinity
- */
-function getEffectiveDistanceCm(payload) {
-  const lidarValid =
-    typeof payload.lidar_cm === "number" && payload.lidar_cm > 0;
-  const ultraValid =
-    typeof payload.ultra_cm === "number" && payload.ultra_cm > 0;
-
-  const lidar = lidarValid ? payload.lidar_cm : Infinity;
-  const ultra = ultraValid ? payload.ultra_cm : Infinity;
-
-  return Math.min(lidar, ultra);
+/* 
+ Chỉ dùng ultrasonic để phát hiện vật cản trước
+ - ultra = -1 → bỏ qua → coi như clear
+*/
+function isFrontBlocked(ultra) {
+  if (typeof ultra !== "number") return false;
+  if (ultra <= 0) return false; // ultra = -1 → no obstacle
+  return ultra < THRESHOLD;
 }
 
-/* ==========================================================
-   GLOBAL SCAN STATUS
-========================================================== */
+/*
+ Chỉ dùng LIDAR khi quét trái/phải
+*/
+function isLidarClear(lidar) {
+  return typeof lidar === "number" && lidar >= THRESHOLD;
+}
 
-let scanStatus = "idle";
-
-/* ========= AUTO NAV + SCAN DONE MESSAGE HANDLER ========= */
 mqttClient.on("message", (topic, msgBuffer) => {
-  const msgStr = msgBuffer.toString();
-
-  // 1) Cập nhật trạng thái scan
-  if (topic === "robot/scanning_done") {
-    scanStatus = "done";
-    console.log("📩 robot/scanning_done → scanStatus = done");
-    return;
-  }
-
-  // 2) Xử lý điều hướng tự động
   if (topic !== "/dieuhuongrobot") return;
 
   let payload;
   try {
-    payload = JSON.parse(msgStr);
-  } catch (e) {
-    console.log("Invalid JSON on /dieuhuongrobot:", msgStr);
+    payload = JSON.parse(msgBuffer.toString());
+  } catch {
     return;
   }
 
   const phase = payload.phase || "front";
-  const dist = getEffectiveDistanceCm(payload);
-  const hasObstacle = dist < OBSTACLE_THRESHOLD_CM;
+  const lidar = payload.lidar_cm;
+  const ultra = payload.ultra_cm;
 
-  console.log(
-    `📡 [AUTO] phase=${phase}, dist=${dist}cm, obstacle=${hasObstacle}`
-  );
+  console.log(`📡 NAV phase=${phase} ultra=${ultra} lidar=${lidar}`);
 
-  // Helper: đưa lidar về neutral khi đường clear
-  const sendLidarNeutral = (reason) => {
-    const p = JSON.stringify({ action: "scan_neutral", reason });
-    mqttClient.publish("robot/lidar_neutralpoint", p, { qos: 1 });
-    console.log("→ LIDAR NEUTRAL:", reason);
-  };
-
-  /* =============================
-       PHASE: FRONT (SONAR + LIDAR)
-     ============================= */
+  /* ===========================================================
+      PHASE: FRONT → chỉ dùng ULTRASONIC
+  =========================================================== */
   if (phase === "front") {
-    if (!hasObstacle) {
-      // Đường phía trước clear → đi thẳng + đảm bảo lidar đứng im
-      sendLidarNeutral("front_clear");
+    if (!isFrontBlocked(ultra)) {
       mqttClient.publish(
         "/robot/goahead",
         JSON.stringify({ action: "goahead" }),
         { qos: 1 }
       );
       console.log("→ FRONT CLEAR → GO AHEAD");
-    } else {
-      // Có vật cản phía trước → quét PHẢI robot (LIDAR xoay LEFT)
-      mqttClient.publish(
-        "robot/lidar45_turnleft",
-        JSON.stringify({ action: "scan_right" }),
-        { qos: 1 }
-      );
-      console.log("→ FRONT BLOCKED → CHECK RIGHT SIDE (LIDAR LEFT)");
+      return;
     }
+
+    // blocked → quét TRÁI
+    mqttClient.publish(
+      "robot/lidar_left",
+      JSON.stringify({ action: "scan_left" }),
+      { qos: 1 }
+    );
+    console.log("→ FRONT BLOCKED → SCAN LEFT");
     return;
   }
 
-  /* =============================
-        LEFT45 = LiDAR xoay LEFT
-        → Quét PHÍA PHẢI robot
-     ============================= */
-  if (phase === "left45") {
-    if (!hasObstacle) {
-      // Phía phải robot clear → quay phải + đi tới, đồng thời ngưng quay lidar
-      sendLidarNeutral("right_side_clear");
+  /* ===========================================================
+      PHASE: LEFT → chỉ dùng LIDAR
+  =========================================================== */
+  if (phase === "left") {
+    if (isLidarClear(lidar)) {
       mqttClient.publish(
-        "/robot/turnright45_goahead",
-        JSON.stringify({ action: "turnright45_goahead" }),
+        "/robot/goahead_left",
+        JSON.stringify({ action: "goahead_left" }),
         { qos: 1 }
       );
-      console.log("→ RIGHT SIDE CLEAR → TURN RIGHT + GO");
-    } else {
-      // Phải bị chặn → kiểm tra TRÁI robot
-      mqttClient.publish(
-        "robot/lidar45_turnright",
-        JSON.stringify({ action: "scan_left" }),
-        { qos: 1 }
-      );
-      console.log("→ RIGHT BLOCKED → CHECK LEFT SIDE (LIDAR RIGHT)");
+      console.log("→ LEFT CLEAR → GO AHEAD LEFT");
+      return;
     }
+
+    // trái blocked → quét phải
+    mqttClient.publish(
+      "robot/lidar_right",
+      JSON.stringify({ action: "scan_right" }),
+      { qos: 1 }
+    );
+    console.log("→ LEFT BLOCKED → SCAN RIGHT");
     return;
   }
 
-  /* =============================
-        RIGHT45 = LiDAR xoay RIGHT
-        → Quét PHÍA TRÁI robot
-     ============================= */
-  if (phase === "right45") {
-    if (!hasObstacle) {
-      // Phía trái clear → quay trái + đi tới, đồng thời đưa lidar về neutral
-      sendLidarNeutral("left_side_clear");
+  /* ===========================================================
+      PHASE: RIGHT → chỉ dùng LIDAR
+  =========================================================== */
+  if (phase === "right") {
+    if (isLidarClear(lidar)) {
       mqttClient.publish(
-        "/robot/turnleft45_goahead",
-        JSON.stringify({ action: "turnleft45_goahead" }),
+        "/robot/goahead_right",
+        JSON.stringify({ action: "goahead_right" }),
         { qos: 1 }
       );
-      console.log("→ LEFT SIDE CLEAR → TURN LEFT + GO");
-    } else {
-      // Trái cũng bị chặn → kiểm tra neutral phía sau
-      mqttClient.publish(
-        "robot/lidar_neutralpoint",
-        JSON.stringify({ action: "scan_neutral" }),
-        { qos: 1 }
-      );
-      console.log("→ LEFT BLOCKED → CHECK NEUTRAL (BACK)");
+      console.log("→ RIGHT CLEAR → GO AHEAD RIGHT");
+      return;
     }
-    return;
-  }
 
-  /* =============================
-             NEUTRAL
-     ============================= */
-  if (phase === "neutral") {
-    if (!hasObstacle) {
-      // Phía sau clear → lùi, đồng thời đảm bảo lidar đứng neutral
-      sendLidarNeutral("back_clear");
-      mqttClient.publish(
-        "/robot/goback",
-        JSON.stringify({ action: "goback" }),
-        { qos: 1 }
-      );
-      console.log("→ BACK CLEAR → GO BACK");
-    } else {
-      // Tất cả hướng đều có vật cản → dừng & neutral
-      sendLidarNeutral("all_blocked");
-      mqttClient.publish(
-        "/robot/stop",
-        JSON.stringify({ action: "stop" }),
-        { qos: 1 }
-      );
-      console.log("→ ALL BLOCKED → STOP");
-    }
+    // cả trước trái phải đều block → lùi + stop
+    mqttClient.publish(
+      "/robot/goback",
+      JSON.stringify({ action: "goback" }),
+      { qos: 1 }
+    );
+    mqttClient.publish(
+      "/robot/stop",
+      JSON.stringify({ action: "stop" }),
+      { qos: 1 }
+    );
+
+    console.log("⛔ ALL BLOCKED → GO BACK + STOP");
     return;
   }
 });
 
-/* ========= CAMERA ROTATE ENDPOINT ========= */
-/*
-   HTTP GET:
-      /camera_rotate?direction=left&angle=60
-
-   JSON gửi lên MQTT:
-      { "direction": "left", "angle": 60, "time": 1732... }
-*/
+/* ========= Camera Rotate Endpoint ========= */
 app.get("/camera_rotate", (req, res) => {
   try {
     const direction = (req.query.direction || "").toLowerCase();
@@ -552,189 +349,44 @@ app.get("/camera_rotate", (req, res) => {
 
     if (!["left", "right"].includes(direction)) {
       return res.status(400).json({
-        error: "direction must be 'left' or 'right'"
+        error: "direction must be 'left' or 'right'",
       });
     }
 
     if (isNaN(angle) || angle < 0 || angle > 180) {
       return res.status(400).json({
-        error: "angle must be a number 0–180"
+        error: "angle must be 0–180",
       });
     }
 
-    const payload = JSON.stringify({
+    const payload = {
       direction,
       angle,
-      time: Date.now()
-    });
+      time: Date.now(),
+    };
 
     mqttClient.publish(
       "/robot/camera_rotate",
-      payload,
+      JSON.stringify(payload),
       { qos: 1 }
     );
 
-    console.log("📡 Sent /robot/camera_rotate →", payload);
-
     res.json({
       status: "ok",
-      message: "Camera rotate command sent",
-      topic: "/robot/camera_rotate",
-      payload: JSON.parse(payload)
+      message: "rotate sent",
+      payload,
     });
-
   } catch (e) {
-    console.error("❌ /camera_rotate error:", e.message);
-    res.status(500).json({ error: "server error" });
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ========= Trigger Scan Endpoint ========= */
-app.get("/trigger_scan", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "start_scan",
-      time: Date.now()
-    });
-
-    mqttClient.publish("robot/scanning360", payload, { qos: 1 });
-
-    console.log("📡 Triggered 360° scan → robot/scanning360");
-
-    res.json({
-      status: "ok",
-      message: "Scan started",
-      topic: "robot/scanning360",
-      payload: JSON.parse(payload)
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* ========= Trigger 180° Scan ========= */
-app.get("/trigger_scan180", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "scan_180",
-      degree: 180,
-      time: Date.now(),
-    });
-
-    mqttClient.publish("robot/scanning180", payload, { qos: 1 });
-
-    console.log("📡 Triggered 180° scan → robot/scanning180");
-
-    res.json({
-      status: "ok",
-      message: "180° scan started",
-      topic: "robot/scanning180",
-      payload: JSON.parse(payload),
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering 180 scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* ========= Trigger 90° Scan ========= */
-app.get("/trigger_scan90", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "scan_90",
-      degree: 90,
-      time: Date.now(),
-    });
-
-    mqttClient.publish("robot/scanning90", payload, { qos: 1 });
-
-    console.log("📡 Triggered 90° scan → robot/scanning90");
-
-    res.json({
-      status: "ok",
-      message: "90° scan started",
-      topic: "robot/scanning90",
-      payload: JSON.parse(payload),
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering 90 scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* ========= Trigger 45° Scan ========= */
-app.get("/trigger_scan45", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "scan_45",
-      degree: 45,
-      time: Date.now(),
-    });
-
-    mqttClient.publish("robot/scanning45", payload, { qos: 1 });
-
-    console.log("📡 Triggered 45° scan → robot/scanning45");
-
-    res.json({
-      status: "ok",
-      message: "45° scan started",
-      topic: "robot/scanning45",
-      payload: JSON.parse(payload),
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering 45 scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* ========= Trigger 30° Scan ========= */
-app.get("/trigger_scan30", (req, res) => {
-  try {
-    const payload = JSON.stringify({
-      action: "scan_30",
-      degree: 30,
-      time: Date.now(),
-    });
-
-    mqttClient.publish("robot/scanning30", payload, { qos: 1 });
-
-    console.log("📡 Triggered 30° scan → robot/scanning30");
-
-    res.json({
-      status: "ok",
-      message: "30° scan started",
-      topic: "robot/scanning30",
-      payload: JSON.parse(payload),
-    });
-
-  } catch (e) {
-    console.error("❌ Error triggering 30 scan:", e.message);
-    res.status(500).json({ error: "Trigger failed" });
-  }
-});
-
-/* Endpoint để client kiểm tra scan đã xong chưa */
-app.get("/get_scanningstatus", (req, res) => {
-  try {
-    res.json({
-      status: scanStatus
-    });
-  } catch (e) {
-    res.status(500).json({ error: "server error" });
-  }
-});
-
-/* ========= Root Endpoint ========= */
+/* ========= Root ========= */
 app.get("/", (_, res) =>
   res.send("Node.js Audio + AI + Auto Navigation Server is running!")
 );
 
-/* ========= START SERVER ========= */
+/* ========= Start ========= */
 app.listen(PORT, () => {
-  console.log(`🚀 HTTP server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
