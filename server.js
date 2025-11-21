@@ -53,6 +53,34 @@ app.use(
 app.options("/upload_audio", cors());
 
 /* ===========================================================================
+   RATE LIMIT CHO /upload_audio — ƯU TIÊN CHATBOT, TRÁNH QUÁ TẢI
+===========================================================================*/
+const requestLimitMap = {};
+const MAX_REQ = 2;      // tối đa 2 request / giây / IP
+const WINDOW_MS = 1000; // 1 giây
+
+function uploadLimiter(req, res, next) {
+  const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const now = Date.now();
+
+  if (!requestLimitMap[ip]) {
+    requestLimitMap[ip] = [];
+  }
+
+  // chỉ giữ lại những request trong 1 giây gần nhất
+  requestLimitMap[ip] = requestLimitMap[ip].filter((t) => now - t < WINDOW_MS);
+
+  if (requestLimitMap[ip].length >= MAX_REQ) {
+    return res.status(429).json({
+      error: "Server đang bận, vui lòng thử lại sau 1 giây.",
+    });
+  }
+
+  requestLimitMap[ip].push(now);
+  next();
+}
+
+/* ===========================================================================
    STATIC
 ===========================================================================*/
 app.use("/audio", express.static(audioDir));
@@ -160,7 +188,8 @@ function getPublicHost() {
 
 async function downloadFile(url, destPath) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  if (!res.ok)
+    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
 
   await new Promise((resolve, reject) => {
     const fileStream = fs.createWriteStream(destPath);
@@ -282,7 +311,7 @@ function overrideLabelByText(label, text) {
 ===========================================================================*/
 const upload = multer({ storage: multer.memoryStorage() });
 
-app.post("/upload_audio", upload.single("audio"), async (req, res) => {
+app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ error: "No audio uploaded" });
@@ -293,6 +322,9 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 
     // rất ngắn → bỏ qua
     if (req.file.buffer.length < 2000) {
+      try {
+        fs.unlinkSync(inputFile);
+      } catch { }
       return res.json({
         status: "ok",
         transcript: "",
@@ -324,6 +356,10 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       text = (tr.text || "").trim();
     } catch (err) {
       console.error("STT error:", err);
+      try {
+        fs.unlinkSync(inputFile);
+        fs.unlinkSync(wavFile);
+      } catch { }
       return res.status(500).json({ error: "STT failed" });
     }
 
@@ -350,7 +386,8 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
         ],
       });
       replyText =
-        completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+        completion.choices?.[0]?.message?.content?.trim() ||
+        "Em chưa hiểu câu này.";
     }
 
     if (!playbackUrl) {
@@ -382,8 +419,10 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
       );
     }
 
-    fs.unlinkSync(inputFile);
-    fs.unlinkSync(wavFile);
+    try {
+      fs.unlinkSync(inputFile);
+      fs.unlinkSync(wavFile);
+    } catch { }
 
     res.json({
       status: "ok",
@@ -398,13 +437,37 @@ app.post("/upload_audio", upload.single("audio"), async (req, res) => {
 });
 
 /* ===========================================================================
-   AUTO NAVIGATION — STATE MACHINE WITH DONE_ROTATE
+   AUTO NAVIGATION — STATE MACHINE WITH DONE_ROTATE + WATCHDOG
 ===========================================================================*/
 
 const THRESHOLD = 20;
 let STATE = "idle"; // idle | wait_left_done | wait_right_done
 let lastUltra = -1;
 let lastLidar = -1;
+
+// WATCHDOG chống kẹt
+let stateTimer = null;
+
+function setState(newState) {
+  STATE = newState;
+
+  if (STATE === "idle") {
+    if (stateTimer) {
+      clearTimeout(stateTimer);
+      stateTimer = null;
+    }
+    return;
+  }
+
+  if (stateTimer) {
+    clearTimeout(stateTimer);
+  }
+  stateTimer = setTimeout(() => {
+    console.log("⏳ WATCHDOG: STATE timeout → reset về idle từ", STATE);
+    STATE = "idle";
+    stateTimer = null;
+  }, 1500); // 1.5 giây
+}
 
 function isFrontBlocked(ultra) {
   if (typeof ultra !== "number") return false;
@@ -423,7 +486,18 @@ function send(topic, obj) {
 /* ========== SCAN STATUS (nếu bạn còn dùng) ========== */
 let scanStatus = "idle";
 
-/* ---------- MQTT MESSAGE HANDLER ---------- */
+/* ===========================================================================
+   MQTT MESSAGE HANDLER (có log throttle)
+===========================================================================*/
+let lastLog = 0;
+function throttledLog(msg) {
+  const now = Date.now();
+  if (now - lastLog > 300) {
+    console.log(msg);
+    lastLog = now;
+  }
+}
+
 mqttClient.on("message", (topic, msgBuf) => {
   const msgStr = msgBuf.toString();
 
@@ -448,7 +522,7 @@ mqttClient.on("message", (topic, msgBuf) => {
     lastUltra = p.ultra_cm;
     lastLidar = p.lidar_cm;
 
-    console.log(
+    throttledLog(
       `📡 NAV phase=${phase} ultra=${lastUltra} lidar=${lastLidar} STATE=${STATE}`
     );
 
@@ -462,12 +536,13 @@ mqttClient.on("message", (topic, msgBuf) => {
 
       // blocked → yêu cầu LIDAR xoay TRÁI 45° (quét PHẢI ROBOT)
       send("robot/lidar45_turnleft", { action: "scan_right" });
-      STATE = "wait_left_done";
+      setState("wait_left_done");
       console.log("→ FRONT BLOCKED → REQUEST LIDAR TURN LEFT (SCAN RIGHT)");
       return;
     }
 
-    return; // các phase khác (left45/right45) sẽ được xử lý gián tiếp qua done_*
+    // các phase khác (left45/right45) sẽ được xử lý gián tiếp qua done_*
+    return;
   }
 
   // DONE ROTATE LEFT
@@ -475,33 +550,30 @@ mqttClient.on("message", (topic, msgBuf) => {
     console.log("✔ DONE ROTATE LEFT, lidar =", lastLidar);
 
     if (isLidarClear(lastLidar)) {
-
-      // NEW: reset lidar về 110° trước khi đi
+      // reset lidar về 110° trước khi đi
       send("robot/lidar_neutralpoint", { action: "neutral" });
       console.log("→ RESET LIDAR TO NEUTRAL");
 
-      // NEW: sau đó mới đi thẳng (quẹo phải)
+      // quẹo phải + đi thẳng
       send("/robot/turnright45_goahead", { action: "turnright45_goahead" });
       console.log("→ RIGHT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
 
-      STATE = "idle";
+      setState("idle");
       return;
     }
 
     // phải blocked → thử LIDAR quay sang phải
     send("robot/lidar45_turnright", { action: "scan_left" });
-    STATE = "wait_right_done";
+    setState("wait_right_done");
     console.log("→ RIGHT BLOCKED → REQUEST TURN RIGHT (SCAN LEFT)");
     return;
   }
-
 
   // DONE ROTATE RIGHT
   if (topic === "/done_rotate_lidarright" && STATE === "wait_right_done") {
     console.log("✔ DONE ROTATE RIGHT, lidar =", lastLidar);
 
     if (isLidarClear(lastLidar)) {
-
       // RESET LIDAR trước khi đi
       send("robot/lidar_neutralpoint", { action: "neutral" });
       console.log("→ RESET LIDAR TO NEUTRAL");
@@ -510,7 +582,7 @@ mqttClient.on("message", (topic, msgBuf) => {
       send("/robot/turnleft45_goahead", { action: "turnleft45_goahead" });
       console.log("→ LEFT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
 
-      STATE = "idle";
+      setState("idle");
       return;
     }
 
@@ -518,14 +590,13 @@ mqttClient.on("message", (topic, msgBuf) => {
     send("/robot/goback", { action: "goback" });
     send("/robot/stop", { action: "stop" });
     console.log("⛔ ALL BLOCKED → GO BACK + STOP");
-    STATE = "idle";
+    setState("idle");
     return;
   }
-
 });
 
 /* ===========================================================================
-   CAMERA ROTATE ENDPOINT (GIỮ NGUYÊN)
+   CAMERA ROTATE ENDPOINT
    GET /camera_rotate?direction=left&angle=60
 ===========================================================================*/
 app.get("/camera_rotate", (req, res) => {
@@ -570,7 +641,7 @@ app.get("/camera_rotate", (req, res) => {
 });
 
 /* ===========================================================================
-   SCAN TRIGGER ENDPOINTS (NẾU BẠN CÒN DÙNG VỚI FLASK MAP)
+   SCAN TRIGGER ENDPOINTS (cho Flask map nếu còn dùng)
 ===========================================================================*/
 function triggerScanEndpoint(pathUrl, payload) {
   return (req, res) => {
