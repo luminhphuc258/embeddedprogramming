@@ -698,7 +698,7 @@ app.get("/camera_rotate", (req, res) => {
       time: Date.now(),
     };
 
-    mqttClient.publish("/robot/camera_rotate", JSON.stringify(payload), {
+    mqttClient.publish("robot/camera_rotate", JSON.stringify(payload), {
       qos: 1,
     });
 
