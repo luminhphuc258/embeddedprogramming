@@ -702,12 +702,12 @@ app.get("/camera_rotate", (req, res) => {
       qos: 1,
     });
 
-    console.log("📡 Sent /robot/camera_rotate →", payload);
+    console.log("📡 Sent robot/camera_rotate →", payload);
 
     res.json({
       status: "ok",
       message: "Camera rotate command sent",
-      topic: "/robot/camera_rotate",
+      topic: "robot/camera_rotate",
       payload,
     });
   } catch (e) {
