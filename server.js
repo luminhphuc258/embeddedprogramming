@@ -1,8 +1,8 @@
 /* ===========================================================================
    Matthew Robot — Node.js Server (Chatbot + iTunes + Auto Navigation)
    - STT + ChatGPT / iTunes + TTS
-   - Auto điều hướng với ULTRASONIC + LIDAR + state machine
-   - Dùng done_rotate_lidarleft / done_rotate_lidarright để tránh quay lặp
+   - Auto điều hướng với LIDAR (trước) + ULTRASONIC (sau) + state machine
+   - Khi label = "nhac" → publish thêm /robot/vaytay để robot vẫy tay
 ===========================================================================*/
 
 import express from "express";
@@ -56,7 +56,7 @@ app.options("/upload_audio", cors());
    RATE LIMIT CHO /upload_audio — ƯU TIÊN CHATBOT, TRÁNH QUÁ TẢI
 ===========================================================================*/
 const requestLimitMap = {};
-const MAX_REQ = 2;      // tối đa 2 request / giây / IP
+const MAX_REQ = 2; // tối đa 2 request / giây / IP
 const WINDOW_MS = 1000; // 1 giây
 
 function uploadLimiter(req, res, next) {
@@ -299,7 +299,11 @@ function overrideLabelByText(label, text) {
   ];
 
   for (const rule of rules) {
-    if (rule.keywords.some((kw) => t.includes(stripDiacritics(kw.toLowerCase())))) {
+    if (
+      rule.keywords.some((kw) =>
+        t.includes(stripDiacritics(kw.toLowerCase()))
+      )
+    ) {
       return rule.newLabel;
     }
   }
@@ -308,207 +312,248 @@ function overrideLabelByText(label, text) {
 
 /* ===========================================================================
    /upload_audio — STT → (Music / Chatbot) → TTS
+   (đã thêm /robot/vaytay khi label = "nhac")
 ===========================================================================*/
 const upload = multer({ storage: multer.memoryStorage() });
 
-app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ error: "No audio uploaded" });
-    }
-
-    const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
-    fs.writeFileSync(inputFile, req.file.buffer);
-
-    // rất ngắn → bỏ qua
-    if (req.file.buffer.length < 2000) {
-      try {
-        fs.unlinkSync(inputFile);
-      } catch { }
-      return res.json({
-        status: "ok",
-        transcript: "",
-        label: "unknown",
-        audio_url: null,
-      });
-    }
-
-    const wavFile = inputFile.replace(".webm", ".wav");
-
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputFile)
-        .inputOptions("-fflags +genpts")
-        .outputOptions("-vn")
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(16000)
-        .on("error", (err) => reject(err))
-        .on("end", resolve)
-        .save(wavFile);
-    });
-
-    let text = "";
+app.post(
+  "/upload_audio",
+  uploadLimiter,
+  upload.single("audio"),
+  async (req, res) => {
     try {
-      const tr = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: "gpt-4o-mini-transcribe",
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "No audio uploaded" });
+      }
+
+      const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
+      fs.writeFileSync(inputFile, req.file.buffer);
+
+      // rất ngắn → bỏ qua
+      if (req.file.buffer.length < 2000) {
+        try {
+          fs.unlinkSync(inputFile);
+        } catch { }
+        return res.json({
+          status: "ok",
+          transcript: "",
+          label: "unknown",
+          audio_url: null,
+        });
+      }
+
+      const wavFile = inputFile.replace(".webm", ".wav");
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(inputFile)
+          .inputOptions("-fflags +genpts")
+          .outputOptions("-vn")
+          .audioCodec("pcm_s16le")
+          .audioChannels(1)
+          .audioFrequency(16000)
+          .on("error", (err) => reject(err))
+          .on("end", resolve)
+          .save(wavFile);
       });
-      text = (tr.text || "").trim();
-    } catch (err) {
-      console.error("STT error:", err);
+
+      let text = "";
+      try {
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavFile),
+          model: "gpt-4o-mini-transcribe",
+        });
+        text = (tr.text || "").trim();
+      } catch (err) {
+        console.error("STT error:", err);
+        try {
+          fs.unlinkSync(inputFile);
+          fs.unlinkSync(wavFile);
+        } catch { }
+        return res.status(500).json({ error: "STT failed" });
+      }
+
+      let label = overrideLabelByText("unknown", text);
+      let playbackUrl = null;
+      let replyText = "";
+
+      /* ===============================================================
+         1) XỬ LÝ LABEL = “NHẠC”
+      ===============================================================*/
+      if (label === "nhac") {
+        const query = extractSongQuery(text) || text;
+        const musicMeta = await searchITunes(query);
+
+        if (musicMeta?.previewUrl) {
+          const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
+          playbackUrl = mp3Url;
+
+          replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
+
+          // NEW: publish để robot vẫy tay theo nhạc
+          mqttClient.publish(
+            "/robot/vaytay",
+            JSON.stringify({ action: "vaytay", playing: true }),
+            { qos: 1 }
+          );
+          console.log("🎵 Sent /robot/vaytay → { playing: true }");
+        } else {
+          replyText = "Không tìm thấy bài phù hợp.";
+        }
+      }
+
+      /* ===============================================================
+         2) TRƯỜNG HỢP KHÔNG PHẢI NHẠC → CHATBOT
+      ===============================================================*/
+      if (label !== "nhac") {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            {
+              role: "system",
+              content: "Bạn là trợ lý của robot, nói ngắn gọn, dễ hiểu.",
+            },
+            { role: "user", content: text },
+          ],
+        });
+
+        replyText =
+          completion.choices?.[0]?.message?.content?.trim() ||
+          "Em chưa hiểu câu này.";
+      }
+
+      /* ===============================================================
+         3) TẠO TTS — CHO CÁC TRẢ LỜI KHÔNG PHẢI NHẠC
+      ===============================================================*/
+      if (!playbackUrl) {
+        const filename = `tts_${Date.now()}.mp3`;
+        const outPath = path.join(audioDir, filename);
+        const speech = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: "ballad",
+          format: "mp3",
+          input: replyText,
+        });
+
+        const buf = Buffer.from(await speech.arrayBuffer());
+        fs.writeFileSync(outPath, buf);
+
+        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+      }
+
+      /* ===============================================================
+         4) GỬI QUA MQTT — MUSIC HOẶC CONTROL
+      ===============================================================*/
+      if (["tien", "lui", "trai", "phai"].includes(label)) {
+        mqttClient.publish(
+          "robot/label",
+          JSON.stringify({ label }),
+          { qos: 1, retain: true }
+        );
+      } else {
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({ audio_url: playbackUrl, text: replyText, label }),
+          { qos: 1 }
+        );
+      }
+
+      /* ===============================================================
+         5) XÓA FILE TEMP
+      ===============================================================*/
       try {
         fs.unlinkSync(inputFile);
         fs.unlinkSync(wavFile);
       } catch { }
-      return res.status(500).json({ error: "STT failed" });
-    }
 
-    let label = overrideLabelByText("unknown", text);
-    let playbackUrl = null;
-    let replyText = "";
-
-    if (label === "nhac") {
-      const query = extractSongQuery(text) || text;
-      const musicMeta = await searchITunes(query);
-      if (musicMeta?.previewUrl) {
-        const mp3Url = await getMp3FromPreview(musicMeta.previewUrl);
-        playbackUrl = mp3Url;
-        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
-      } else {
-        replyText = "Không tìm thấy bài phù hợp.";
-      }
-    } else {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "Bạn là trợ lý của robot, nói ngắn gọn, dễ hiểu." },
-          { role: "user", content: text },
-        ],
+      /* ===============================================================
+         6) TRẢ KẾT QUẢ CHO CLIENT
+      ===============================================================*/
+      res.json({
+        status: "ok",
+        transcript: text,
+        label,
+        audio_url: playbackUrl,
       });
-      replyText =
-        completion.choices?.[0]?.message?.content?.trim() ||
-        "Em chưa hiểu câu này.";
+    } catch (err) {
+      console.error("upload_audio error:", err);
+      res.status(500).json({ error: err.message });
     }
-
-    if (!playbackUrl) {
-      const filename = `tts_${Date.now()}.mp3`;
-      const outPath = path.join(audioDir, filename);
-      const speech = await openai.audio.speech.create({
-        model: "gpt-4o-mini-tts",
-        voice: "ballad",
-        format: "mp3",
-        input: replyText,
-      });
-      const buf = Buffer.from(await speech.arrayBuffer());
-      fs.writeFileSync(outPath, buf);
-      playbackUrl = `${getPublicHost()}/audio/${filename}`;
-    }
-
-    // publish control vs music
-    if (["tien", "lui", "trai", "phai"].includes(label)) {
-      mqttClient.publish(
-        "robot/label",
-        JSON.stringify({ label }),
-        { qos: 1, retain: true }
-      );
-    } else {
-      mqttClient.publish(
-        "robot/music",
-        JSON.stringify({ audio_url: playbackUrl, text: replyText, label }),
-        { qos: 1 }
-      );
-    }
-
-    try {
-      fs.unlinkSync(inputFile);
-      fs.unlinkSync(wavFile);
-    } catch { }
-
-    res.json({
-      status: "ok",
-      transcript: text,
-      label,
-      audio_url: playbackUrl,
-    });
-  } catch (err) {
-    console.error("upload_audio error:", err);
-    res.status(500).json({ error: err.message });
   }
-});
+);
 
 /* ===========================================================================
-   AUTO NAVIGATION — STATE MACHINE WITH DONE_ROTATE + WATCHDOG
+   AUTO NAVIGATION — LIDAR TRƯỚC + ULTRASONIC SAU
+   Logic:
+   - Bình thường: đi thẳng
+   - Nếu LIDAR < 20 cm → STOP → quay phải 45°
+   - Nếu vẫn kẹt → quay trái 90°
+   - Nếu vẫn kẹt → đọc ULTRA sau
+       + Ultra > 20cm hoặc = -1 → lùi
+       + Ultra = undefined → STOP
 ===========================================================================*/
 
 const THRESHOLD = 20;
-let STATE = "idle"; // idle | wait_left_done | wait_right_done
-let lastUltra = -1;
-let lastLidar = -1;
+let STATE = "idle"; // idle | wait_after_turnright | wait_after_turnleft
+let lastUltra = -1; // ultrasonic BACK
+let lastLidar = -1; // lidar FRONT
 
-// WATCHDOG chống kẹt
 let stateTimer = null;
 
+/* ---------------- STATE HELPER ---------------- */
 function setState(newState) {
   STATE = newState;
 
   if (STATE === "idle") {
-    if (stateTimer) {
-      clearTimeout(stateTimer);
-      stateTimer = null;
-    }
+    if (stateTimer) clearTimeout(stateTimer);
+    stateTimer = null;
     return;
   }
 
-  if (stateTimer) {
-    clearTimeout(stateTimer);
-  }
+  if (stateTimer) clearTimeout(stateTimer);
   stateTimer = setTimeout(() => {
-    console.log("⏳ WATCHDOG: STATE timeout → reset về idle từ", STATE);
+    console.log("⏳ STATE timeout → reset idle");
     STATE = "idle";
     stateTimer = null;
-  }, 1500); // 1.5 giây
+  }, 2000);
 }
 
-function isFrontBlocked(ultra) {
-  if (typeof ultra !== "number") return false;
-  if (ultra <= 0) return false; // ultra = -1 or 0 → xem như ko có vật cản
-  return ultra < THRESHOLD;
+/* ----------------- CHECKERS ------------------- */
+function lidarBlocked() {
+  return typeof lastLidar === "number" && lastLidar > 0 && lastLidar < THRESHOLD;
 }
 
-function isLidarClear(lidar) {
-  return typeof lidar === "number" && lidar >= THRESHOLD;
+function lidarClear() {
+  return typeof lastLidar === "number" && lastLidar >= THRESHOLD;
 }
 
+function ultraBackClear() {
+  if (lastUltra === undefined) return false;
+  if (lastUltra === -1) return true; // -1 → xem như không có vật cản
+  return lastUltra >= THRESHOLD;
+}
+
+/* ---------------- MQTT SEND ------------------- */
 function send(topic, obj) {
   mqttClient.publish(topic, JSON.stringify(obj), { qos: 1 });
 }
 
-/* ========== SCAN STATUS (nếu bạn còn dùng) ========== */
+/* ========== SCAN STATUS (cho Flask hỏi) ========== */
 let scanStatus = "idle";
 
 /* ===========================================================================
-   MQTT MESSAGE HANDLER (có log throttle)
+   MQTT MESSAGE HANDLER
 ===========================================================================*/
-let lastLog = 0;
-function throttledLog(msg) {
-  const now = Date.now();
-  if (now - lastLog > 300) {
-    console.log(msg);
-    lastLog = now;
-  }
-}
-
 mqttClient.on("message", (topic, msgBuf) => {
   const msgStr = msgBuf.toString();
 
-  // robot báo scan hoàn tất
+  // robot báo scan hoàn tất (nếu bạn còn dùng cho map)
   if (topic === "robot/scanning_done") {
     scanStatus = "done";
     console.log("📩 robot/scanning_done → scanStatus = done");
     return;
   }
 
-  // SENSOR DATA: từ ESP32 /dieuhuongrobot
+  // SENSOR DATA: /dieuhuongrobot
   if (topic === "/dieuhuongrobot") {
     let p;
     try {
@@ -518,81 +563,90 @@ mqttClient.on("message", (topic, msgBuf) => {
       return;
     }
 
-    const phase = p.phase || "front";
-    lastUltra = p.ultra_cm;
-    lastLidar = p.lidar_cm;
+    lastUltra = p.ultra_cm; // ultrasonic phía sau
+    lastLidar = p.lidar_cm; // lidar phía trước
 
-    throttledLog(
-      `📡 NAV phase=${phase} ultra=${lastUltra} lidar=${lastLidar} STATE=${STATE}`
+    console.log(
+      `📡 NAV: lidar_front=${lastLidar}cm ultra_back=${lastUltra} STATE=${STATE}`
     );
 
-    // PHASE FRONT chỉ xử lý khi đang idle
-    if (phase === "front" && STATE === "idle") {
-      if (!isFrontBlocked(lastUltra)) {
+    /* -------------------------------------------------------------
+       IDLE — robot đang đi thẳng bình thường
+    ------------------------------------------------------------- */
+    if (STATE === "idle") {
+      if (!lidarBlocked()) {
         send("/robot/goahead", { action: "goahead" });
-        console.log("→ FRONT CLEAR → GO AHEAD");
         return;
       }
 
-      // blocked → yêu cầu LIDAR xoay TRÁI 45° (quét PHẢI ROBOT)
-      send("robot/lidar45_turnleft", { action: "scan_right" });
-      setState("wait_left_done");
-      console.log("→ FRONT BLOCKED → REQUEST LIDAR TURN LEFT (SCAN RIGHT)");
+      // FRONT BLOCKED → STOP + TURN RIGHT 45°
+      console.log("⛔ FRONT BLOCKED → STOP");
+      send("/robot/stop", { action: "stop" });
+
+      console.log("↪️ TURN RIGHT 45°");
+      send("/robot/turnright45", { action: "turnright45" });
+
+      setState("wait_after_turnright");
       return;
     }
 
-    // các phase khác (left45/right45) sẽ được xử lý gián tiếp qua done_*
-    return;
-  }
+    /* -------------------------------------------------------------
+       AFTER TURN RIGHT 45 → check LIDAR
+    ------------------------------------------------------------- */
+    if (STATE === "wait_after_turnright") {
+      if (lidarClear()) {
+        console.log("→ RIGHT SIDE CLEAR → GO AHEAD");
+        send("/robot/goahead", { action: "goahead" });
+        setState("idle");
+        return;
+      }
 
-  // DONE ROTATE LEFT
-  if (topic === "/done_rotate_lidarleft" && STATE === "wait_left_done") {
-    console.log("✔ DONE ROTATE LEFT, lidar =", lastLidar);
+      // STILL BLOCKED → TURN LEFT 90°
+      console.log("↩️ STILL BLOCKED → TURN LEFT 90°");
+      send("/robot/turnleft90", { action: "turnleft90" });
 
-    if (isLidarClear(lastLidar)) {
-      // reset lidar về 110° trước khi đi
-      send("robot/lidar_neutralpoint", { action: "neutral" });
-      console.log("→ RESET LIDAR TO NEUTRAL");
+      setState("wait_after_turnleft");
+      return;
+    }
 
-      // quẹo phải + đi thẳng
-      send("/robot/turnright45_goahead", { action: "turnright45_goahead" });
-      console.log("→ RIGHT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
+    /* -------------------------------------------------------------
+       AFTER TURN LEFT 90 → check LIDAR
+    ------------------------------------------------------------- */
+    if (STATE === "wait_after_turnleft") {
+      if (lidarClear()) {
+        console.log("→ LEFT SIDE CLEAR → GO AHEAD");
+        send("/robot/goahead", { action: "goahead" });
+        setState("idle");
+        return;
+      }
 
+      // BOTH SIDES BLOCKED → CHECK ULTRASONIC BACK
+      console.log("🔥 BOTH SIDES BLOCKED → CHECK BACK ULTRA");
+
+      if (lastUltra === undefined) {
+        console.log("⛔ ULTRA = undefined → STOP");
+        send("/robot/stop", { action: "stop" });
+        setState("idle");
+        return;
+      }
+
+      if (ultraBackClear()) {
+        console.log("↩️ BACK CLEAR → GO BACK");
+        send("/robot/goback", { action: "goback" });
+        setState("idle");
+        return;
+      }
+
+      console.log("⚠️ BACK ALSO BLOCKED → STOP");
+      send("/robot/stop", { action: "stop" });
       setState("idle");
       return;
     }
 
-    // phải blocked → thử LIDAR quay sang phải
-    send("robot/lidar45_turnright", { action: "scan_left" });
-    setState("wait_right_done");
-    console.log("→ RIGHT BLOCKED → REQUEST TURN RIGHT (SCAN LEFT)");
     return;
   }
 
-  // DONE ROTATE RIGHT
-  if (topic === "/done_rotate_lidarright" && STATE === "wait_right_done") {
-    console.log("✔ DONE ROTATE RIGHT, lidar =", lastLidar);
-
-    if (isLidarClear(lastLidar)) {
-      // RESET LIDAR trước khi đi
-      send("robot/lidar_neutralpoint", { action: "neutral" });
-      console.log("→ RESET LIDAR TO NEUTRAL");
-
-      // quẹo trái + đi thẳng
-      send("/robot/turnleft45_goahead", { action: "turnleft45_goahead" });
-      console.log("→ LEFT SIDE CLEAR → GOAHEAD AFTER NEUTRAL");
-
-      setState("idle");
-      return;
-    }
-
-    // trái và phải đều blocked
-    send("/robot/goback", { action: "goback" });
-    send("/robot/stop", { action: "stop" });
-    console.log("⛔ ALL BLOCKED → GO BACK + STOP");
-    setState("idle");
-    return;
-  }
+  // các topic khác hiện chưa xử lý
 });
 
 /* ===========================================================================
@@ -653,7 +707,9 @@ function triggerScanEndpoint(pathUrl, payload) {
 
       mqttClient.publish(pathUrl, msg, { qos: 1 });
 
-      console.log(`📡 Triggered ${payload.degree || "360"}° scan → ${pathUrl}`);
+      console.log(
+        `📡 Triggered ${payload.degree || "360"}° scan → ${pathUrl}`
+      );
 
       res.json({
         status: "ok",
@@ -669,33 +725,48 @@ function triggerScanEndpoint(pathUrl, payload) {
 }
 
 // 360°
-app.get("/trigger_scan", triggerScanEndpoint("robot/scanning360", {
-  action: "start_scan",
-}));
+app.get(
+  "/trigger_scan",
+  triggerScanEndpoint("robot/scanning360", {
+    action: "start_scan",
+  })
+);
 
 // 180°
-app.get("/trigger_scan180", triggerScanEndpoint("robot/scanning180", {
-  action: "scan_180",
-  degree: 180,
-}));
+app.get(
+  "/trigger_scan180",
+  triggerScanEndpoint("robot/scanning180", {
+    action: "scan_180",
+    degree: 180,
+  })
+);
 
 // 90°
-app.get("/trigger_scan90", triggerScanEndpoint("robot/scanning90", {
-  action: "scan_90",
-  degree: 90,
-}));
+app.get(
+  "/trigger_scan90",
+  triggerScanEndpoint("robot/scanning90", {
+    action: "scan_90",
+    degree: 90,
+  })
+);
 
 // 45°
-app.get("/trigger_scan45", triggerScanEndpoint("robot/scanning45", {
-  action: "scan_45",
-  degree: 45,
-}));
+app.get(
+  "/trigger_scan45",
+  triggerScanEndpoint("robot/scanning45", {
+    action: "scan_45",
+    degree: 45,
+  })
+);
 
 // 30°
-app.get("/trigger_scan30", triggerScanEndpoint("robot/scanning30", {
-  action: "scan_30",
-  degree: 30,
-}));
+app.get(
+  "/trigger_scan30",
+  triggerScanEndpoint("robot/scanning30", {
+    action: "scan_30",
+    degree: 30,
+  })
+);
 
 // cho Flask hỏi trạng thái scan (nếu cần)
 app.get("/get_scanningstatus", (req, res) => {
