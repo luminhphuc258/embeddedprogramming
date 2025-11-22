@@ -675,21 +675,14 @@ mqttClient.on("message", async (topic, msgBuf) => {
    CAMERA ROTATE ENDPOINT
    GET /camera_rotate?direction=left&angle=60
 ===========================================================================*/
+/* CAMERA ROTATE ENDPOINT */
 app.get("/camera_rotate", (req, res) => {
   try {
-    const direction = (req.query.direction || "").toLowerCase();
     const angle = parseInt(req.query.angle || "0", 10);
-
-    if (!["left", "right"].includes(direction)) {
-      return res.status(400).json({
-        error: "direction must be 'left' or 'right'",
-      });
-    }
+    const direction = req.query.direction || "abs";   // thêm mode tuyệt đối
 
     if (isNaN(angle) || angle < 0 || angle > 180) {
-      return res.status(400).json({
-        error: "angle must be 0–180",
-      });
+      return res.status(400).json({ error: "Angle must be 0–180" });
     }
 
     const payload = {
@@ -698,23 +691,21 @@ app.get("/camera_rotate", (req, res) => {
       time: Date.now(),
     };
 
-    mqttClient.publish("/robot/camera_rotate", JSON.stringify(payload), {
-      qos: 1,
-    });
+    mqttClient.publish("/robot/camera_rotate", JSON.stringify(payload), { qos: 1 });
 
     console.log("📡 Sent /robot/camera_rotate →", payload);
 
     res.json({
       status: "ok",
-      message: "Camera rotate command sent",
-      topic: "/robot/camera_rotate",
       payload,
     });
+
   } catch (e) {
-    console.error("❌ /camera_rotate error:", e.message);
+    console.error("❌ /camera_rotate error:", e);
     res.status(500).json({ error: "server error" });
   }
 });
+
 
 /* ===========================================================================
    SCAN TRIGGER ENDPOINTS (cho Flask mapping nếu còn dùng)
