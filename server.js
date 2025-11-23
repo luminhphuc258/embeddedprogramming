@@ -501,6 +501,25 @@ function ultraUndefined() {
   return lastUltra === undefined;
 }
 
+function waitForNewLidar(timeout = 700) {
+  return new Promise((resolve) => {
+    const old = lastLidar;
+    const start = Date.now();
+
+    const check = setInterval(() => {
+      if (lastLidar !== old) {
+        clearInterval(check);
+        resolve(true);
+      }
+      if (Date.now() - start > timeout) {
+        clearInterval(check);
+        resolve(false);
+      }
+    }, 20);
+  });
+}
+
+
 mqttClient.on("message", async (topic, buf) => {
   if (topic !== "/dieuhuongrobot") return;
 
@@ -551,7 +570,10 @@ mqttClient.on("message", async (topic, buf) => {
   // STEP 1: QUAY TRÁI 45°
   console.log("↩️ TURN LEFT 45°");
   sendCmd("/robot/turnleft45", "turnleft45");
-  await delay(500);
+
+  // đợi giá trị lidar mới sau khi xoay
+  await waitForNewLidar();
+
 
   if (lidarClear()) {
     console.log("✔ LEFT CLEAR → GO AHEAD");
@@ -568,7 +590,7 @@ mqttClient.on("message", async (topic, buf) => {
   // STEP 3: XOAY PHẢI 45°
   console.log("↪️ TURN RIGHT 45°");
   sendCmd("/robot/turnright45", "turnright45");
-  await delay(500);
+  await waitForNewLidar();
 
   if (lidarClear()) {
     console.log("✔ RIGHT CLEAR → GO");
