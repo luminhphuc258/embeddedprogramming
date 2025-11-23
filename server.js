@@ -517,6 +517,10 @@ function delay(ms) {
 async function scanOneMode(topicCmd, modeName) {
   console.log(`📡 BẮT ĐẦU QUÉT MODE: ${modeName}`);
 
+  // ❗ RESET LIDAR trước khi quét
+  lastLidar = -1;
+
+  // Gửi lệnh đổi góc LIDAR
   mqttClient.publish(
     topicCmd,
     JSON.stringify({ action: modeName, time: Date.now() }),
@@ -526,24 +530,32 @@ async function scanOneMode(topicCmd, modeName) {
   let localMin = Infinity;
   const start = Date.now();
 
-  // chờ servo đổi góc xong rồi mới đo kỹ
-  await delay(150);
+  // Chờ servo xoay + cảm biến ổn định
+  await delay(200);
 
   while (Date.now() - start < SCAN_DURATION_MS) {
-    if (lastLidar > 0 && lastLidar < localMin) {
-      localMin = lastLidar;
+
+    // 💥 Bỏ qua những giá trị cũ "cache" không hợp lệ
+    if (lastLidar > 0 && lastLidar < 5000) {
+
+      if (lastLidar < localMin) {
+        localMin = lastLidar;
+      }
+
     }
+
     await delay(SAMPLE_INTERVAL_MS);
   }
 
   if (!Number.isFinite(localMin)) {
-    console.log(`⚠️ Mode ${modeName}: không có dữ liệu LIDAR hợp lệ`);
+    console.log(`⚠️ Không nhận được LIDAR mới ở mode ${modeName}`);
     return Infinity;
   }
 
   console.log(`✅ Mode ${modeName}: minDistance = ${localMin}cm`);
   return localMin;
 }
+
 
 /**
  * Quét đủ 3 mode (cao / trung / thấp) theo thứ tự.
