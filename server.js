@@ -1,7 +1,7 @@
 /* ===========================================================================
    Matthew Robot — Node.js Server (Chatbot + iTunes + Auto Navigation)
    - STT + ChatGPT / iTunes + TTS
-   - Auto điều hướng với LIDAR + ULTRASONIC
+   - Auto điều hướng với LIDAR + ULTRASONIC (3 mode: cao / trung / thấp)
    - Label override + camera + scan 360
 ===========================================================================*/
 
@@ -119,8 +119,15 @@ function stripDiacritics(s = "") {
 function extractSongQuery(text) {
   let t = stripDiacritics(text.toLowerCase());
   const remove = [
-    "xin chao", "toi muon nghe", "nghe nhac", "phat nhac", "mo bai",
-    "bai hat", "nhac", "song", "music"
+    "xin chao",
+    "toi muon nghe",
+    "nghe nhac",
+    "phat nhac",
+    "mo bai",
+    "bai hat",
+    "nhac",
+    "song",
+    "music",
   ];
 
   remove.forEach((p) => (t = t.replace(p, " ")));
@@ -130,7 +137,9 @@ function extractSongQuery(text) {
 async function searchITunes(query) {
   if (!query) return null;
 
-  const url = `https://itunes.apple.com/search?media=music&limit=1&term=${encodeURIComponent(query)}`;
+  const url = `https://itunes.apple.com/search?media=music&limit=1&term=${encodeURIComponent(
+    query
+  )}`;
   const resp = await fetch(url);
   if (!resp.ok) return null;
 
@@ -155,7 +164,8 @@ async function getMp3FromPreview(previewUrl) {
   fs.writeFileSync(src, buffer);
 
   await new Promise((resolve, reject) =>
-    ffmpeg(src).toFormat("mp3")
+    ffmpeg(src)
+      .toFormat("mp3")
       .on("end", resolve)
       .on("error", reject)
       .save(dst)
@@ -187,6 +197,7 @@ function overrideLabelByText(label, text) {
 
   return label;
 }
+
 /* ===========================================================================  
    UPLOAD_AUDIO — STT → (Music / Chatbot) → TTS  
 ===========================================================================*/
@@ -208,7 +219,9 @@ app.post(
 
       // Nếu file quá nhỏ thì bỏ qua
       if (req.file.buffer.length < 2000) {
-        try { fs.unlinkSync(inputFile); } catch { }
+        try {
+          fs.unlinkSync(inputFile);
+        } catch { }
         return res.json({
           status: "ok",
           transcript: "",
@@ -321,10 +334,7 @@ app.post(
           input: replyText,
         });
 
-        fs.writeFileSync(
-          outPath,
-          Buffer.from(await speech.arrayBuffer())
-        );
+        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
 
         playbackUrl = `${getPublicHost()}/audio/${filename}`;
       }
@@ -404,7 +414,7 @@ app.get("/camera_rotate", (req, res) => {
 });
 
 /* ===========================================================================  
-   SCAN TRIGGER ENDPOINTS  
+   SCAN TRIGGER ENDPOINTS (360 / 180 / 90 / 45 / 30)
 ===========================================================================*/
 
 function triggerScanEndpoint(pathUrl, payload) {
@@ -430,14 +440,29 @@ function triggerScanEndpoint(pathUrl, payload) {
   };
 }
 
-app.get("/trigger_scan", triggerScanEndpoint("robot/scanning360", { action: "start_scan" }));
-app.get("/trigger_scan180", triggerScanEndpoint("robot/scanning180", { action: "scan_180" }));
-app.get("/trigger_scan90", triggerScanEndpoint("robot/scanning90", { action: "scan_90" }));
-app.get("/trigger_scan45", triggerScanEndpoint("robot/scanning45", { action: "scan_45" }));
-app.get("/trigger_scan30", triggerScanEndpoint("robot/scanning30", { action: "scan_30" }));
+app.get(
+  "/trigger_scan",
+  triggerScanEndpoint("robot/scanning360", { action: "start_scan" })
+);
+app.get(
+  "/trigger_scan180",
+  triggerScanEndpoint("robot/scanning180", { action: "scan_180" })
+);
+app.get(
+  "/trigger_scan90",
+  triggerScanEndpoint("robot/scanning90", { action: "scan_90" })
+);
+app.get(
+  "/trigger_scan45",
+  triggerScanEndpoint("robot/scanning45", { action: "scan_45" })
+);
+app.get(
+  "/trigger_scan30",
+  triggerScanEndpoint("robot/scanning30", { action: "scan_30" })
+);
 
 /* ===========================================================================  
-   SCAN STATUS  
+   SCAN STATUS (CHO FLASK VIDEO SERVER HỎI)
 ===========================================================================*/
 let scanStatus = "idle";
 
@@ -448,34 +473,32 @@ mqttClient.on("message", (topic) => {
 app.get("/get_scanningstatus", (req, res) => {
   res.json({ status: scanStatus });
 });
+
 /* ===========================================================================
-   AUTO NAVIGATION — NEW LOGIC (FINAL VERSION)
-   REQUIREMENTS:
-   - Ngưỡng LIDAR: 55 cm
-   - Khi blocked:
-       1. STOP
-       2. Turn LEFT 45°
-       3. Wait 500ms → check again
-          - Nếu clear → đi tiếp
-          - Nếu blocked →
-                4. Lùi 500ms
-                5. Turn RIGHT 45°
-                6. Wait 500ms
-                   - Nếu clear → đi tiếp
-                   - Nếu blocked →
-                        7. Kiểm tra ultrasonic sau
-                        8. Nếu sau <50 cm hoặc = -1 → lùi 500ms rồi STOP
-                        9. Quay 360°
-                        10. Nếu vẫn blocked → HARD_BLOCK
+   AUTO NAVIGATION — 3 LIDAR MODES (HIGH / MID / LOW)
+   Logic:
+   1. Mỗi lần quyết định di chuyển:
+      - Quét 3 mode: cao → trung → thấp (mỗi mode 800ms)
+      - Sau 3 mode: publish /robot/stop3mode để xe đứng đợi
+      - Nếu phía trước clear → goahead
+      - Nếu blocked:
+          + quay trái 45°, quét 3 mode
+              · nếu clear → goahead
+          + nếu vẫn blocked → quay sang phải 45° so với ban đầu, quét 3 mode
+              · nếu clear → goahead
+          + nếu vẫn blocked → kiểm tra sau:
+              · nếu sau trống → lùi 500ms rồi stop
+              · nếu sau cũng kẹt → stop luôn
 ===========================================================================*/
 
-const LIDAR_THRESHOLD = 55;       // cm phía trước
-const ULTRA_BACK_THRESHOLD = 50;  // cm phía sau
+const LIDAR_THRESHOLD = 55;        // cm: ngưỡng phía trước
+const ULTRA_BACK_THRESHOLD = 50;   // cm: ngưỡng phía sau
+const SCAN_DURATION_MS = 800;      // thời gian quét mỗi mode
+const SAMPLE_INTERVAL_MS = 50;     // chu kỳ đọc lastLidar
 
+let lastLidar = -1;   // LIDAR trước (giá trị mới nhất từ ESP)
 let lastUltra = -1;   // ultrasonic sau
-let lastLidar = -1;   // lidar trước
-
-let HARD_BLOCK = false;  // robot bị kẹt hoàn toàn
+let isScanning3Mode = false;  // đang chạy quy trình 3 mode hay không
 
 function sendCmd(topic, action) {
   mqttClient.publish(topic, JSON.stringify({ action }), { qos: 1 });
@@ -485,40 +508,179 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function lidarBlocked() {
-  return lastLidar > 0 && lastLidar < LIDAR_THRESHOLD;
+/**
+ * Quét 1 mode LIDAR trong SCAN_DURATION_MS.
+ * - topicCmd: topic để robot biết chỉnh góc LIDAR (cao / trung / thấp)
+ * - modeName: chỉ để log
+ * Trả về: khoảng cách nhỏ nhất đo được trong khoảng thời gian đó (cm)
+ */
+async function scanOneMode(topicCmd, modeName) {
+  console.log(`📡 BẮT ĐẦU QUÉT MODE: ${modeName}`);
+
+  mqttClient.publish(
+    topicCmd,
+    JSON.stringify({ action: modeName, time: Date.now() }),
+    { qos: 1 }
+  );
+
+  let localMin = Infinity;
+  const start = Date.now();
+
+  // chờ servo đổi góc xong rồi mới đo kỹ
+  await delay(150);
+
+  while (Date.now() - start < SCAN_DURATION_MS) {
+    if (lastLidar > 0 && lastLidar < localMin) {
+      localMin = lastLidar;
+    }
+    await delay(SAMPLE_INTERVAL_MS);
+  }
+
+  if (!Number.isFinite(localMin)) {
+    console.log(`⚠️ Mode ${modeName}: không có dữ liệu LIDAR hợp lệ`);
+    return Infinity;
+  }
+
+  console.log(`✅ Mode ${modeName}: minDistance = ${localMin}cm`);
+  return localMin;
 }
 
-function lidarClear() {
-  return lastLidar >= LIDAR_THRESHOLD;
+/**
+ * Quét đủ 3 mode (cao / trung / thấp) theo thứ tự.
+ * Sau khi xong 3 mode thì publish /robot/stop3mode để xe đứng đợi.
+ * Trả về: { clear, minDist, high, mid, low }
+ */
+async function threeModeScanFront() {
+  console.log("🎯 BẮT ĐẦU QUY TRÌNH QUÉT 3 MODE PHÍA TRƯỚC");
+
+  const high = await scanOneMode("/robot/quetcao", "quetcao");
+  const mid = await scanOneMode("/robot/quettamtrung", "quettamtrung");
+  const low = await scanOneMode("/robot/quettamthap", "quettamthap"); // dùng /robot/quettamthap
+
+  // Sau khi quét xong 3 mode → đảm bảo xe đứng chờ
+  mqttClient.publish(
+    "/robot/stop3mode",
+    JSON.stringify({ action: "stop3mode", time: Date.now() }),
+    { qos: 1 }
+  );
+
+  const validDistances = [high, mid, low].filter(
+    (d) => Number.isFinite(d) && d > 0
+  );
+
+  if (validDistances.length === 0) {
+    console.log(
+      "⚠️ Không có dữ liệu LIDAR hợp lệ từ 3 mode → coi như BLOCKED"
+    );
+    return {
+      clear: false,
+      minDist: Infinity,
+      high,
+      mid,
+      low,
+    };
+  }
+
+  const minDist = Math.min(...validDistances);
+  const clear = minDist >= LIDAR_THRESHOLD;
+
+  console.log(
+    `📏 Kết quả 3 mode: high=${high}cm, mid=${mid}cm, low=${low}cm, min=${minDist}cm, clear=${clear}`
+  );
+
+  return { clear, minDist, high, mid, low };
 }
 
-function ultraBlocked() {
-  return lastUltra > 0 && lastUltra < ULTRA_BACK_THRESHOLD;
+/**
+ * Hàm chính: mỗi lần quyết định di chuyển → gọi full 3-mode logic
+ */
+async function handleNavDecision3Mode() {
+  if (isScanning3Mode) {
+    // Đang scan thì không vào thêm lần nữa
+    return;
+  }
+
+  isScanning3Mode = true;
+  try {
+    console.log("🤖 AUTO NAV 3-MODE: BẮT ĐẦU QUYẾT ĐỊNH MỚI");
+
+    // Dừng xe lại trước khi quét
+    sendCmd("/robot/stop", "stop");
+
+    // 1) QUÉT 3 MODE TRƯỚC MẶT (hướng hiện tại)
+    const front = await threeModeScanFront();
+
+    if (front.clear) {
+      console.log("✔ PHÍA TRƯỚC CLEAR → GOAHEAD");
+      sendCmd("/robot/goahead", "goahead");
+      return;
+    }
+
+    // 2) TRƯỚC BỊ CHẶN → THỬ XOAY TRÁI 45°
+    console.log("⛔ TRƯỚC BỊ CHẶN → XOAY TRÁI 45°");
+    sendCmd("/robot/turnleft45", "turnleft45");
+    await delay(500); // chờ robot xoay xong
+
+    const left = await threeModeScanFront();
+
+    if (left.clear) {
+      console.log("✔ GÓC TRÁI 45° CLEAR → GOAHEAD");
+      sendCmd("/robot/goahead", "goahead");
+      return;
+    }
+
+    // 3) GÓC TRÁI CŨNG BỊ CHẶN → XOAY SANG PHẢI
+    console.log("⛔ GÓC TRÁI CŨNG BỊ CHẶN → THỬ GÓC PHẢI");
+
+    // Nếu muốn đứng ở góc phải 45° so với ban đầu:
+    // - đang ở trái 45°, quay phải 45° → về giữa
+    // - quay phải 45° lần nữa → sang phải 45°
+    sendCmd("/robot/turnright45", "turnright45"); // về lại giữa
+    await delay(500);
+    sendCmd("/robot/turnright45", "turnright45"); // sang phải 45°
+    await delay(500);
+
+    const right = await threeModeScanFront();
+
+    if (right.clear) {
+      console.log("✔ GÓC PHẢI 45° CLEAR → GOAHEAD");
+      sendCmd("/robot/goahead", "goahead");
+      return;
+    }
+
+    // 4) TRƯỚC + TRÁI + PHẢI ĐỀU KẸT → XEM LÙI ĐƯỢC KHÔNG
+    console.log(
+      "🔥 CẢ TRƯỚC, TRÁI, PHẢI ĐỀU BLOCKED → KIỂM TRA SAU (ULTRASONIC)"
+    );
+
+    if (!(lastUltra > 0)) {
+      console.log("⚠️ Không có dữ liệu ultrasonic phía sau → STOP");
+      sendCmd("/robot/stop", "stop");
+      return;
+    }
+
+    if (lastUltra > ULTRA_BACK_THRESHOLD) {
+      console.log("↩️ PHÍA SAU TRỐNG → LÙI 500ms RỒI STOP");
+      sendCmd("/robot/goback", "goback");
+      await delay(500);
+      sendCmd("/robot/stop", "stop");
+    } else {
+      console.log("⛔ PHÍA SAU CŨNG KẸT → DỪNG HẲN");
+      sendCmd("/robot/stop", "stop");
+    }
+  } catch (err) {
+    console.error("❌ Lỗi trong handleNavDecision3Mode:", err);
+    sendCmd("/robot/stop", "stop");
+  } finally {
+    isScanning3Mode = false;
+  }
 }
 
-function ultraUndefined() {
-  return lastUltra === undefined;
-}
-
-function waitForNewLidar(timeout = 700) {
-  return new Promise((resolve) => {
-    const old = lastLidar;
-    const start = Date.now();
-
-    const check = setInterval(() => {
-      if (lastLidar !== old) {
-        clearInterval(check);
-        resolve(true);
-      }
-      if (Date.now() - start > timeout) {
-        clearInterval(check);
-        resolve(false);
-      }
-    }, 20);
-  });
-}
-
+/* ===========================================================================
+   LẮNG NGHE SENSOR /dieuhuongrobot
+   - Cập nhật lastLidar, lastUltra mỗi khi ESP gửi dữ liệu
+   - Nếu không bận scan 3 mode thì gọi handleNavDecision3Mode()
+===========================================================================*/
 
 mqttClient.on("message", async (topic, buf) => {
   if (topic !== "/dieuhuongrobot") return;
@@ -535,102 +697,23 @@ mqttClient.on("message", async (topic, buf) => {
   lastUltra = p.ultra_cm;
 
   console.log(
-    `📡 NAV: LIDAR=${lastLidar}cm ULTRA=${lastUltra}cm HARD_BLOCK=${HARD_BLOCK}`
+    `📡 NAV SENSOR: LIDAR=${lastLidar}cm ULTRA=${lastUltra}cm`
   );
 
-  /* ==========================================================
-        CASE: HARD BLOCK MODE
-     ==========================================================*/
-  if (HARD_BLOCK) {
-    if (!lidarClear()) {
-      console.log("⛔ HARD BLOCK → ROBOT MUST STOP");
-      sendCmd("/robot/stop", "stop");
-      return;
-    }
+  // Mỗi lần có sensor mới → nếu không bận scan thì bắt đầu 1 quyết định mới
+  await handleNavDecision3Mode();
+});
 
-    console.log("✔ LIDAR CLEAR AGAIN → EXIT HARD BLOCK");
-    HARD_BLOCK = false;
-  }
+/* ===========================================================================  
+   SIMPLE ROOT CHECK  
+===========================================================================*/
+app.get("/", (req, res) => {
+  res.send("Matthew Robot server is running 🚀");
+});
 
-  /* ==========================================================
-        CASE: ĐƯỜNG TRƯỚC RÕ → ĐI THẲNG
-     ==========================================================*/
-  if (!lidarBlocked()) {
-    sendCmd("/robot/goahead", "goahead");
-    return;
-  }
-
-  /* ==========================================================
-        CASE: BỊ CHẶN — BẮT ĐẦU LOGIC TRÁNH VẬT CẢN
-     ==========================================================*/
-
-  console.log("⛔ BLOCKED FRONT → STOP");
-  sendCmd("/robot/stop", "stop");
-
-  // STEP 1: QUAY TRÁI 45°
-  console.log("↩️ TURN LEFT 45°");
-  sendCmd("/robot/turnleft45", "turnleft45");
-
-  // đợi giá trị lidar mới sau khi xoay
-  await waitForNewLidar();
-
-
-  if (lidarClear()) {
-    console.log("✔ LEFT CLEAR → GO AHEAD");
-    sendCmd("/robot/goahead", "goahead");
-    return;
-  }
-
-  // STEP 2: LÙI 500MS
-  console.log("↩️ REVERSE 500ms");
-  sendCmd("/robot/goback", "goback");
-  await delay(500);
-  sendCmd("/robot/stop", "stop");
-
-  // STEP 3: XOAY PHẢI 45°
-  console.log("↪️ TURN RIGHT 45°");
-  sendCmd("/robot/turnright45", "turnright45");
-  await waitForNewLidar();
-
-  if (lidarClear()) {
-    console.log("✔ RIGHT CLEAR → GO");
-    sendCmd("/robot/goahead", "goahead");
-    return;
-  }
-
-  // STEP 4: HAI BÊN + TRƯỚC ĐỀU KẸT → CHECK SAU
-  console.log("🔥 BOTH SIDES BLOCKED → CHECK ULTRASONIC BACK");
-
-  if (ultraUndefined()) {
-    console.log("⛔ ULTRASONIC UNDEFINED → HARD BLOCK");
-    sendCmd("/robot/stop", "stop");
-    HARD_BLOCK = true;
-    return;
-  }
-
-  if (!ultraBlocked() || lastUltra === -1) {
-    console.log("↩️ BACK CLEAR OR -1 → REVERSE 500ms");
-    sendCmd("/robot/goback", "goback");
-    await delay(500);
-    sendCmd("/robot/stop", "stop");
-  } else {
-    console.log("⛔ BACK ALSO BLOCKED → STOP");
-    sendCmd("/robot/stop", "stop");
-  }
-
-  // STEP 5: XOAY 360°
-  console.log("🔄 TURN FULL 360°");
-  sendCmd("/robot/turn360", "turn360");
-  await delay(500);
-
-  // STEP 6: SAU 360° → KIỂM TRA LẠI LIDAR
-  if (lidarBlocked()) {
-    console.log("⛔ STILL BLOCKED AFTER 360° → HARD BLOCK");
-    sendCmd("/robot/stop", "stop");
-    HARD_BLOCK = true;
-    return;
-  }
-
-  console.log("✔ CLEAR AFTER 360° → MOVE FORWARD");
-  sendCmd("/robot/goahead", "goahead");
+/* ===========================================================================  
+   START SERVER  
+===========================================================================*/
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
 });
