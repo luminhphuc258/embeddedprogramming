@@ -103,6 +103,27 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("/done_rotate_lidarleft");
   mqttClient.subscribe("/done_rotate_lidarright");
   mqttClient.subscribe("robot/audio_in");
+  //nhận hướng điều hướng từ ESP
+  mqttClient.subscribe("robot/label");
+});
+
+mqttClient.on("message", (topic, message) => {
+  try {
+    const msg = message.toString();
+
+    if (topic === "robot/label") {
+      console.log("==> Robot quyết định hướng:", msg);
+      return;
+    }
+
+    if (topic === "robot/scanning_done") {
+      scanStatus = "done";
+      return;
+    }
+
+  } catch (err) {
+    console.error("MQTT message error", err);
+  }
 });
 
 /* ===========================================================================  
