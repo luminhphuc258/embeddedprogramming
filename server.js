@@ -103,6 +103,7 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("/done_rotate_lidarleft");
   mqttClient.subscribe("/done_rotate_lidarright");
   mqttClient.subscribe("robot/audio_in");
+  mqttClient.subscribe("robot/scanning180");
   //nhận hướng điều hướng từ ESP
   mqttClient.subscribe("robot/label");
 });
@@ -113,6 +114,11 @@ mqttClient.on("message", (topic, message) => {
 
     if (topic === "robot/label") {
       console.log("==> Robot quyết định hướng:", msg);
+      return;
+    }
+
+    if (topic === "robot/scanning180") {
+      console.log("==> Quyet dinh xoay 180 độ:", msg);
       return;
     }
 
