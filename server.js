@@ -411,6 +411,143 @@ app.post(
   }
 );
 
+/* ===========================================================================
+   API RIÊNG CHO RASPBERRY PI
+   - Nhận WAV (S16_LE, mono, 16kHz)
+   - Không convert WebM
+===========================================================================*/
+
+app.post(
+  "/pi_upload_audio",
+  uploadLimiter,
+  upload.single("audio"),   // nhận field "audio"
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "No audio uploaded" });
+      }
+
+      // lưu WAV vào server
+      const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
+      fs.writeFileSync(wavFile, req.file.buffer);
+
+      /* -------------------------------------------------------------
+         STT → TEXT
+      ------------------------------------------------------------- */
+      let text = "";
+      try {
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavFile),
+          model: "gpt-4o-mini-transcribe",
+        });
+
+        text = (tr.text || "").trim();
+        console.log("🎤 PI STT:", text);
+      } catch (err) {
+        console.error("PI STT error:", err);
+        return res.json({
+          status: "error",
+          text: "",
+          label: "unknown",
+          audio_url: null,
+        });
+      }
+
+      /* -------------------------------------------------------------
+         OVERRIDE LABEL
+      ------------------------------------------------------------- */
+      let label = overrideLabelByText("unknown", text);
+
+      let playbackUrl = null;
+      let replyText = "";
+
+      /* -------------------------------------------------------------
+         LABEL = nhạc → iTunes
+      ------------------------------------------------------------- */
+      if (label === "nhac") {
+        const query = extractSongQuery(text) || text;
+        const m = await searchITunes(query);
+
+        if (m?.previewUrl) {
+          playbackUrl = await getMp3FromPreview(m.previewUrl);
+          replyText = `Em mở bài "${m.trackName}" của ${m.artistName} nhé.`;
+        } else {
+          replyText = "Em không tìm thấy bài phù hợp.";
+        }
+      }
+
+      /* -------------------------------------------------------------
+         LABEL KHÁC → ChatGPT → TTS
+      ------------------------------------------------------------- */
+      if (!playbackUrl) {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn." },
+            { role: "user", content: text },
+          ],
+        });
+
+        replyText = completion.choices?.[0]?.message?.content || "Em chưa hiểu.";
+      }
+
+      /* -------------------------------------------------------------
+         TTS nếu cần
+      ------------------------------------------------------------- */
+      if (!playbackUrl) {
+        const filename = `pi_tts_${Date.now()}.mp3`;
+        const outPath = path.join(audioDir, filename);
+
+        const speech = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: "ballad",
+          format: "mp3",
+          input: replyText,
+        });
+
+        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
+
+        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+      }
+
+      /* -------------------------------------------------------------
+         Gửi MQTT CHO ROBOT
+      ------------------------------------------------------------- */
+      if (["tien", "lui", "trai", "phai"].includes(label)) {
+        mqttClient.publish(
+          "robot/label",
+          JSON.stringify({ label }),
+          { qos: 1, retain: true }
+        );
+      } else {
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({
+            audio_url: playbackUrl,
+            text: replyText,
+            label,
+          }),
+          { qos: 1 }
+        );
+      }
+
+      /* -------------------------------------------------------------
+         TRẢ KẾT QUẢ CHO RASPBERRY PI
+      ------------------------------------------------------------- */
+      res.json({
+        status: "ok",
+        text,
+        label,
+        audio_url: playbackUrl,
+      });
+    } catch (err) {
+      console.error("pi_upload_audio error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+
 /* ===========================================================================  
    CAMERA ROTATE ENDPOINT  
 ===========================================================================*/
