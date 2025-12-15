@@ -208,11 +208,11 @@ async function getMp3FromPreview(previewUrl) {
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
-  const question = ["la ai", "là ai", "cho toi biet", "cho tôi hỏi"];
+  const question = ["la ai", "là ai", "cho toi biet", "cho tôi hỏi", "hay cho toi biet", "hay cho tôi biết", "cau hoi", "ban co biet"];
   if (question.some((k) => t.includes(k))) return "question";
 
   const rules = [
-    { keys: ["nhac", "nghe bai", "phat nhac"], out: "nhac" },
+    { keys: ["nhac", "music", "play", "nghe bai hat", "nhac", "nghe", "phat nhac", "cho toi nghe", "phat nhac", "bat nhac"], out: "nhac" },
     { keys: ["qua trai", "xoay trai", "bên trái"], out: "trai" },
     { keys: ["qua phai", "xoay phải"], out: "phai" },
     { keys: ["tiến", "đi lên"], out: "tien" },
