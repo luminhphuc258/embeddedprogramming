@@ -21,6 +21,7 @@ import cors from "cors";
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
 
+const uploadVision = multer({ storage: multer.memoryStorage() });
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -75,6 +76,145 @@ function uploadLimiter(req, res, next) {
   requestLimitMap[ip].push(now);
   next();
 }
+
+// PHAN COMPUTER VISION 
+app.post(
+  "/avoid_obstacle_vision",
+  uploadVision.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "No image" });
+      }
+
+      let meta = {};
+      try {
+        meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
+      } catch {
+        meta = {};
+      }
+
+      const ultraCm = meta.ultra_cm ?? null;
+      const localBest = meta.local_best_sector ?? null;
+      const roiW = Number(meta.roi_w || 640);
+      const roiH = Number(meta.roi_h || 240);
+
+      // image -> base64 data url
+      const b64 = req.file.buffer.toString("base64");
+      const dataUrl = `data:image/jpeg;base64,${b64}`;
+
+      const system = `
+Bạn là module "AvoidObstacle" cho robot.
+Từ ảnh ROI (phần dưới camera, gần robot) hãy:
+- xác định vật cản đáng chú ý trong ROI
+- đề xuất vùng đi an toàn (safe polygon) trong ROI
+- đề xuất best_sector (0..8) theo chiều ngang ROI (9 sector)
+Trả về JSON hợp lệ, KHÔNG giải thích.
+
+Tọa độ bbox: [x1,y1,x2,y2] theo ROI, gốc (0,0) ở góc trên trái ROI.
+Tọa độ safe_poly: list các điểm [x,y] theo ROI.
+confidence: 0..1
+risk: 0..1 (vật càng gần/chiếm ROI dưới càng risk cao)
+`.trim();
+
+      const user = [
+        {
+          type: "text",
+          text: `
+Meta:
+- ultrasonic_cm: ${ultraCm}
+- local_best_sector: ${localBest}
+ROI size: ${roiW}x${roiH}
+
+Return JSON schema exactly:
+{
+ "best_sector": number,
+ "safe_poly": [[x,y],[x,y],[x,y],[x,y]],
+ "obstacles": [{"label": string, "bbox":[x1,y1,x2,y2], "risk": number}],
+ "n_obstacles": number,
+ "confidence": number
+}
+
+Rules:
+- Ưu tiên đánh giá vật cản ở nửa dưới ROI (near-field).
+- Nếu chỉ thấy rèm/tường ở xa (ở cao, không “ăn” xuống dưới), risk thấp.
+- Không bịa. Không chắc thì label="unknown" và confidence thấp.
+`.trim(),
+        },
+        { type: "image_url", image_url: { url: dataUrl } },
+      ];
+
+      const model = process.env.VISION_MODEL || "gpt-4.1-mini";
+
+      const completion = await openai.chat.completions.create({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        temperature: 0.2,
+        max_tokens: 350,
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+
+      // Parse JSON best-effort
+      let plan = null;
+      try {
+        plan = JSON.parse(raw);
+      } catch {
+        const m = raw.match(/\{[\s\S]*\}$/);
+        if (m) {
+          try { plan = JSON.parse(m[0]); } catch { }
+        }
+      }
+
+      // fallback nếu GPT trả sai format
+      if (!plan || typeof plan !== "object") {
+        return res.status(200).json({
+          best_sector: (typeof localBest === "number" ? localBest : 4),
+          safe_poly: [
+            [0, roiH],
+            [roiW, roiH],
+            [roiW, Math.floor(0.55 * roiH)],
+            [0, Math.floor(0.55 * roiH)],
+          ],
+          obstacles: [],
+          n_obstacles: 0,
+          confidence: 0.15,
+        });
+      }
+
+      // normalize fields
+      if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
+      if (!Array.isArray(plan.safe_poly)) plan.safe_poly = [];
+      if (typeof plan.best_sector !== "number") plan.best_sector = (typeof localBest === "number" ? localBest : 4);
+      plan.n_obstacles = plan.obstacles.length;
+      if (typeof plan.confidence !== "number") plan.confidence = 0.4;
+
+      /* ====== LOG VẬT CẢN (SERVER) ====== */
+      console.log("VISION PLAN:", {
+        ultrasonic_cm: ultraCm,
+        best_sector: plan.best_sector,
+        confidence: plan.confidence,
+        n_obstacles: plan.n_obstacles,
+        obstacles: plan.obstacles.map((o, i) => ({
+          i,
+          label: o.label,
+          risk: o.risk,
+          bbox: o.bbox,
+        })),
+        safe_poly: plan.safe_poly,
+      });
+
+      res.json(plan);
+    } catch (err) {
+      console.error("/avoid_obstacle_vision error:", err);
+      res.status(500).json({ error: err.message || "vision failed" });
+    }
+  }
+);
+
 
 /* ===========================================================================  
    STATIC  
