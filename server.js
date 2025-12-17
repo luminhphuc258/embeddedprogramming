@@ -87,6 +87,7 @@ app.post(
         return res.status(400).json({ error: "No image" });
       }
 
+      // -------- meta ----------
       let meta = {};
       try {
         meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
@@ -94,8 +95,20 @@ app.post(
         meta = {};
       }
 
-      const ultraCm = meta.ultra_cm ?? null;
-      const localBest = meta.local_best_sector ?? null;
+      // Support both old + new meta keys
+      const distCm = meta.lidar_cm ?? meta.ultra_cm ?? null;                 // lidar distance
+      const strength = meta.lidar_strength ?? meta.uart_strength ?? null;
+
+      const localBest =
+        meta.best_sector_local ??
+        meta.local_best_sector ??
+        meta.local_best ??
+        null;
+
+      const corridorCenterX = meta.corridor_center_x ?? null;
+      const corridorWidthRatio = meta.corridor_width_ratio ?? null;
+      const corridorConf = meta.corridor_conf ?? null;
+
       const roiW = Number(meta.roi_w || 640);
       const roiH = Number(meta.roi_h || 240);
 
@@ -103,18 +116,17 @@ app.post(
       const b64 = req.file.buffer.toString("base64");
       const dataUrl = `data:image/jpeg;base64,${b64}`;
 
+      // -------- prompt ----------
       const system = `
-Bạn là module "AvoidObstacle" cho robot.
-Từ ảnh ROI (phần dưới camera, gần robot) hãy:
-- xác định vật cản đáng chú ý trong ROI
-- đề xuất vùng đi an toàn (safe polygon) trong ROI
-- đề xuất best_sector (0..8) theo chiều ngang ROI (9 sector)
-Trả về JSON hợp lệ, KHÔNG giải thích.
+Bạn là module "AvoidObstacle" cho robot đi trong nhà.
+Mục tiêu: chọn hướng đi theo "lối đi dành cho người" (walkway/corridor) trong ROI.
 
-Tọa độ bbox: [x1,y1,x2,y2] theo ROI, gốc (0,0) ở góc trên trái ROI.
-Tọa độ safe_poly: list các điểm [x,y] theo ROI.
-confidence: 0..1
-risk: 0..1 (vật càng gần/chiếm ROI dưới càng risk cao)
+Từ ảnh ROI (vùng gần robot):
+- Xác định vật cản quan trọng (bàn/ghế/quạt/tường/đồ vật).
+- Xác định lối đi (walkway) rộng và an toàn nhất để robot đi theo.
+- Nếu thấy khe giữa bàn và tường có thể đi được, hãy chọn lối đó.
+- Ưu tiên đánh giá near-field (nửa dưới ROI).
+- Trả về JSON hợp lệ, KHÔNG giải thích.
 `.trim();
 
       const user = [
@@ -122,23 +134,30 @@ risk: 0..1 (vật càng gần/chiếm ROI dưới càng risk cao)
           type: "text",
           text: `
 Meta:
-- ultrasonic_cm: ${ultraCm}
+- dist_cm: ${distCm}
+- strength: ${strength}
 - local_best_sector: ${localBest}
+- local_corridor_center_x: ${corridorCenterX}
+- local_corridor_width_ratio: ${corridorWidthRatio}
+- local_corridor_conf: ${corridorConf}
 ROI size: ${roiW}x${roiH}
 
 Return JSON schema exactly:
 {
- "best_sector": number,
- "safe_poly": [[x,y],[x,y],[x,y],[x,y]],
- "obstacles": [{"label": string, "bbox":[x1,y1,x2,y2], "risk": number}],
- "n_obstacles": number,
- "confidence": number
+  "best_sector": number,                 // 0..8
+  "walkway_center_x": number,            // 0..roiW-1
+  "walkway_poly": [[x,y],[x,y],[x,y],[x,y]],  // polygon vùng đi được
+  "obstacles": [{"label": string, "bbox":[x1,y1,x2,y2], "risk": number}],
+  "n_obstacles": number,
+  "confidence": number
 }
 
 Rules:
-- Ưu tiên đánh giá vật cản ở nửa dưới ROI (near-field).
-- Nếu chỉ thấy rèm/tường ở xa (ở cao, không “ăn” xuống dưới), risk thấp.
-- Không bịa. Không chắc thì label="unknown" và confidence thấp.
+- best_sector map 9 sectors theo chiều ngang ROI.
+- walkway_center_x nằm ở trung tâm của walkway_poly.
+- Nếu không chắc: confidence thấp, và chọn walkway theo local_corridor_*.
+- risk 0..1: vật càng gần đáy ROI / chiếm near-field càng risk cao.
+- Không bịa. Nếu không chắc label="unknown".
 `.trim(),
         },
         { type: "image_url", image_url: { url: dataUrl } },
@@ -153,67 +172,153 @@ Rules:
           { role: "user", content: user },
         ],
         temperature: 0.2,
-        max_tokens: 350,
+        max_tokens: 420,
       });
 
       const raw = completion.choices?.[0]?.message?.content?.trim() || "";
 
-      // Parse JSON best-effort
+      // -------- parse JSON best-effort ----------
       let plan = null;
       try {
         plan = JSON.parse(raw);
       } catch {
         const m = raw.match(/\{[\s\S]*\}$/);
         if (m) {
-          try { plan = JSON.parse(m[0]); } catch { }
+          try {
+            plan = JSON.parse(m[0]);
+          } catch { }
         }
       }
 
-      // fallback nếu GPT trả sai format
+      // -------- smart fallback ----------
+      const fallbackCenter =
+        typeof corridorCenterX === "number"
+          ? corridorCenterX
+          : Math.floor(roiW / 2);
+
+      const fallbackBest =
+        typeof localBest === "number"
+          ? localBest
+          : 4;
+
+      const fallbackPoly = (() => {
+        // corridor-based rectangle in lower ROI
+        const halfW = Math.floor(roiW * 0.18);
+        const x1 = Math.max(0, fallbackCenter - halfW);
+        const x2 = Math.min(roiW - 1, fallbackCenter + halfW);
+        const yTop = Math.floor(0.60 * roiH);
+        return [
+          [x1, roiH - 1],
+          [x2, roiH - 1],
+          [x2, yTop],
+          [x1, yTop],
+        ];
+      })();
+
       if (!plan || typeof plan !== "object") {
         return res.status(200).json({
-          best_sector: (typeof localBest === "number" ? localBest : 4),
-          safe_poly: [
-            [0, roiH],
-            [roiW, roiH],
-            [roiW, Math.floor(0.55 * roiH)],
-            [0, Math.floor(0.55 * roiH)],
-          ],
+          best_sector: fallbackBest,
+          walkway_center_x: fallbackCenter,
+          walkway_poly: fallbackPoly,
           obstacles: [],
           n_obstacles: 0,
           confidence: 0.15,
         });
       }
 
-      // normalize fields
-      if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
-      if (!Array.isArray(plan.safe_poly)) plan.safe_poly = [];
-      if (typeof plan.best_sector !== "number") plan.best_sector = (typeof localBest === "number" ? localBest : 4);
-      plan.n_obstacles = plan.obstacles.length;
-      if (typeof plan.confidence !== "number") plan.confidence = 0.4;
+      // -------- normalize fields ----------
+      if (typeof plan.best_sector !== "number") plan.best_sector = fallbackBest;
 
-      /* ====== LOG VẬT CẢN (SERVER) ====== */
-      console.log("VISION PLAN:", {
-        ultrasonic_cm: ultraCm,
-        best_sector: plan.best_sector,
-        confidence: plan.confidence,
-        n_obstacles: plan.n_obstacles,
-        obstacles: plan.obstacles.map((o, i) => ({
-          i,
-          label: o.label,
-          risk: o.risk,
-          bbox: o.bbox,
-        })),
-        safe_poly: plan.safe_poly,
+      if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
+      if (!Array.isArray(plan.walkway_poly)) {
+        // backward compat: accept safe_poly too
+        if (Array.isArray(plan.safe_poly)) plan.walkway_poly = plan.safe_poly;
+        else plan.walkway_poly = fallbackPoly;
+      }
+
+      if (typeof plan.walkway_center_x !== "number") {
+        // derive from polygon if possible
+        try {
+          const xs = plan.walkway_poly.map((p) => (Array.isArray(p) ? Number(p[0]) : NaN)).filter(Number.isFinite);
+          if (xs.length > 0) {
+            const minx = Math.max(0, Math.min(...xs));
+            const maxx = Math.min(roiW - 1, Math.max(...xs));
+            plan.walkway_center_x = Math.floor((minx + maxx) / 2);
+          } else {
+            plan.walkway_center_x = fallbackCenter;
+          }
+        } catch {
+          plan.walkway_center_x = fallbackCenter;
+        }
+      }
+
+      // clamp walkway_center_x
+      plan.walkway_center_x = Math.max(0, Math.min(roiW - 1, Number(plan.walkway_center_x)));
+
+      // clamp poly points
+      plan.walkway_poly = plan.walkway_poly
+        .filter((p) => Array.isArray(p) && p.length === 2)
+        .map((p) => {
+          const x = Math.max(0, Math.min(roiW - 1, Number(p[0])));
+          const y = Math.max(0, Math.min(roiH - 1, Number(p[1])));
+          return [x, y];
+        });
+
+      // clamp obstacles bbox
+      plan.obstacles = plan.obstacles.slice(0, 12).map((o) => {
+        const label = typeof o?.label === "string" ? o.label : "unknown";
+        const risk = typeof o?.risk === "number" ? Math.max(0, Math.min(1, o.risk)) : 0.5;
+        let bbox = o?.bbox;
+        if (!Array.isArray(bbox) || bbox.length !== 4) {
+          bbox = [0, 0, 0, 0];
+        }
+        let [x1, y1, x2, y2] = bbox.map((v) => Number(v));
+        if (![x1, y1, x2, y2].every(Number.isFinite)) {
+          x1 = y1 = x2 = y2 = 0;
+        }
+        x1 = Math.max(0, Math.min(roiW - 1, x1));
+        x2 = Math.max(0, Math.min(roiW - 1, x2));
+        y1 = Math.max(0, Math.min(roiH - 1, y1));
+        y2 = Math.max(0, Math.min(roiH - 1, y2));
+        if (x2 < x1) [x1, x2] = [x2, x1];
+        if (y2 < y1) [y1, y2] = [y2, y1];
+        return { label, bbox: [x1, y1, x2, y2], risk };
       });
 
-      res.json(plan);
+      plan.n_obstacles = plan.obstacles.length;
+
+      if (typeof plan.confidence !== "number") plan.confidence = 0.4;
+      plan.confidence = Math.max(0, Math.min(1, plan.confidence));
+
+      // optional: if confidence too low, softly fallback walkway
+      if (plan.confidence < 0.25) {
+        plan.walkway_center_x = fallbackCenter;
+        plan.walkway_poly = fallbackPoly;
+        plan.best_sector = fallbackBest;
+      }
+
+      /* ====== SERVER LOG ====== */
+      console.log("VISION PLAN:", {
+        dist_cm: distCm,
+        strength,
+        localBest,
+        corridor: { center_x: corridorCenterX, width_ratio: corridorWidthRatio, conf: corridorConf },
+        best_sector: plan.best_sector,
+        walkway_center_x: plan.walkway_center_x,
+        confidence: plan.confidence,
+        n_obstacles: plan.n_obstacles,
+        obstacles: plan.obstacles.map((o, i) => ({ i, label: o.label, risk: o.risk, bbox: o.bbox })),
+        walkway_poly: plan.walkway_poly,
+      });
+
+      return res.json(plan);
     } catch (err) {
       console.error("/avoid_obstacle_vision error:", err);
       res.status(500).json({ error: err.message || "vision failed" });
     }
   }
 );
+
 
 
 /* ===========================================================================  
