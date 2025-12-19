@@ -490,6 +490,8 @@ function overrideLabelByText(label, text) {
 /* ===========================================================================  
    UPLOAD_AUDIO — STT → (Music / Chatbot) → TTS  
 ===========================================================================*/
+//===============================
+const upload = multer({ storage: multer.memoryStorage() });
 
 // update  active listening v2
 app.post(
@@ -692,8 +694,6 @@ Nếu không chắc, nói rõ là không chắc.
 
 
 
-//===============================
-const upload = multer({ storage: multer.memoryStorage() });
 
 app.post(
   "/upload_audio",
