@@ -467,6 +467,18 @@ async function getMp3FromPreview(previewUrl) {
 /* ===========================================================================  
    OVERRIDE LABEL  
 ===========================================================================*/
+
+// ====== helper: detect clap by transcript ======
+function isClapText(text = "") {
+  const t = stripDiacritics(text.toLowerCase());
+  const keys = [
+    "clap", "applause", "hand clap", "clapping",
+    "vo tay", "vỗ tay", "tieng vo tay", "tiếng vỗ tay"
+  ];
+  return keys.some(k => t.includes(stripDiacritics(k)));
+}
+
+
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
@@ -493,6 +505,7 @@ function overrideLabelByText(label, text) {
 //===============================
 const upload = multer({ storage: multer.memoryStorage() });
 
+// update  active listening v2
 // update  active listening v2
 app.post(
   "/pi_upload_audio_v2",
@@ -531,9 +544,10 @@ app.post(
           model: "gpt-4o-mini-transcribe",
         });
         text = (tr.text || "").trim();
-        console.log(" PI_V2 STT:", text);
+        console.log("🎤 PI_V2 STT:", text);
       } catch (e) {
         console.error("PI_V2 STT error:", e);
+        try { fs.unlinkSync(wavPath); } catch { }
         return res.json({
           status: "error",
           transcript: "",
@@ -543,14 +557,25 @@ app.post(
         });
       }
 
+      // ====== QUICK CLAP SHORT-CIRCUIT ======
+      // If STT says clap/applause => tell Pi to bark (no TTS)
+      if (isClapText(text)) {
+        console.log("👏 Detected CLAP by STT -> return label=clap");
+        try { fs.unlinkSync(wavPath); } catch { }
+        return res.json({
+          status: "ok",
+          transcript: text,
+          label: "clap",
+          reply_text: "",     // Pi won't speak
+          audio_url: null,    // Pi will bark locally
+          used_vision: false,
+        });
+      }
+
       // label logic (giữ như cũ)
       let label = overrideLabelByText("unknown", text);
 
-      // Decide vision
-      const wantVision = !!imageFile && needVisionByText(text);
-
-      // Build chat messages with memory
-      // memoryArr là list JSON đã lưu từ Pi, ta đưa vào system như “robot memory”
+      // ====== memory => system ======
       const memoryText = memoryArr
         .slice(-12)
         .map((m, i) => {
@@ -571,6 +596,7 @@ app.post(
         if (m?.previewUrl) {
           playbackUrl = await getMp3FromPreview(m.previewUrl);
           replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
+
           mqttClient.publish(
             "/robot/vaytay",
             JSON.stringify({ action: "vaytay", playing: true }),
@@ -581,18 +607,20 @@ app.post(
         }
       }
 
-      // non-music -> Chat (with optional vision)
+      // ====== vision: if image exists -> ALWAYS use vision model ======
+      const hasImage = !!imageFile?.buffer;
+
       if (label !== "nhac") {
         const system = `
-Bạn là trợ lý của robot Pidog của Matthew.
+Bạn là dog robot của Matthew.
 Trả lời ngắn gọn, dễ hiểu, thân thiện.
-Nếu người dùng hỏi về hình ảnh/khung cảnh thì mô tả rõ ràng, ưu tiên những thứ nổi bật.
+Nếu có hình ảnh đi kèm: bạn ĐÃ có ảnh rồi, KHÔNG được yêu cầu người dùng gửi ảnh nữa.
+Nếu người dùng hỏi "nhìn vào ảnh / nhìn xung quanh" thì mô tả ảnh rõ ràng.
+Nếu câu hỏi không liên quan ảnh thì vẫn trả lời bình thường.
 Nếu không chắc, nói rõ là không chắc.
 `.trim();
 
-        const messages = [
-          { role: "system", content: system },
-        ];
+        const messages = [{ role: "system", content: system }];
 
         if (memoryText) {
           messages.push({
@@ -601,43 +629,40 @@ Nếu không chắc, nói rõ là không chắc.
           });
         }
 
-        if (wantVision) {
-          // image -> data url
+        if (hasImage) {
           const b64 = imageFile.buffer.toString("base64");
           const dataUrl = `data:image/jpeg;base64,${b64}`;
 
           const userContent = [
-            { type: "text", text: `Người dùng nói: "${text}". Hãy trả lời theo yêu cầu.` },
+            { type: "text", text: `Người dùng nói: "${text}". Trả lời theo yêu cầu. Nếu có liên quan đến hình ảnh thì mô tả hình.` },
             { type: "image_url", image_url: { url: dataUrl } },
           ];
 
           const completion = await openai.chat.completions.create({
             model: process.env.VISION_MODEL || "gpt-4.1-mini",
-            messages: [
-              ...messages,
-              { role: "user", content: userContent },
-            ],
+            messages: [...messages, { role: "user", content: userContent }],
             temperature: 0.3,
             max_tokens: 420,
           });
 
-          replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa thấy rõ, anh cho em xem lại được không?";
+          replyText =
+            completion.choices?.[0]?.message?.content?.trim() ||
+            "Em chưa thấy rõ, anh cho em xem lại được không?";
         } else {
           const completion = await openai.chat.completions.create({
             model: "gpt-4.1-mini",
-            messages: [
-              ...messages,
-              { role: "user", content: text },
-            ],
+            messages: [...messages, { role: "user", content: text }],
             temperature: 0.4,
             max_tokens: 260,
           });
 
-          replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+          replyText =
+            completion.choices?.[0]?.message?.content?.trim() ||
+            "Em chưa hiểu câu này.";
         }
       }
 
-      // TTS if not playbackUrl already
+      // TTS if not music playbackUrl
       if (!playbackUrl) {
         const filename = `pi_v2_tts_${Date.now()}.mp3`;
         const outPath = path.join(audioDir, filename);
@@ -682,7 +707,7 @@ Nếu không chắc, nói rõ là không chắc.
         label,
         reply_text: replyText,
         audio_url: playbackUrl,
-        used_vision: wantVision,
+        used_vision: hasImage,
       });
 
     } catch (err) {
@@ -691,8 +716,6 @@ Nếu không chắc, nói rõ là không chắc.
     }
   }
 );
-
-
 
 
 app.post(
