@@ -380,6 +380,23 @@ mqttClient.on("message", (topic, message) => {
 /* ===========================================================================  
    HELPERS — remove dấu, iTunes, mp3  
 ===========================================================================*/
+function needVisionByText(text = "") {
+  const t = stripDiacritics(text.toLowerCase());
+
+  const keys = [
+    "nhin", "nhìn",
+    "buc anh", "bức ảnh",
+    "hinh", "hình",
+    "mo ta", "mô tả",
+    "xung quanh", "xung quanh ban",
+    "ban thay gi", "bạn thấy gì",
+    "what do you see", "look at", "describe this", "around you"
+  ];
+
+  return keys.some(k => t.includes(stripDiacritics(k)));
+}
+
+
 function stripDiacritics(s = "") {
   return s
     .normalize("NFD")
@@ -474,6 +491,208 @@ function overrideLabelByText(label, text) {
    UPLOAD_AUDIO — STT → (Music / Chatbot) → TTS  
 ===========================================================================*/
 
+// update  active listening v2
+app.post(
+  "/pi_upload_audio_v2",
+  uploadLimiter,
+  upload.fields([
+    { name: "audio", maxCount: 1 },
+    { name: "image", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const audioFile = req.files?.audio?.[0];
+      const imageFile = req.files?.image?.[0] || null;
+
+      if (!audioFile?.buffer) {
+        return res.status(400).json({ error: "No audio uploaded" });
+      }
+
+      // meta (memory + info)
+      let meta = {};
+      try {
+        meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
+      } catch {
+        meta = {};
+      }
+      const memoryArr = Array.isArray(meta.memory) ? meta.memory : [];
+
+      // save WAV
+      const wavPath = path.join(audioDir, `pi_v2_${Date.now()}.wav`);
+      fs.writeFileSync(wavPath, audioFile.buffer);
+
+      // STT
+      let text = "";
+      try {
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavPath),
+          model: "gpt-4o-mini-transcribe",
+        });
+        text = (tr.text || "").trim();
+        console.log(" PI_V2 STT:", text);
+      } catch (e) {
+        console.error("PI_V2 STT error:", e);
+        return res.json({
+          status: "error",
+          transcript: "",
+          label: "unknown",
+          reply_text: "",
+          audio_url: null,
+        });
+      }
+
+      // label logic (giữ như cũ)
+      let label = overrideLabelByText("unknown", text);
+
+      // Decide vision
+      const wantVision = !!imageFile && needVisionByText(text);
+
+      // Build chat messages with memory
+      // memoryArr là list JSON đã lưu từ Pi, ta đưa vào system như “robot memory”
+      const memoryText = memoryArr
+        .slice(-12)
+        .map((m, i) => {
+          const u = (m.transcript || "").trim();
+          const a = (m.reply_text || "").trim();
+          return `#${i + 1} USER: ${u}\n#${i + 1} BOT: ${a}`;
+        })
+        .join("\n\n");
+
+      let replyText = "";
+      let playbackUrl = null;
+
+      // music flow (giữ như cũ)
+      if (label === "nhac") {
+        const query = extractSongQuery(text) || text;
+        const m = await searchITunes(query);
+
+        if (m?.previewUrl) {
+          playbackUrl = await getMp3FromPreview(m.previewUrl);
+          replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
+          mqttClient.publish(
+            "/robot/vaytay",
+            JSON.stringify({ action: "vaytay", playing: true }),
+            { qos: 1 }
+          );
+        } else {
+          replyText = "Em không tìm thấy bài hát phù hợp.";
+        }
+      }
+
+      // non-music -> Chat (with optional vision)
+      if (label !== "nhac") {
+        const system = `
+Bạn là trợ lý của robot Pidog của Matthew.
+Trả lời ngắn gọn, dễ hiểu, thân thiện.
+Nếu người dùng hỏi về hình ảnh/khung cảnh thì mô tả rõ ràng, ưu tiên những thứ nổi bật.
+Nếu không chắc, nói rõ là không chắc.
+`.trim();
+
+        const messages = [
+          { role: "system", content: system },
+        ];
+
+        if (memoryText) {
+          messages.push({
+            role: "system",
+            content: `Robot long-term memory (recent):\n${memoryText}`.slice(0, 6000),
+          });
+        }
+
+        if (wantVision) {
+          // image -> data url
+          const b64 = imageFile.buffer.toString("base64");
+          const dataUrl = `data:image/jpeg;base64,${b64}`;
+
+          const userContent = [
+            { type: "text", text: `Người dùng nói: "${text}". Hãy trả lời theo yêu cầu.` },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ];
+
+          const completion = await openai.chat.completions.create({
+            model: process.env.VISION_MODEL || "gpt-4.1-mini",
+            messages: [
+              ...messages,
+              { role: "user", content: userContent },
+            ],
+            temperature: 0.3,
+            max_tokens: 420,
+          });
+
+          replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa thấy rõ, anh cho em xem lại được không?";
+        } else {
+          const completion = await openai.chat.completions.create({
+            model: "gpt-4.1-mini",
+            messages: [
+              ...messages,
+              { role: "user", content: text },
+            ],
+            temperature: 0.4,
+            max_tokens: 260,
+          });
+
+          replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+        }
+      }
+
+      // TTS if not playbackUrl already
+      if (!playbackUrl) {
+        const filename = `pi_v2_tts_${Date.now()}.mp3`;
+        const outPath = path.join(audioDir, filename);
+
+        const speech = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: "ballad",
+          format: "mp3",
+          input: replyText,
+        });
+
+        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
+        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+      }
+
+      // publish MQTT (giữ như cũ)
+      if (["tien", "lui", "trai", "phai"].includes(label)) {
+        mqttClient.publish(
+          "robot/label",
+          JSON.stringify({ label }),
+          { qos: 1, retain: true }
+        );
+      } else {
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({
+            audio_url: playbackUrl,
+            text: replyText,
+            label,
+          }),
+          { qos: 1 }
+        );
+      }
+
+      // cleanup wav
+      try { fs.unlinkSync(wavPath); } catch { }
+
+      // response for Pi
+      return res.json({
+        status: "ok",
+        transcript: text,
+        label,
+        reply_text: replyText,
+        audio_url: playbackUrl,
+        used_vision: wantVision,
+      });
+
+    } catch (err) {
+      console.error("pi_upload_audio_v2 error:", err);
+      res.status(500).json({ error: err.message || "server error" });
+    }
+  }
+);
+
+
+
+//===============================
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post(
