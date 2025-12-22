@@ -4,10 +4,11 @@
    - Auto điều hướng với LIDAR + ULTRASONIC
    - Label override + camera + scan 360
    - UPDATE: all replyText -> Eleven voice server -> MP3 (except iTunes music playback)
-   - FIXES:
-     (1) Better iTunes search for "nhạc xưa" + confidence gating (avoid wrong modern songs)
-     (2) Vision only when user asks (no auto describe image)
-     (3) Better general-knowledge answers (avoid "không biết" too often)
+   - FIXES kept:
+     (1) Vision only when user asks (no auto describe image)
+     (2) Better general-knowledge answers (avoid "không biết" too often)
+   - CHANGE requested:
+     ✅ Revert iTunes search to OLD stable version (limit=1, pick first)
 ===========================================================================*/
 
 import express from "express";
@@ -59,6 +60,7 @@ app.use(
 );
 
 app.options("/upload_audio", cors());
+app.options("/pi_upload_audio_v2", cors());
 
 /* ===========================================================================  
    RATE LIMIT (upload_audio)
@@ -158,7 +160,7 @@ function getPublicHost() {
 }
 
 /* ===========================================================================  
-   VOICE (Eleven proxy server -> WAV -> MP3)
+   VOICE (Eleven proxy server -> WAV -> MP3)  ✅ keep as you asked
 ===========================================================================*/
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
@@ -225,19 +227,21 @@ async function voiceServerToMp3(replyText, prefix = "eleven") {
     fs.writeFileSync(wavTmp, buf);
 
     await new Promise((resolve, reject) =>
-      ffmpeg(wavTmp)
-        .toFormat("mp3")
-        .on("end", resolve)
-        .on("error", reject)
-        .save(mp3Out)
+      ffmpeg(wavTmp).toFormat("mp3").on("end", resolve).on("error", reject).save(mp3Out)
     );
 
-    try { fs.unlinkSync(wavTmp); } catch { }
+    try {
+      fs.unlinkSync(wavTmp);
+    } catch { }
     return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
   } catch (e) {
     clearTimeout(timer);
-    try { if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp); } catch { }
-    try { if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out); } catch { }
+    try {
+      if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp);
+    } catch { }
+    try {
+      if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out);
+    } catch { }
     throw e;
   }
 }
@@ -254,93 +258,26 @@ async function textToSpeechMp3(replyText, prefix = "reply") {
   }
 }
 
-async function getMp3FromPreview(previewUrl) {
-  const ts = Date.now();
-  const src = path.join(audioDir, `song_${ts}.m4a`);
-  const dst = path.join(audioDir, `song_${ts}.mp3`);
-
-  const resp = await fetch(previewUrl);
-  const buffer = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(src, buffer);
-
-  await new Promise((resolve, reject) =>
-    ffmpeg(src)
-      .toFormat("mp3")
-      .on("end", resolve)
-      .on("error", reject)
-      .save(dst)
-  );
-
-  try { fs.unlinkSync(src); } catch { }
-  return `${getPublicHost()}/audio/song_${ts}.mp3`;
-}
-
 /* ===========================================================================  
-   VISION GATING (FIX: don't auto describe image)
-===========================================================================*/
-function wantsVision(text = "") {
-  const t = stripDiacritics((text || "").toLowerCase());
-
-  const triggers = [
-    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi", "co gi",
-    "mo ta", "ta hinh", "trong anh", "anh nay", "tam anh", "camera",
-    "day la gi", "cai gi", "vat gi", "giai thich hinh"
-  ];
-
-  return triggers.some(k => t.includes(stripDiacritics(k)));
-}
-
-/* ===========================================================================  
-   MUSIC QUERY CLEANING + preferOld detection (FIX iTunes)
+   MUSIC QUERY CLEANING (keep)
 ===========================================================================*/
 function cleanMusicQuery(q = "") {
   let t = (q || "").toLowerCase().trim();
-
-  // remove brackets
   t = t.replace(/\(.*?\)|\[.*?\]/g, " ");
-
-  // remove punctuation that hurts iTunes matching
   t = t.replace(/[.,;:!?]/g, " ");
-
-  // remove junk words
   t = t.replace(/\b(official|mv|lyrics|karaoke|cover|8d|tiktok|sped\s*up|slowed|remix|ver\.?|version)\b/g, " ");
   t = t.replace(/\b(feat|ft)\.?\b/g, " ");
-
-  // collapse
   t = t.replace(/\s+/g, " ").trim();
   return t;
 }
 
-function detectPreferOld(text = "") {
-  const t = stripDiacritics((text || "").toLowerCase());
-  const keys = [
-    "nhac xua", "bolero", "tru tinh", "tien chien", "nhac vang", "nhac pre",
-    "truoc 75", "pre 75", "tinh khuc", "nhac que huong"
-  ];
-  return keys.some(k => t.includes(stripDiacritics(k)));
-}
-
-function stripOldHintsForSearch(text = "") {
-  // remove "nhạc xưa/bolero..." from search term (but keep preferOld separately)
-  let t = cleanMusicQuery(text);
-  const remove = [
-    "nhac xua", "bolero", "tru tinh", "tien chien", "nhac vang", "truoc 75", "pre 75", "pre75",
-    "tinh khuc", "que huong"
-  ];
-  let s = stripDiacritics(t);
-  for (const r of remove) {
-    s = s.replace(new RegExp(`\\b${stripDiacritics(r)}\\b`, "g"), " ");
-  }
-  s = s.replace(/\s+/g, " ").trim();
-  return cleanMusicQuery(s || t);
-}
-
 function extractSongQuery(text) {
-  let t = stripOldHintsForSearch(text);
+  let t = cleanMusicQuery(text);
   const tNoDau = stripDiacritics(t);
 
   const removePhrases = [
     "xin chao",
+    "nghe",
     "toi muon nghe",
     "cho toi nghe",
     "nghe nhac",
@@ -353,7 +290,6 @@ function extractSongQuery(text) {
     "song",
     "music",
     "play",
-    "please",
   ];
 
   let s = tNoDau;
@@ -363,241 +299,90 @@ function extractSongQuery(text) {
   }
   s = s.replace(/\s+/g, " ").trim();
 
-  if (!s || s.length < 2) return stripOldHintsForSearch(text);
+  if (!s || s.length < 2) return cleanMusicQuery(text);
   return cleanMusicQuery(s);
 }
 
-// parse "artist - title", "title by artist"
-function parseArtistTitle(raw = "") {
-  const t = cleanMusicQuery(raw);
+/* ===========================================================================  
+   iTunes search (REVERT OLD stable)
+   - limit=1, pick first
+   - country default US (or set env ITUNES_COUNTRY)
+===========================================================================*/
+const ITUNES_COUNTRY = (process.env.ITUNES_COUNTRY || "US").toUpperCase();
+const ITUNES_LANG = process.env.ITUNES_LANG || ""; // optional
 
-  const by = t.match(/(.+?)\s+by\s+(.+)/i);
-  if (by) return { title: by[1].trim(), artist: by[2].trim() };
+async function searchITunesOld(query) {
+  const q = (query || "").trim();
+  if (!q) return null;
 
-  const dash = t.split(/\s-\s|—|–|\|/).map(s => s.trim()).filter(Boolean);
-  if (dash.length === 2) {
-    const [a, b] = dash;
-    return (a.split(" ").length <= b.split(" ").length)
-      ? { artist: a, title: b }
-      : { artist: b, title: a };
-  }
+  const url = new URL("https://itunes.apple.com/search");
+  url.searchParams.set("media", "music");
+  url.searchParams.set("entity", "song");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("term", q);
+  url.searchParams.set("country", ITUNES_COUNTRY);
+  if (ITUNES_LANG) url.searchParams.set("lang", ITUNES_LANG);
 
-  return { title: t };
-}
-
-function yearFromDate(s) {
   try {
-    const y = new Date(s).getFullYear();
-    return Number.isFinite(y) ? y : null;
-  } catch {
+    const resp = await fetch(url.toString(), { timeout: 7000 });
+    if (!resp.ok) return null;
+
+    const data = await resp.json();
+    const item = data?.results?.[0] || null;
+    if (item?.previewUrl) return item;
+    return null;
+  } catch (e) {
+    console.error("iTunes search error:", e?.message || e);
     return null;
   }
-}
-
-function scoreItunesSong(item, { title, artist, preferOld }) {
-  const track = (item.trackName || "").toLowerCase();
-  const art = (item.artistName || "").toLowerCase();
-  const album = (item.collectionName || "").toLowerCase();
-
-  const trackND = stripDiacritics(track);
-  const artND = stripDiacritics(art);
-
-  let s = 0;
-
-  // title match (diacritics-insensitive)
-  if (title) {
-    const tt = stripDiacritics(title.toLowerCase());
-    if (trackND === tt) s += 160;
-    else if (trackND.startsWith(tt)) s += 95;
-    else if (trackND.includes(tt)) s += 50;
-  }
-
-  // artist match
-  if (artist) {
-    const aa = stripDiacritics(artist.toLowerCase());
-    if (artND === aa) s += 120;
-    else if (artND.includes(aa)) s += 65;
-  }
-
-  // penalties
-  const bad = ["karaoke", "instrumental", "tribute", "cover", "8d", "remix", "sped up", "slowed"];
-  for (const w of bad) {
-    const ww = stripDiacritics(w);
-    if (trackND.includes(ww) || artND.includes(ww) || stripDiacritics(album).includes(ww)) s -= 90;
-  }
-
-  // release year heuristic (prefer old)
-  const y = yearFromDate(item.releaseDate);
-  if (preferOld && y) {
-    if (y <= 1985) s += 55;
-    else if (y <= 1995) s += 45;
-    else if (y <= 2005) s += 30;
-    else if (y >= 2015) s -= 35; // modern -> punish
-  }
-
-  // too short => often wrong
-  if ((item.trackTimeMillis || 0) < 60_000) s -= 15;
-
-  // slight preference for "single"
-  if (album.includes("single")) s += 4;
-
-  return s;
 }
 
 /* ===========================================================================  
-   iTunes cache + smart search v2
+   MP3 from iTunes preview
 ===========================================================================*/
-const ITUNES_COUNTRY_PRIMARY = "VN";
-const ITUNES_COUNTRY_FALLBACK = process.env.ITUNES_COUNTRY_FALLBACK || "US";
-const ITUNES_LANG = "vi_vn";
+async function getMp3FromPreview(previewUrl) {
+  const ts = Date.now();
+  const src = path.join(audioDir, `song_${ts}.m4a`);
+  const dst = path.join(audioDir, `song_${ts}.mp3`);
 
-const itunesCache = new Map();
-const ITUNES_CACHE_MS = 5 * 60 * 1000;
+  const resp = await fetch(previewUrl);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  fs.writeFileSync(src, buffer);
 
-function cacheGet(key) {
-  const v = itunesCache.get(key);
-  if (!v) return null;
-  if (Date.now() - v.ts > ITUNES_CACHE_MS) {
-    itunesCache.delete(key);
-    return null;
-  }
-  return v.data;
-}
-function cacheSet(key, data) {
-  itunesCache.set(key, { ts: Date.now(), data });
-}
+  await new Promise((resolve, reject) =>
+    ffmpeg(src).toFormat("mp3").on("end", resolve).on("error", reject).save(dst)
+  );
 
-/**
- * iTunes search raw with optional country + attribute
- * attribute examples: mixTerm, songTerm, artistTerm
- */
-async function itunesSearchRaw(term, { limit = 25, country = ITUNES_COUNTRY_PRIMARY, attribute = "mixTerm" } = {}) {
-  const key = `${country}|${ITUNES_LANG}|${attribute}|${limit}|${term}`;
-  const cached = cacheGet(key);
-  if (cached) return cached;
-
-  const url = new URL("https://itunes.apple.com/search");
-  url.searchParams.set("term", term);
-  url.searchParams.set("media", "music");
-  url.searchParams.set("entity", "song");
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("country", country);
-  url.searchParams.set("lang", ITUNES_LANG);
-  if (attribute) url.searchParams.set("attribute", attribute);
-
-  // node-fetch timeout option is supported
-  const resp = await fetch(url.toString(), { timeout: 7000 });
-  if (!resp.ok) return { results: [] };
-
-  const data = await resp.json();
-  cacheSet(key, data);
-  return data;
+  try {
+    fs.unlinkSync(src);
+  } catch { }
+  return `${getPublicHost()}/audio/song_${ts}.mp3`;
 }
 
-function rankResults(results, parsed) {
-  const ranked = results
-    .filter(r => r.wrapperType === "track" && r.previewUrl)
-    .map(r => ({ r, s: scoreItunesSong(r, parsed) }))
-    .sort((a, b) => b.s - a.s);
-
-  return ranked;
-}
-
-/**
- * Search strategy:
- *  - remove "nhạc xưa" hints from term
- *  - try multiple term/attribute
- *  - country: VN first, if score weak then fallback US
- *  - confidence gating: only autoplay if topScore >= AUTO_PLAY_MIN_SCORE
- */
-const AUTO_PLAY_MIN_SCORE = Number(process.env.AUTO_PLAY_MIN_SCORE || 105);
-const ACCEPT_MIN_SCORE = Number(process.env.ACCEPT_MIN_SCORE || 60);
-
-async function searchITunesSmartV2(rawQuery) {
-  const preferOld = detectPreferOld(rawQuery);
-  const cleaned = cleanMusicQuery(rawQuery);
-  if (!cleaned || cleaned.length < 2) return null;
-
-  const searchBase = stripOldHintsForSearch(cleaned);
-  const parsedBase = parseArtistTitle(searchBase);
-
-  const parsed = { ...parsedBase, preferOld };
-
-  const attempts = [];
-
-  // Most reliable: "title + artist" when exists
-  if (parsed.title && parsed.artist) attempts.push({ term: `${parsed.title} ${parsed.artist}`, attribute: "mixTerm" });
-  if (parsed.title) {
-    attempts.push({ term: parsed.title, attribute: "songTerm" });
-    attempts.push({ term: parsed.title, attribute: "mixTerm" });
-  }
-  if (parsed.artist) attempts.push({ term: parsed.artist, attribute: "artistTerm" });
-
-  // no-diacritics attempt
-  const nodau = stripDiacritics(searchBase);
-  if (nodau && nodau !== searchBase) {
-    const p2 = parseArtistTitle(nodau);
-    attempts.push({ term: p2.title && p2.artist ? `${p2.title} ${p2.artist}` : nodau, attribute: "mixTerm" });
-    if (p2.title) attempts.push({ term: p2.title, attribute: "songTerm" });
-  }
-
-  // keep it small
-  const uniqueKey = (a) => `${a.attribute}|${a.term}`;
-  const uniq = new Map();
-  for (const a of attempts) {
-    const k = uniqueKey(a);
-    if (!uniq.has(k) && a.term && a.term.length >= 2) uniq.set(k, a);
-  }
-
-  const runForCountry = async (country) => {
-    let best = null;
-
-    for (const att of uniq.values()) {
-      const data = await itunesSearchRaw(att.term, { limit: 25, country, attribute: att.attribute });
-      const results = Array.isArray(data.results) ? data.results : [];
-
-      const ranked = rankResults(results, parsed);
-      if (!ranked.length) continue;
-
-      const top = ranked[0];
-      const topScore = top.s;
-
-      if (!best || topScore > best.topScore) {
-        best = {
-          country,
-          usedTerm: att.term,
-          attribute: att.attribute,
-          cleaned: searchBase,
-          parsed,
-          top: top.r,
-          topScore,
-          candidates: ranked.slice(0, 5).map(x => x.r),
-          rankedDebug: ranked.slice(0, 5).map(x => ({
-            score: x.s,
-            track: x.r.trackName,
-            artist: x.r.artistName,
-            year: yearFromDate(x.r.releaseDate),
-          })),
-        };
-      }
-
-      // early exit if very strong
-      if (topScore >= AUTO_PLAY_MIN_SCORE + 25) break;
-    }
-
-    return best;
-  };
-
-  // 1) primary country
-  const bestVN = await runForCountry(ITUNES_COUNTRY_PRIMARY);
-
-  // If VN weak, fallback to US
-  if (!bestVN || bestVN.topScore < ACCEPT_MIN_SCORE) {
-    const bestFB = await runForCountry(ITUNES_COUNTRY_FALLBACK);
-    if (bestFB && (!bestVN || bestFB.topScore > bestVN.topScore)) return bestFB;
-  }
-
-  return bestVN;
+/* ===========================================================================  
+   VISION GATING (keep)
+===========================================================================*/
+function wantsVision(text = "") {
+  const t = stripDiacritics((text || "").toLowerCase());
+  const triggers = [
+    "nhin",
+    "xem",
+    "xung quanh",
+    "truoc mat",
+    "o day co gi",
+    "co gi",
+    "mo ta",
+    "ta hinh",
+    "trong anh",
+    "anh nay",
+    "tam anh",
+    "camera",
+    "day la gi",
+    "cai gi",
+    "vat gi",
+    "giai thich hinh",
+  ];
+  return triggers.some((k) => t.includes(stripDiacritics(k)));
 }
 
 /* ===========================================================================  
@@ -622,12 +407,12 @@ function detectSongChoice(text = "") {
 }
 
 /* ===========================================================================  
-   OVERRIDE LABEL  
+   OVERRIDE LABEL
 ===========================================================================*/
 function isClapText(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const keys = ["clap", "applause", "hand clap", "clapping", "vo tay", "tieng vo tay"];
-  return keys.some(k => t.includes(stripDiacritics(k)));
+  return keys.some((k) => t.includes(stripDiacritics(k)));
 }
 
 function overrideLabelByText(label, text) {
@@ -651,7 +436,7 @@ function overrideLabelByText(label, text) {
 }
 
 /* ===========================================================================  
-   MEMORY: store last candidates per user (IP-based)
+   MEMORY: store last candidates per user (IP-based)  (keep)
 ===========================================================================*/
 const lastMusicCandidatesByUser = new Map();
 const CANDIDATES_TTL_MS = 3 * 60 * 1000;
@@ -670,44 +455,41 @@ function getLastCandidates(userKey) {
 }
 
 /* ===========================================================================  
-   VISION ENDPOINT (keep as-is)
+   VISION ENDPOINT (keep)
 ===========================================================================*/
-app.post(
-  "/avoid_obstacle_vision",
-  uploadVision.single("image"),
-  async (req, res) => {
+app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: "No image" });
+    }
+
+    let meta = {};
     try {
-      if (!req.file || !req.file.buffer) {
-        return res.status(400).json({ error: "No image" });
-      }
+      meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
+    } catch {
+      meta = {};
+    }
 
-      let meta = {};
-      try {
-        meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
-      } catch {
-        meta = {};
-      }
+    const distCm = meta.lidar_cm ?? meta.ultra_cm ?? null;
+    const strength = meta.lidar_strength ?? meta.uart_strength ?? null;
 
-      const distCm = meta.lidar_cm ?? meta.ultra_cm ?? null;
-      const strength = meta.lidar_strength ?? meta.uart_strength ?? null;
+    const localBest =
+      meta.best_sector_local ??
+      meta.local_best_sector ??
+      meta.local_best ??
+      null;
 
-      const localBest =
-        meta.best_sector_local ??
-        meta.local_best_sector ??
-        meta.local_best ??
-        null;
+    const corridorCenterX = meta.corridor_center_x ?? null;
+    const corridorWidthRatio = meta.corridor_width_ratio ?? null;
+    const corridorConf = meta.corridor_conf ?? null;
 
-      const corridorCenterX = meta.corridor_center_x ?? null;
-      const corridorWidthRatio = meta.corridor_width_ratio ?? null;
-      const corridorConf = meta.corridor_conf ?? null;
+    const roiW = Number(meta.roi_w || 640);
+    const roiH = Number(meta.roi_h || 240);
 
-      const roiW = Number(meta.roi_w || 640);
-      const roiH = Number(meta.roi_h || 240);
+    const b64 = req.file.buffer.toString("base64");
+    const dataUrl = `data:image/jpeg;base64,${b64}`;
 
-      const b64 = req.file.buffer.toString("base64");
-      const dataUrl = `data:image/jpeg;base64,${b64}`;
-
-      const system = `
+    const system = `
 Bạn là module "AvoidObstacle" cho robot đi trong nhà.
 Mục tiêu: chọn hướng đi theo "lối đi dành cho người" (walkway/corridor) trong ROI.
 
@@ -719,10 +501,10 @@ Từ ảnh ROI (vùng gần robot):
 - Trả về JSON hợp lệ, KHÔNG giải thích.
 `.trim();
 
-      const user = [
-        {
-          type: "text",
-          text: `
+    const user = [
+      {
+        type: "text",
+        text: `
 Meta:
 - dist_cm: ${distCm}
 - strength: ${strength}
@@ -742,128 +524,130 @@ Return JSON schema exactly:
   "confidence": number
 }
 `.trim(),
-        },
-        { type: "image_url", image_url: { url: dataUrl } },
-      ];
+      },
+      { type: "image_url", image_url: { url: dataUrl } },
+    ];
 
-      const model = process.env.VISION_MODEL || "gpt-4.1-mini";
+    const model = process.env.VISION_MODEL || "gpt-4.1-mini";
 
-      const completion = await openai.chat.completions.create({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0.2,
-        max_tokens: 420,
-      });
+    const completion = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      max_tokens: 420,
+    });
 
-      const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
 
-      let plan = null;
-      try {
-        plan = JSON.parse(raw);
-      } catch {
-        const m = raw.match(/\{[\s\S]*\}$/);
-        if (m) {
-          try { plan = JSON.parse(m[0]); } catch { }
-        }
-      }
-
-      const fallbackCenter =
-        typeof corridorCenterX === "number" ? corridorCenterX : Math.floor(roiW / 2);
-      const fallbackBest = typeof localBest === "number" ? localBest : 4;
-      const fallbackPoly = (() => {
-        const halfW = Math.floor(roiW * 0.18);
-        const x1 = Math.max(0, fallbackCenter - halfW);
-        const x2 = Math.min(roiW - 1, fallbackCenter + halfW);
-        const yTop = Math.floor(0.60 * roiH);
-        return [[x1, roiH - 1], [x2, roiH - 1], [x2, yTop], [x1, yTop]];
-      })();
-
-      if (!plan || typeof plan !== "object") {
-        return res.status(200).json({
-          best_sector: fallbackBest,
-          walkway_center_x: fallbackCenter,
-          walkway_poly: fallbackPoly,
-          obstacles: [],
-          n_obstacles: 0,
-          confidence: 0.15,
-        });
-      }
-
-      if (typeof plan.best_sector !== "number") plan.best_sector = fallbackBest;
-      if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
-      if (!Array.isArray(plan.walkway_poly)) plan.walkway_poly = fallbackPoly;
-
-      if (typeof plan.walkway_center_x !== "number") {
+    let plan = null;
+    try {
+      plan = JSON.parse(raw);
+    } catch {
+      const m = raw.match(/\{[\s\S]*\}$/);
+      if (m) {
         try {
-          const xs = plan.walkway_poly
-            .map((p) => (Array.isArray(p) ? Number(p[0]) : NaN))
-            .filter(Number.isFinite);
-          if (xs.length) {
-            const minx = Math.max(0, Math.min(...xs));
-            const maxx = Math.min(roiW - 1, Math.max(...xs));
-            plan.walkway_center_x = Math.floor((minx + maxx) / 2);
-          } else plan.walkway_center_x = fallbackCenter;
-        } catch {
-          plan.walkway_center_x = fallbackCenter;
-        }
+          plan = JSON.parse(m[0]);
+        } catch { }
       }
-
-      plan.walkway_center_x = Math.max(0, Math.min(roiW - 1, Number(plan.walkway_center_x)));
-      plan.walkway_poly = plan.walkway_poly
-        .filter((p) => Array.isArray(p) && p.length === 2)
-        .map((p) => {
-          const x = Math.max(0, Math.min(roiW - 1, Number(p[0])));
-          const y = Math.max(0, Math.min(roiH - 1, Number(p[1])));
-          return [x, y];
-        });
-
-      plan.obstacles = plan.obstacles.slice(0, 12).map((o) => {
-        const label = typeof o?.label === "string" ? o.label : "unknown";
-        const risk = typeof o?.risk === "number" ? Math.max(0, Math.min(1, o.risk)) : 0.5;
-        let bbox = o?.bbox;
-        if (!Array.isArray(bbox) || bbox.length !== 4) bbox = [0, 0, 0, 0];
-        let [x1, y1, x2, y2] = bbox.map((v) => Number(v));
-        if (![x1, y1, x2, y2].every(Number.isFinite)) x1 = y1 = x2 = y2 = 0;
-        x1 = Math.max(0, Math.min(roiW - 1, x1));
-        x2 = Math.max(0, Math.min(roiW - 1, x2));
-        y1 = Math.max(0, Math.min(roiH - 1, y1));
-        y2 = Math.max(0, Math.min(roiH - 1, y2));
-        if (x2 < x1) [x1, x2] = [x2, x1];
-        if (y2 < y1) [y1, y2] = [y2, y1];
-        return { label, bbox: [x1, y1, x2, y2], risk };
-      });
-
-      plan.n_obstacles = plan.obstacles.length;
-      if (typeof plan.confidence !== "number") plan.confidence = 0.4;
-      plan.confidence = Math.max(0, Math.min(1, plan.confidence));
-
-      if (plan.confidence < 0.25) {
-        plan.walkway_center_x = fallbackCenter;
-        plan.walkway_poly = fallbackPoly;
-        plan.best_sector = fallbackBest;
-      }
-
-      console.log("VISION PLAN:", {
-        dist_cm: distCm,
-        strength,
-        localBest,
-        corridor: { center_x: corridorCenterX, width_ratio: corridorWidthRatio, conf: corridorConf },
-        best_sector: plan.best_sector,
-        walkway_center_x: plan.walkway_center_x,
-        confidence: plan.confidence,
-        n_obstacles: plan.n_obstacles,
-      });
-
-      return res.json(plan);
-    } catch (err) {
-      console.error("/avoid_obstacle_vision error:", err);
-      res.status(500).json({ error: err.message || "vision failed" });
     }
+
+    const fallbackCenter = typeof corridorCenterX === "number" ? corridorCenterX : Math.floor(roiW / 2);
+    const fallbackBest = typeof localBest === "number" ? localBest : 4;
+    const fallbackPoly = (() => {
+      const halfW = Math.floor(roiW * 0.18);
+      const x1 = Math.max(0, fallbackCenter - halfW);
+      const x2 = Math.min(roiW - 1, fallbackCenter + halfW);
+      const yTop = Math.floor(0.6 * roiH);
+      return [[x1, roiH - 1], [x2, roiH - 1], [x2, yTop], [x1, yTop]];
+    })();
+
+    if (!plan || typeof plan !== "object") {
+      return res.status(200).json({
+        best_sector: fallbackBest,
+        walkway_center_x: fallbackCenter,
+        walkway_poly: fallbackPoly,
+        obstacles: [],
+        n_obstacles: 0,
+        confidence: 0.15,
+      });
+    }
+
+    if (typeof plan.best_sector !== "number") plan.best_sector = fallbackBest;
+    if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
+    if (!Array.isArray(plan.walkway_poly)) plan.walkway_poly = fallbackPoly;
+
+    if (typeof plan.walkway_center_x !== "number") {
+      try {
+        const xs = plan.walkway_poly
+          .map((p) => (Array.isArray(p) ? Number(p[0]) : NaN))
+          .filter(Number.isFinite);
+        if (xs.length) {
+          const minx = Math.max(0, Math.min(...xs));
+          const maxx = Math.min(roiW - 1, Math.max(...xs));
+          plan.walkway_center_x = Math.floor((minx + maxx) / 2);
+        } else plan.walkway_center_x = fallbackCenter;
+      } catch {
+        plan.walkway_center_x = fallbackCenter;
+      }
+    }
+
+    plan.walkway_center_x = Math.max(0, Math.min(roiW - 1, Number(plan.walkway_center_x)));
+    plan.walkway_poly = plan.walkway_poly
+      .filter((p) => Array.isArray(p) && p.length === 2)
+      .map((p) => {
+        const x = Math.max(0, Math.min(roiW - 1, Number(p[0])));
+        const y = Math.max(0, Math.min(roiH - 1, Number(p[1])));
+        return [x, y];
+      });
+
+    plan.obstacles = plan.obstacles.slice(0, 12).map((o) => {
+      const label = typeof o?.label === "string" ? o.label : "unknown";
+      const risk = typeof o?.risk === "number" ? Math.max(0, Math.min(1, o.risk)) : 0.5;
+
+      let bbox = o?.bbox;
+      if (!Array.isArray(bbox) || bbox.length !== 4) bbox = [0, 0, 0, 0];
+      let [x1, y1, x2, y2] = bbox.map((v) => Number(v));
+      if (![x1, y1, x2, y2].every(Number.isFinite)) x1 = y1 = x2 = y2 = 0;
+
+      x1 = Math.max(0, Math.min(roiW - 1, x1));
+      x2 = Math.max(0, Math.min(roiW - 1, x2));
+      y1 = Math.max(0, Math.min(roiH - 1, y1));
+      y2 = Math.max(0, Math.min(roiH - 1, y2));
+      if (x2 < x1) [x1, x2] = [x2, x1];
+      if (y2 < y1) [y1, y2] = [y2, y1];
+      return { label, bbox: [x1, y1, x2, y2], risk };
+    });
+
+    plan.n_obstacles = plan.obstacles.length;
+    if (typeof plan.confidence !== "number") plan.confidence = 0.4;
+    plan.confidence = Math.max(0, Math.min(1, plan.confidence));
+
+    if (plan.confidence < 0.25) {
+      plan.walkway_center_x = fallbackCenter;
+      plan.walkway_poly = fallbackPoly;
+      plan.best_sector = fallbackBest;
+    }
+
+    console.log("VISION PLAN:", {
+      dist_cm: distCm,
+      strength,
+      localBest,
+      corridor: { center_x: corridorCenterX, width_ratio: corridorWidthRatio, conf: corridorConf },
+      best_sector: plan.best_sector,
+      walkway_center_x: plan.walkway_center_x,
+      confidence: plan.confidence,
+      n_obstacles: plan.n_obstacles,
+    });
+
+    return res.json(plan);
+  } catch (err) {
+    console.error("/avoid_obstacle_vision error:", err);
+    res.status(500).json({ error: err.message || "vision failed" });
   }
-);
+});
 
 /* ===========================================================================  
    UPLOAD_AUDIO — STT → (Music / Chatbot) → VOICE (Eleven)
@@ -889,8 +673,9 @@ app.post(
       let meta = {};
       try {
         meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
-      } catch { meta = {}; }
-
+      } catch {
+        meta = {};
+      }
       const memoryArr = Array.isArray(meta.memory) ? meta.memory : [];
 
       // save WAV
@@ -908,14 +693,18 @@ app.post(
         console.log("🎤 PI_V2 STT:", text);
       } catch (e) {
         console.error("PI_V2 STT error:", e);
-        try { fs.unlinkSync(wavPath); } catch { }
+        try {
+          fs.unlinkSync(wavPath);
+        } catch { }
         return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null });
       }
 
       // clap short-circuit
       if (isClapText(text)) {
         console.log("👏 Detected CLAP by STT -> return label=clap");
-        try { fs.unlinkSync(wavPath); } catch { }
+        try {
+          fs.unlinkSync(wavPath);
+        } catch { }
         return res.json({ status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null, used_vision: false });
       }
 
@@ -928,7 +717,7 @@ app.post(
       let playbackUrl = null;
 
       /* ===========================
-         MUSIC: user chooses (1..5) -> play immediately
+         MUSIC: user chooses (1..5) -> play immediately (if we have last)
       =========================== */
       if (choice && last?.candidates?.length) {
         const idx = choice - 1;
@@ -945,63 +734,33 @@ app.post(
       }
 
       /* ===========================
-         MUSIC: normal search flow (FIXED)
-         - smarter search + preferOld + confidence gating
+         MUSIC: OLD stable iTunes (limit=1)
       =========================== */
       if (!playbackUrl && label === "nhac") {
         const query = extractSongQuery(text) || text;
 
-        const result = await searchITunesSmartV2(query);
+        const m = await searchITunesOld(query);
 
-        if (result?.candidates?.length) {
+        // store last as a single candidate so "bài số 1" vẫn dùng được
+        if (m?.previewUrl) {
           setLastCandidates(userKey, {
-            candidates: result.candidates.map(x => ({
-              trackName: x.trackName,
-              artistName: x.artistName,
-              previewUrl: x.previewUrl,
-              trackId: x.trackId,
-            })),
+            candidates: [
+              {
+                trackName: m.trackName,
+                artistName: m.artistName,
+                previewUrl: m.previewUrl,
+                trackId: m.trackId,
+              },
+            ],
             originalQuery: query,
           });
+        }
 
-          // publish candidates for UI
-          mqttClient.publish("robot/music_candidates", JSON.stringify({
-            query,
-            country: result.country,
-            usedTerm: result.usedTerm,
-            preferOld: !!result.parsed?.preferOld,
-            candidates: result.candidates.map((x, i) => ({
-              index: i + 1,
-              trackName: x.trackName,
-              artistName: x.artistName,
-              year: yearFromDate(x.releaseDate),
-            }))
-          }), { qos: 1 });
+        if (m?.previewUrl) {
+          playbackUrl = await getMp3FromPreview(m.previewUrl);
+          replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
 
-          console.log("🎵 iTunes country:", result.country, "attribute:", result.attribute);
-          console.log("🎵 usedTerm:", result.usedTerm);
-          console.log("🎵 topScore:", result.topScore);
-          console.log("🎵 debug:", result.rankedDebug);
-
-          // ✅ Only auto-play if confident (avoid wrong modern songs)
-          if (result.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
-            playbackUrl = await getMp3FromPreview(result.top.previewUrl);
-            replyText = `Dạ, em mở bài "${result.top.trackName}" của ${result.top.artistName} cho anh nhé.`;
-
-            mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-          } else {
-            // Not confident -> ask user to choose
-            const listText = result.candidates
-              .map((x, i) => {
-                const y = yearFromDate(x.releaseDate);
-                return `${i + 1}) ${x.trackName} - ${x.artistName}${y ? ` (${y})` : ""}`;
-              })
-              .join("\n");
-
-            replyText =
-              `Em tìm được vài bản giống tên bài này, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
-            // playbackUrl stays null -> will TTS this prompt
-          }
+          mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
         } else {
           replyText = "Em không tìm thấy bài hát phù hợp ở iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
         }
@@ -1009,7 +768,7 @@ app.post(
 
       /* ===========================
          GPT (only if NOT playing music)
-         FIX: Vision only when user asks
+         Vision only when user asks
       =========================== */
       const hasImage = !!imageFile?.buffer;
       const useVision = hasImage && wantsVision(text);
@@ -1036,7 +795,7 @@ QUY TẮC ẢNH:
 - Nếu người dùng KHÔNG hỏi về hình thì bỏ qua ảnh, trả lời theo câu nói.
 
 ÂM NHẠC:
-- Nếu user nói "bài số 2" mà không có danh sách candidates thì chỉ nói: "Anh nói lại tên bài hoặc ca sĩ giúp em nha."
+- Nếu user nói "bài số 2" mà không có danh sách candidates thì nói: "Anh nói lại tên bài hoặc ca sĩ giúp em nha."
 `.trim();
 
         const messages = [{ role: "system", content: system }];
@@ -1079,8 +838,6 @@ QUY TẮC ẢNH:
         }
       }
 
-      // If label=nhac but not playing (asking user to choose), replyText already set above.
-
       /* ===========================
          VOICE:
          - If playbackUrl exists (iTunes music) => keep it
@@ -1103,7 +860,9 @@ QUY TẮC ẢNH:
         );
       }
 
-      try { fs.unlinkSync(wavPath); } catch { }
+      try {
+        fs.unlinkSync(wavPath);
+      } catch { }
 
       return res.json({
         status: "ok",
@@ -1112,9 +871,7 @@ QUY TẮC ẢNH:
         reply_text: replyText,
         audio_url: playbackUrl,
         used_vision: !!useVision,
-        itunes_country_primary: ITUNES_COUNTRY_PRIMARY,
-        itunes_country_fallback: ITUNES_COUNTRY_FALLBACK,
-        lang: ITUNES_LANG,
+        itunes_country: ITUNES_COUNTRY,
       });
     } catch (err) {
       console.error("pi_upload_audio_v2 error:", err);
@@ -1124,182 +881,170 @@ QUY TẮC ẢNH:
 );
 
 /* ===========================================================================  
-   (Optional) other endpoints (keep, but can also apply vision gating similarly)
+   web upload_audio (WebM->WAV)
 ===========================================================================*/
+app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
 
-// web upload_audio (WebM->WAV)
-app.post(
-  "/upload_audio",
-  uploadLimiter,
-  upload.single("audio"),
-  async (req, res) => {
+    const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
+    fs.writeFileSync(inputFile, req.file.buffer);
+
+    if (req.file.buffer.length < 2000) {
+      try {
+        fs.unlinkSync(inputFile);
+      } catch { }
+      return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null });
+    }
+
+    const wavFile = inputFile.replace(".webm", ".wav");
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputFile)
+        .inputOptions("-fflags +genpts")
+        .outputOptions("-vn")
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .on("error", reject)
+        .on("end", resolve)
+        .save(wavFile);
+    });
+
+    let text = "";
     try {
-      if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
-
-      const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
-      fs.writeFileSync(inputFile, req.file.buffer);
-
-      if (req.file.buffer.length < 2000) {
-        try { fs.unlinkSync(inputFile); } catch { }
-        return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null });
-      }
-
-      const wavFile = inputFile.replace(".webm", ".wav");
-
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputFile)
-          .inputOptions("-fflags +genpts")
-          .outputOptions("-vn")
-          .audioCodec("pcm_s16le")
-          .audioChannels(1)
-          .audioFrequency(16000)
-          .on("error", reject)
-          .on("end", resolve)
-          .save(wavFile);
+      const tr = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavFile),
+        model: "gpt-4o-mini-transcribe",
       });
-
-      let text = "";
-      try {
-        const tr = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(wavFile),
-          model: "gpt-4o-mini-transcribe",
-        });
-        text = (tr.text || "").trim();
-      } catch (err) {
-        console.error("STT error:", err);
-        try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-        return res.status(500).json({ error: "STT failed" });
-      }
-
-      let label = overrideLabelByText("unknown", text);
-
-      let playbackUrl = null;
-      let replyText = "";
-
-      if (label === "nhac") {
-        const query = extractSongQuery(text) || text;
-        const result = await searchITunesSmartV2(query);
-
-        if (result?.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
-          playbackUrl = await getMp3FromPreview(result.top.previewUrl);
-          replyText = `Dạ, em mở bài "${result.top.trackName}" của ${result.top.artistName} cho anh nhé.`;
-          mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-        } else if (result?.candidates?.length) {
-          const listText = result.candidates
-            .map((x, i) => `${i + 1}) ${x.trackName} - ${x.artistName}`)
-            .join("\n");
-          replyText = `Em tìm được vài bản, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
-        } else {
-          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes.";
-        }
-      }
-
-      if (!playbackUrl && label !== "nhac") {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          messages: [
-            { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-            { role: "user", content: text },
-          ],
-          temperature: 0.25,
-          max_tokens: 260,
-        });
-        replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
-      }
-
-      if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "web");
-
-      if (["tien", "lui", "trai", "phai"].includes(label)) {
-        mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
-      } else {
-        mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
-      }
-
-      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-
-      res.json({ status: "ok", transcript: text, label, audio_url: playbackUrl });
+      text = (tr.text || "").trim();
     } catch (err) {
-      console.error("upload_audio error:", err);
-      res.status(500).json({ error: err.message });
+      console.error("STT error:", err);
+      try {
+        fs.unlinkSync(inputFile);
+        fs.unlinkSync(wavFile);
+      } catch { }
+      return res.status(500).json({ error: "STT failed" });
     }
-  }
-);
 
-// PI upload_audio (WAV already)
-app.post(
-  "/pi_upload_audio",
-  uploadLimiter,
-  upload.single("audio"),
-  async (req, res) => {
+    let label = overrideLabelByText("unknown", text);
+
+    let playbackUrl = null;
+    let replyText = "";
+
+    if (label === "nhac") {
+      const query = extractSongQuery(text) || text;
+      const musicMeta = await searchITunesOld(query);
+
+      if (musicMeta?.previewUrl) {
+        playbackUrl = await getMp3FromPreview(musicMeta.previewUrl);
+        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
+        mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
+      } else {
+        replyText = "Em không tìm thấy bài hát phù hợp ở iTunes.";
+      }
+    }
+
+    if (!playbackUrl && label !== "nhac") {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
+          { role: "user", content: text },
+        ],
+        temperature: 0.25,
+        max_tokens: 260,
+      });
+      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+    }
+
+    if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "web");
+
+    if (["tien", "lui", "trai", "phai"].includes(label)) {
+      mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
+    } else {
+      mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
+    }
+
     try {
-      if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
+      fs.unlinkSync(inputFile);
+      fs.unlinkSync(wavFile);
+    } catch { }
 
-      const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
-      fs.writeFileSync(wavFile, req.file.buffer);
-
-      let text = "";
-      try {
-        const tr = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(wavFile),
-          model: "gpt-4o-mini-transcribe",
-        });
-        text = (tr.text || "").trim();
-        console.log("🎤 PI STT:", text);
-      } catch (err) {
-        console.error("PI STT error:", err);
-        return res.json({ status: "error", text: "", label: "unknown", audio_url: null });
-      }
-
-      let label = overrideLabelByText("unknown", text);
-
-      let playbackUrl = null;
-      let replyText = "";
-
-      if (label === "nhac") {
-        const query = extractSongQuery(text) || text;
-        const result = await searchITunesSmartV2(query);
-
-        if (result?.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
-          playbackUrl = await getMp3FromPreview(result.top.previewUrl);
-          replyText = `Em mở bài "${result.top.trackName}" của ${result.top.artistName} nhé.`;
-        } else if (result?.candidates?.length) {
-          const listText = result.candidates
-            .map((x, i) => `${i + 1}) ${x.trackName} - ${x.artistName}`)
-            .join("\n");
-          replyText = `Em tìm được vài bản, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
-        } else {
-          replyText = "Em không tìm thấy bài phù hợp ở iTunes.";
-        }
-      }
-
-      if (!playbackUrl && label !== "nhac") {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          messages: [
-            { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-            { role: "user", content: text },
-          ],
-          temperature: 0.25,
-          max_tokens: 260,
-        });
-        replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu.";
-      }
-
-      if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "pi");
-
-      if (["tien", "lui", "trai", "phai"].includes(label)) {
-        mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
-      } else {
-        mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
-      }
-
-      res.json({ status: "ok", text, label, audio_url: playbackUrl });
-    } catch (err) {
-      console.error("pi_upload_audio error:", err);
-      res.status(500).json({ error: err.message });
-    }
+    res.json({ status: "ok", transcript: text, label, audio_url: playbackUrl });
+  } catch (err) {
+    console.error("upload_audio error:", err);
+    res.status(500).json({ error: err.message });
   }
-);
+});
+
+/* ===========================================================================  
+   PI upload_audio (WAV already)
+===========================================================================*/
+app.post("/pi_upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
+
+    const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
+    fs.writeFileSync(wavFile, req.file.buffer);
+
+    let text = "";
+    try {
+      const tr = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavFile),
+        model: "gpt-4o-mini-transcribe",
+      });
+      text = (tr.text || "").trim();
+      console.log("🎤 PI STT:", text);
+    } catch (err) {
+      console.error("PI STT error:", err);
+      return res.json({ status: "error", text: "", label: "unknown", audio_url: null });
+    }
+
+    let label = overrideLabelByText("unknown", text);
+
+    let playbackUrl = null;
+    let replyText = "";
+
+    if (label === "nhac") {
+      const query = extractSongQuery(text) || text;
+      const m = await searchITunesOld(query);
+
+      if (m?.previewUrl) {
+        playbackUrl = await getMp3FromPreview(m.previewUrl);
+        replyText = `Em mở bài "${m.trackName}" của ${m.artistName} nhé.`;
+      } else {
+        replyText = "Em không tìm thấy bài phù hợp.";
+      }
+    }
+
+    if (!playbackUrl) {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
+          { role: "user", content: text },
+        ],
+        temperature: 0.25,
+        max_tokens: 260,
+      });
+      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu.";
+    }
+
+    if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "pi");
+
+    if (["tien", "lui", "trai", "phai"].includes(label)) {
+      mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
+    } else {
+      mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
+    }
+
+    res.json({ status: "ok", text, label, audio_url: playbackUrl });
+  } catch (err) {
+    console.error("pi_upload_audio error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ===========================================================================  
    CAMERA ROTATE ENDPOINT  
@@ -1366,6 +1111,6 @@ app.get("/", (req, res) => {
 ===========================================================================*/
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`🎵 iTunes region: primary=${ITUNES_COUNTRY_PRIMARY} fallback=${ITUNES_COUNTRY_FALLBACK} lang=${ITUNES_LANG}`);
+  console.log(`🎵 iTunes country=${ITUNES_COUNTRY} lang=${ITUNES_LANG || "(none)"}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
 });
