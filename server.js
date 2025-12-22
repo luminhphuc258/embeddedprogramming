@@ -3,8 +3,11 @@
    - STT + ChatGPT / iTunes + TTS
    - Auto điều hướng với LIDAR + ULTRASONIC
    - Label override + camera + scan 360
-   - IMPROVED: iTunes search (VN region) + candidates + user choice -> play immediately
    - UPDATE: all replyText -> Eleven voice server -> MP3 (except iTunes music playback)
+   - FIXES:
+     (1) Better iTunes search for "nhạc xưa" + confidence gating (avoid wrong modern songs)
+     (2) Vision only when user asks (no auto describe image)
+     (3) Better general-knowledge answers (avoid "không biết" too often)
 ===========================================================================*/
 
 import express from "express";
@@ -81,12 +84,12 @@ function uploadLimiter(req, res, next) {
 app.use("/audio", express.static(audioDir));
 
 /* ===========================================================================  
-   MQTT CLIENT  (giữ y như bạn đang dùng)
+   MQTT CLIENT  (move secrets to env)
 ===========================================================================*/
-const MQTT_HOST = "rfff7184.ala.us-east-1.emqxsl.com";
-const MQTT_PORT = 8883;
-const MQTT_USER = "robot_matthew";
-const MQTT_PASS = "29061992abCD!yesokmen";
+const MQTT_HOST = process.env.MQTT_HOST || "rfff7184.ala.us-east-1.emqxsl.com";
+const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
+const MQTT_USER = process.env.MQTT_USER || "robot_matthew";
+const MQTT_PASS = process.env.MQTT_PASS || "";
 
 const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
 const mqttClient = mqtt.connect(mqttUrl, {
@@ -118,7 +121,7 @@ mqttClient.on("message", (topic, message) => {
     }
 
     if (topic === "robot/scanning180") {
-      console.log("==> Quyet dinh xoay 180 độ:", msg);
+      console.log("==> Quyết định xoay 180 độ:", msg);
       return;
     }
 
@@ -132,7 +135,7 @@ mqttClient.on("message", (topic, message) => {
 });
 
 /* ===========================================================================  
-   HELPERS — text normalize, iTunes, mp3  
+   HELPERS — normalize / routing
 ===========================================================================*/
 function stripDiacritics(s = "") {
   return s
@@ -156,7 +159,6 @@ function getPublicHost() {
 
 /* ===========================================================================  
    VOICE (Eleven proxy server -> WAV -> MP3)
-   - Tất cả replyText sẽ chạy qua đây (trừ trường hợp playbackUrl đã là nhạc iTunes)
 ===========================================================================*/
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
@@ -164,7 +166,6 @@ const VOICE_SERVER_URL =
 
 const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
 
-// default settings
 const DEFAULT_VOICE_PAYLOAD = {
   voice_settings: {
     stability: 0.45,
@@ -216,13 +217,11 @@ async function voiceServerToMp3(replyText, prefix = "eleven") {
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
     const buf = Buffer.from(await resp.arrayBuffer());
 
-    // Nếu server trả MP3 trực tiếp -> lưu luôn
     if (ct.includes("audio/mpeg") || ct.includes("audio/mp3")) {
       fs.writeFileSync(mp3Out, buf);
       return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
     }
 
-    // Default: WAV -> convert MP3
     fs.writeFileSync(wavTmp, buf);
 
     await new Promise((resolve, reject) =>
@@ -243,16 +242,9 @@ async function voiceServerToMp3(replyText, prefix = "eleven") {
   }
 }
 
-/**
- * Convert replyText -> Eleven -> MP3, fallback OpenAI TTS
- * NOTE: chỉ gọi hàm này khi bạn muốn speech từ text.
- */
 async function textToSpeechMp3(replyText, prefix = "reply") {
   const safeText = (replyText || "").trim();
-  if (!safeText) {
-    // tránh tạo file rỗng
-    return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
-  }
+  if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
 
   try {
     return await voiceServerToMp3(safeText, `${prefix}_eleven`);
@@ -283,18 +275,68 @@ async function getMp3FromPreview(previewUrl) {
   return `${getPublicHost()}/audio/song_${ts}.mp3`;
 }
 
-/* ------------------------------ MUSIC QUERY CLEANING ------------------------------ */
+/* ===========================================================================  
+   VISION GATING (FIX: don't auto describe image)
+===========================================================================*/
+function wantsVision(text = "") {
+  const t = stripDiacritics((text || "").toLowerCase());
+
+  const triggers = [
+    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi", "co gi",
+    "mo ta", "ta hinh", "trong anh", "anh nay", "tam anh", "camera",
+    "day la gi", "cai gi", "vat gi", "giai thich hinh"
+  ];
+
+  return triggers.some(k => t.includes(stripDiacritics(k)));
+}
+
+/* ===========================================================================  
+   MUSIC QUERY CLEANING + preferOld detection (FIX iTunes)
+===========================================================================*/
 function cleanMusicQuery(q = "") {
   let t = (q || "").toLowerCase().trim();
+
+  // remove brackets
   t = t.replace(/\(.*?\)|\[.*?\]/g, " ");
+
+  // remove punctuation that hurts iTunes matching
+  t = t.replace(/[.,;:!?]/g, " ");
+
+  // remove junk words
   t = t.replace(/\b(official|mv|lyrics|karaoke|cover|8d|tiktok|sped\s*up|slowed|remix|ver\.?|version)\b/g, " ");
   t = t.replace(/\b(feat|ft)\.?\b/g, " ");
+
+  // collapse
   t = t.replace(/\s+/g, " ").trim();
   return t;
 }
 
-function extractSongQuery(text) {
+function detectPreferOld(text = "") {
+  const t = stripDiacritics((text || "").toLowerCase());
+  const keys = [
+    "nhac xua", "bolero", "tru tinh", "tien chien", "nhac vang", "nhac pre",
+    "truoc 75", "pre 75", "tinh khuc", "nhac que huong"
+  ];
+  return keys.some(k => t.includes(stripDiacritics(k)));
+}
+
+function stripOldHintsForSearch(text = "") {
+  // remove "nhạc xưa/bolero..." from search term (but keep preferOld separately)
   let t = cleanMusicQuery(text);
+  const remove = [
+    "nhac xua", "bolero", "tru tinh", "tien chien", "nhac vang", "truoc 75", "pre 75", "pre75",
+    "tinh khuc", "que huong"
+  ];
+  let s = stripDiacritics(t);
+  for (const r of remove) {
+    s = s.replace(new RegExp(`\\b${stripDiacritics(r)}\\b`, "g"), " ");
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  return cleanMusicQuery(s || t);
+}
+
+function extractSongQuery(text) {
+  let t = stripOldHintsForSearch(text);
   const tNoDau = stripDiacritics(t);
 
   const removePhrases = [
@@ -320,10 +362,12 @@ function extractSongQuery(text) {
     s = s.replace(new RegExp(`\\b${pp}\\b`, "g"), " ");
   }
   s = s.replace(/\s+/g, " ").trim();
-  if (!s || s.length < 2) return cleanMusicQuery(text);
+
+  if (!s || s.length < 2) return stripOldHintsForSearch(text);
   return cleanMusicQuery(s);
 }
 
+// parse "artist - title", "title by artist"
 function parseArtistTitle(raw = "") {
   const t = cleanMusicQuery(raw);
 
@@ -341,36 +385,72 @@ function parseArtistTitle(raw = "") {
   return { title: t };
 }
 
-function scoreItunesSong(item, { title, artist }) {
+function yearFromDate(s) {
+  try {
+    const y = new Date(s).getFullYear();
+    return Number.isFinite(y) ? y : null;
+  } catch {
+    return null;
+  }
+}
+
+function scoreItunesSong(item, { title, artist, preferOld }) {
   const track = (item.trackName || "").toLowerCase();
   const art = (item.artistName || "").toLowerCase();
   const album = (item.collectionName || "").toLowerCase();
 
+  const trackND = stripDiacritics(track);
+  const artND = stripDiacritics(art);
+
   let s = 0;
+
+  // title match (diacritics-insensitive)
   if (title) {
-    const tt = title.toLowerCase();
-    if (track === tt) s += 120;
-    else if (track.startsWith(tt)) s += 70;
-    else if (track.includes(tt)) s += 35;
+    const tt = stripDiacritics(title.toLowerCase());
+    if (trackND === tt) s += 160;
+    else if (trackND.startsWith(tt)) s += 95;
+    else if (trackND.includes(tt)) s += 50;
   }
+
+  // artist match
   if (artist) {
-    const aa = artist.toLowerCase();
-    if (art === aa) s += 90;
-    else if (art.includes(aa)) s += 45;
+    const aa = stripDiacritics(artist.toLowerCase());
+    if (artND === aa) s += 120;
+    else if (artND.includes(aa)) s += 65;
   }
 
-  const bad = ["karaoke", "instrumental", "tribute", "cover", "8d"];
-  for (const w of bad) if (track.includes(w) || art.includes(w) || album.includes(w)) s -= 60;
+  // penalties
+  const bad = ["karaoke", "instrumental", "tribute", "cover", "8d", "remix", "sped up", "slowed"];
+  for (const w of bad) {
+    const ww = stripDiacritics(w);
+    if (trackND.includes(ww) || artND.includes(ww) || stripDiacritics(album).includes(ww)) s -= 90;
+  }
 
-  if ((item.trackTimeMillis || 0) < 60_000) s -= 12;
+  // release year heuristic (prefer old)
+  const y = yearFromDate(item.releaseDate);
+  if (preferOld && y) {
+    if (y <= 1985) s += 55;
+    else if (y <= 1995) s += 45;
+    else if (y <= 2005) s += 30;
+    else if (y >= 2015) s -= 35; // modern -> punish
+  }
+
+  // too short => often wrong
+  if ((item.trackTimeMillis || 0) < 60_000) s -= 15;
+
+  // slight preference for "single"
   if (album.includes("single")) s += 4;
 
   return s;
 }
 
-/* ------------------------------ iTunes cache + search ------------------------------ */
-const ITUNES_COUNTRY = "VN";
+/* ===========================================================================  
+   iTunes cache + smart search v2
+===========================================================================*/
+const ITUNES_COUNTRY_PRIMARY = "VN";
+const ITUNES_COUNTRY_FALLBACK = process.env.ITUNES_COUNTRY_FALLBACK || "US";
 const ITUNES_LANG = "vi_vn";
+
 const itunesCache = new Map();
 const ITUNES_CACHE_MS = 5 * 60 * 1000;
 
@@ -387,8 +467,12 @@ function cacheSet(key, data) {
   itunesCache.set(key, { ts: Date.now(), data });
 }
 
-async function itunesSearchRaw(term, { limit = 25 } = {}) {
-  const key = `${ITUNES_COUNTRY}|${ITUNES_LANG}|${limit}|${term}`;
+/**
+ * iTunes search raw with optional country + attribute
+ * attribute examples: mixTerm, songTerm, artistTerm
+ */
+async function itunesSearchRaw(term, { limit = 25, country = ITUNES_COUNTRY_PRIMARY, attribute = "mixTerm" } = {}) {
+  const key = `${country}|${ITUNES_LANG}|${attribute}|${limit}|${term}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
@@ -397,10 +481,12 @@ async function itunesSearchRaw(term, { limit = 25 } = {}) {
   url.searchParams.set("media", "music");
   url.searchParams.set("entity", "song");
   url.searchParams.set("limit", String(limit));
-  url.searchParams.set("country", ITUNES_COUNTRY);
+  url.searchParams.set("country", country);
   url.searchParams.set("lang", ITUNES_LANG);
+  if (attribute) url.searchParams.set("attribute", attribute);
 
-  const resp = await fetch(url.toString(), { timeout: 5000 });
+  // node-fetch timeout option is supported
+  const resp = await fetch(url.toString(), { timeout: 7000 });
   if (!resp.ok) return { results: [] };
 
   const data = await resp.json();
@@ -408,47 +494,115 @@ async function itunesSearchRaw(term, { limit = 25 } = {}) {
   return data;
 }
 
-async function searchITunesSmart(rawQuery) {
+function rankResults(results, parsed) {
+  const ranked = results
+    .filter(r => r.wrapperType === "track" && r.previewUrl)
+    .map(r => ({ r, s: scoreItunesSong(r, parsed) }))
+    .sort((a, b) => b.s - a.s);
+
+  return ranked;
+}
+
+/**
+ * Search strategy:
+ *  - remove "nhạc xưa" hints from term
+ *  - try multiple term/attribute
+ *  - country: VN first, if score weak then fallback US
+ *  - confidence gating: only autoplay if topScore >= AUTO_PLAY_MIN_SCORE
+ */
+const AUTO_PLAY_MIN_SCORE = Number(process.env.AUTO_PLAY_MIN_SCORE || 105);
+const ACCEPT_MIN_SCORE = Number(process.env.ACCEPT_MIN_SCORE || 60);
+
+async function searchITunesSmartV2(rawQuery) {
+  const preferOld = detectPreferOld(rawQuery);
   const cleaned = cleanMusicQuery(rawQuery);
   if (!cleaned || cleaned.length < 2) return null;
 
-  const parsed = parseArtistTitle(cleaned);
+  const searchBase = stripOldHintsForSearch(cleaned);
+  const parsedBase = parseArtistTitle(searchBase);
+
+  const parsed = { ...parsedBase, preferOld };
 
   const attempts = [];
-  attempts.push({ term: cleaned, parsed });
 
-  const nodau = stripDiacritics(cleaned);
-  if (nodau && nodau !== cleaned) attempts.push({ term: nodau, parsed: parseArtistTitle(nodau) });
-
-  const short = cleaned.split(" ").slice(0, 5).join(" ");
-  if (short && short !== cleaned) attempts.push({ term: short, parsed: parseArtistTitle(short) });
-
-  const noDash = cleaned.split(/\s-\s|—|–|\|/)[0]?.trim();
-  if (noDash && noDash !== cleaned) attempts.push({ term: noDash, parsed: { title: noDash } });
-
-  for (const att of attempts) {
-    const data = await itunesSearchRaw(att.term, { limit: 25 });
-    const results = Array.isArray(data.results) ? data.results : [];
-
-    const ranked = results
-      .filter(r => r.wrapperType === "track" && r.previewUrl)
-      .map(r => ({ r, s: scoreItunesSong(r, att.parsed) }))
-      .sort((a, b) => b.s - a.s)
-      .map(x => x.r);
-
-    if (ranked.length) {
-      return {
-        usedTerm: att.term,
-        cleaned,
-        top: ranked[0],
-        candidates: ranked.slice(0, 5),
-      };
-    }
+  // Most reliable: "title + artist" when exists
+  if (parsed.title && parsed.artist) attempts.push({ term: `${parsed.title} ${parsed.artist}`, attribute: "mixTerm" });
+  if (parsed.title) {
+    attempts.push({ term: parsed.title, attribute: "songTerm" });
+    attempts.push({ term: parsed.title, attribute: "mixTerm" });
   }
-  return null;
+  if (parsed.artist) attempts.push({ term: parsed.artist, attribute: "artistTerm" });
+
+  // no-diacritics attempt
+  const nodau = stripDiacritics(searchBase);
+  if (nodau && nodau !== searchBase) {
+    const p2 = parseArtistTitle(nodau);
+    attempts.push({ term: p2.title && p2.artist ? `${p2.title} ${p2.artist}` : nodau, attribute: "mixTerm" });
+    if (p2.title) attempts.push({ term: p2.title, attribute: "songTerm" });
+  }
+
+  // keep it small
+  const uniqueKey = (a) => `${a.attribute}|${a.term}`;
+  const uniq = new Map();
+  for (const a of attempts) {
+    const k = uniqueKey(a);
+    if (!uniq.has(k) && a.term && a.term.length >= 2) uniq.set(k, a);
+  }
+
+  const runForCountry = async (country) => {
+    let best = null;
+
+    for (const att of uniq.values()) {
+      const data = await itunesSearchRaw(att.term, { limit: 25, country, attribute: att.attribute });
+      const results = Array.isArray(data.results) ? data.results : [];
+
+      const ranked = rankResults(results, parsed);
+      if (!ranked.length) continue;
+
+      const top = ranked[0];
+      const topScore = top.s;
+
+      if (!best || topScore > best.topScore) {
+        best = {
+          country,
+          usedTerm: att.term,
+          attribute: att.attribute,
+          cleaned: searchBase,
+          parsed,
+          top: top.r,
+          topScore,
+          candidates: ranked.slice(0, 5).map(x => x.r),
+          rankedDebug: ranked.slice(0, 5).map(x => ({
+            score: x.s,
+            track: x.r.trackName,
+            artist: x.r.artistName,
+            year: yearFromDate(x.r.releaseDate),
+          })),
+        };
+      }
+
+      // early exit if very strong
+      if (topScore >= AUTO_PLAY_MIN_SCORE + 25) break;
+    }
+
+    return best;
+  };
+
+  // 1) primary country
+  const bestVN = await runForCountry(ITUNES_COUNTRY_PRIMARY);
+
+  // If VN weak, fallback to US
+  if (!bestVN || bestVN.topScore < ACCEPT_MIN_SCORE) {
+    const bestFB = await runForCountry(ITUNES_COUNTRY_FALLBACK);
+    if (bestFB && (!bestVN || bestFB.topScore > bestVN.topScore)) return bestFB;
+  }
+
+  return bestVN;
 }
 
-/* ------------------------------ detect user choice ------------------------------ */
+/* ===========================================================================  
+   detect user choice (bài số 2 / chọn 1 / bài thứ hai)
+===========================================================================*/
 function detectSongChoice(text = "") {
   const t = stripDiacritics(text.toLowerCase());
 
@@ -516,7 +670,7 @@ function getLastCandidates(userKey) {
 }
 
 /* ===========================================================================  
-   VISION ENDPOINT (giữ nguyên phần bạn đưa)
+   VISION ENDPOINT (keep as-is)
 ===========================================================================*/
 app.post(
   "/avoid_obstacle_vision",
@@ -765,7 +919,6 @@ app.post(
         return res.json({ status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null, used_vision: false });
       }
 
-      // detect if user is choosing from last candidates
       const choice = detectSongChoice(text);
       const last = getLastCandidates(userKey);
 
@@ -792,12 +945,13 @@ app.post(
       }
 
       /* ===========================
-         MUSIC: normal search flow
+         MUSIC: normal search flow (FIXED)
+         - smarter search + preferOld + confidence gating
       =========================== */
       if (!playbackUrl && label === "nhac") {
         const query = extractSongQuery(text) || text;
 
-        const result = await searchITunesSmart(query);
+        const result = await searchITunesSmartV2(query);
 
         if (result?.candidates?.length) {
           setLastCandidates(userKey, {
@@ -810,35 +964,57 @@ app.post(
             originalQuery: query,
           });
 
-          const top = result.top;
-
-          playbackUrl = await getMp3FromPreview(top.previewUrl);
-          replyText = `Dạ, em mở bài "${top.trackName}" của ${top.artistName} cho anh nhé.`;
-
-          mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-
+          // publish candidates for UI
           mqttClient.publish("robot/music_candidates", JSON.stringify({
             query,
+            country: result.country,
+            usedTerm: result.usedTerm,
+            preferOld: !!result.parsed?.preferOld,
             candidates: result.candidates.map((x, i) => ({
               index: i + 1,
               trackName: x.trackName,
-              artistName: x.artistName
+              artistName: x.artistName,
+              year: yearFromDate(x.releaseDate),
             }))
           }), { qos: 1 });
 
-          console.log("🎵 iTunes usedTerm:", result.usedTerm);
-          console.log("🎵 Candidates:", result.candidates.map(x => `${x.trackName} - ${x.artistName}`));
+          console.log("🎵 iTunes country:", result.country, "attribute:", result.attribute);
+          console.log("🎵 usedTerm:", result.usedTerm);
+          console.log("🎵 topScore:", result.topScore);
+          console.log("🎵 debug:", result.rankedDebug);
+
+          // ✅ Only auto-play if confident (avoid wrong modern songs)
+          if (result.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
+            playbackUrl = await getMp3FromPreview(result.top.previewUrl);
+            replyText = `Dạ, em mở bài "${result.top.trackName}" của ${result.top.artistName} cho anh nhé.`;
+
+            mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
+          } else {
+            // Not confident -> ask user to choose
+            const listText = result.candidates
+              .map((x, i) => {
+                const y = yearFromDate(x.releaseDate);
+                return `${i + 1}) ${x.trackName} - ${x.artistName}${y ? ` (${y})` : ""}`;
+              })
+              .join("\n");
+
+            replyText =
+              `Em tìm được vài bản giống tên bài này, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
+            // playbackUrl stays null -> will TTS this prompt
+          }
         } else {
-          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes (VN). Anh nói lại tên bài + ca sĩ giúp em nha.";
+          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
         }
       }
 
       /* ===========================
          GPT (only if NOT playing music)
+         FIX: Vision only when user asks
       =========================== */
       const hasImage = !!imageFile?.buffer;
+      const useVision = hasImage && wantsVision(text);
 
-      if (!playbackUrl) {
+      if (!playbackUrl && label !== "nhac") {
         const memoryText = memoryArr
           .slice(-12)
           .map((m, i) => {
@@ -849,35 +1025,44 @@ app.post(
           .join("\n\n");
 
         const system = `
-Bạn là dog robot của Matthew.
-Trả lời ngắn gọn, dễ hiểu, thân thiện.
-Nếu user đang chọn bài hát theo số (ví dụ: "bài số 2") mà thiếu danh sách candidates thì chỉ nói: "Anh nói lại tên bài hoặc ca sĩ giúp em nha."
-Nếu có hình ảnh đi kèm: bạn đã có ảnh rồi, KHÔNG được yêu cầu gửi ảnh nữa.
-Nếu user hỏi nhìn/xung quanh thì mô tả thứ bạn đang thấy (không nói "từ hình ảnh").
-Nếu không chắc thì nói rõ không chắc.
+Bạn là dog robot của Matthew. Trả lời ngắn gọn, dễ hiểu, thân thiện.
+
+QUY TẮC KIẾN THỨC:
+- Với câu hỏi kiến thức phổ thông (người nổi tiếng, khái niệm, “là ai”, “là gì”), hãy trả lời trực tiếp bằng kiến thức chung.
+- Chỉ nói "em không chắc" khi câu hỏi quá chi tiết/khó kiểm chứng (ngày sinh chính xác, số liệu nhỏ, tin đồn).
+
+QUY TẮC ẢNH:
+- CHỈ mô tả hình/khung cảnh khi người dùng có hỏi kiểu "nhìn/xem/xung quanh/trong ảnh".
+- Nếu người dùng KHÔNG hỏi về hình thì bỏ qua ảnh, trả lời theo câu nói.
+
+ÂM NHẠC:
+- Nếu user nói "bài số 2" mà không có danh sách candidates thì chỉ nói: "Anh nói lại tên bài hoặc ca sĩ giúp em nha."
 `.trim();
 
         const messages = [{ role: "system", content: system }];
 
         if (memoryText) {
-          messages.push({ role: "system", content: `Robot long-term memory (recent):\n${memoryText}`.slice(0, 6000) });
+          messages.push({
+            role: "system",
+            content: `Robot long-term memory (recent):\n${memoryText}`.slice(0, 6000),
+          });
         }
 
         if (choice && !last?.candidates?.length) {
           replyText = "Anh nói lại tên bài hoặc ca sĩ giúp em nha.";
-        } else if (hasImage) {
+        } else if (useVision) {
           const b64 = imageFile.buffer.toString("base64");
           const dataUrl = `data:image/jpeg;base64,${b64}`;
 
           const userContent = [
-            { type: "text", text: `Người dùng nói: "${text}". Trả lời theo yêu cầu. Nếu có liên quan đến hình ảnh thì mô tả hình.` },
+            { type: "text", text: `Người dùng nói: "${text}". Trả lời đúng yêu cầu. Vì user đang hỏi về hình nên mới mô tả hình.` },
             { type: "image_url", image_url: { url: dataUrl } },
           ];
 
           const completion = await openai.chat.completions.create({
             model: process.env.VISION_MODEL || "gpt-4.1-mini",
             messages: [...messages, { role: "user", content: userContent }],
-            temperature: 0.3,
+            temperature: 0.25,
             max_tokens: 420,
           });
 
@@ -886,7 +1071,7 @@ Nếu không chắc thì nói rõ không chắc.
           const completion = await openai.chat.completions.create({
             model: "gpt-4.1-mini",
             messages: [...messages, { role: "user", content: text }],
-            temperature: 0.4,
+            temperature: 0.25,
             max_tokens: 260,
           });
 
@@ -894,10 +1079,12 @@ Nếu không chắc thì nói rõ không chắc.
         }
       }
 
+      // If label=nhac but not playing (asking user to choose), replyText already set above.
+
       /* ===========================
          VOICE:
-         - Nếu playbackUrl đã có (nhạc iTunes) => giữ nguyên, không convert
-         - Nếu chưa có => convert replyText thành MP3 (Eleven)
+         - If playbackUrl exists (iTunes music) => keep it
+         - else => convert replyText to MP3 (Eleven)
       =========================== */
       if (!playbackUrl) {
         playbackUrl = await textToSpeechMp3(replyText, "pi_v2");
@@ -924,8 +1111,9 @@ Nếu không chắc thì nói rõ không chắc.
         label,
         reply_text: replyText,
         audio_url: playbackUrl,
-        used_vision: hasImage,
-        country: ITUNES_COUNTRY,
+        used_vision: !!useVision,
+        itunes_country_primary: ITUNES_COUNTRY_PRIMARY,
+        itunes_country_fallback: ITUNES_COUNTRY_FALLBACK,
         lang: ITUNES_LANG,
       });
     } catch (err) {
@@ -936,17 +1124,17 @@ Nếu không chắc thì nói rõ không chắc.
 );
 
 /* ===========================================================================  
-   /upload_audio (WebM->WAV)  — giữ endpoint cũ nhưng replyText -> Eleven
+   (Optional) other endpoints (keep, but can also apply vision gating similarly)
 ===========================================================================*/
+
+// web upload_audio (WebM->WAV)
 app.post(
   "/upload_audio",
   uploadLimiter,
   upload.single("audio"),
   async (req, res) => {
     try {
-      if (!req.file || !req.file.buffer) {
-        return res.status(400).json({ error: "No audio uploaded" });
-      }
+      if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
 
       const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
       fs.writeFileSync(inputFile, req.file.buffer);
@@ -990,32 +1178,36 @@ app.post(
 
       if (label === "nhac") {
         const query = extractSongQuery(text) || text;
-        const result = await searchITunesSmart(query);
+        const result = await searchITunesSmartV2(query);
 
-        if (result?.top?.previewUrl) {
+        if (result?.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
           playbackUrl = await getMp3FromPreview(result.top.previewUrl);
           replyText = `Dạ, em mở bài "${result.top.trackName}" của ${result.top.artistName} cho anh nhé.`;
           mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
+        } else if (result?.candidates?.length) {
+          const listText = result.candidates
+            .map((x, i) => `${i + 1}) ${x.trackName} - ${x.artistName}`)
+            .join("\n");
+          replyText = `Em tìm được vài bản, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
         } else {
-          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes (VN).";
+          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes.";
         }
       }
 
-      if (!playbackUrl) {
+      if (!playbackUrl && label !== "nhac") {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
           messages: [
-            { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu." },
+            { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
             { role: "user", content: text },
           ],
+          temperature: 0.25,
+          max_tokens: 260,
         });
         replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
       }
 
-      // If NOT music playbackUrl => convert replyText to MP3 (Eleven)
-      if (!playbackUrl) {
-        playbackUrl = await textToSpeechMp3(replyText, "web");
-      }
+      if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "web");
 
       if (["tien", "lui", "trai", "phai"].includes(label)) {
         mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
@@ -1033,18 +1225,14 @@ app.post(
   }
 );
 
-/* ===========================================================================  
-   /pi_upload_audio (WAV already) — replyText -> Eleven
-===========================================================================*/
+// PI upload_audio (WAV already)
 app.post(
   "/pi_upload_audio",
   uploadLimiter,
   upload.single("audio"),
   async (req, res) => {
     try {
-      if (!req.file || !req.file.buffer) {
-        return res.status(400).json({ error: "No audio uploaded" });
-      }
+      if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
 
       const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
       fs.writeFileSync(wavFile, req.file.buffer);
@@ -1069,31 +1257,35 @@ app.post(
 
       if (label === "nhac") {
         const query = extractSongQuery(text) || text;
-        const result = await searchITunesSmart(query);
+        const result = await searchITunesSmartV2(query);
 
-        if (result?.top?.previewUrl) {
+        if (result?.top?.previewUrl && result.topScore >= AUTO_PLAY_MIN_SCORE) {
           playbackUrl = await getMp3FromPreview(result.top.previewUrl);
           replyText = `Em mở bài "${result.top.trackName}" của ${result.top.artistName} nhé.`;
+        } else if (result?.candidates?.length) {
+          const listText = result.candidates
+            .map((x, i) => `${i + 1}) ${x.trackName} - ${x.artistName}`)
+            .join("\n");
+          replyText = `Em tìm được vài bản, anh chọn giúp em số 1 đến 5 nha:\n${listText}`;
         } else {
-          replyText = "Em không tìm thấy bài phù hợp ở iTunes (VN).";
+          replyText = "Em không tìm thấy bài phù hợp ở iTunes.";
         }
       }
 
-      if (!playbackUrl) {
+      if (!playbackUrl && label !== "nhac") {
         const completion = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
           messages: [
-            { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn." },
+            { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
             { role: "user", content: text },
           ],
+          temperature: 0.25,
+          max_tokens: 260,
         });
-        replyText = completion.choices?.[0]?.message?.content || "Em chưa hiểu.";
+        replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu.";
       }
 
-      // If NOT music playbackUrl => convert replyText to MP3 (Eleven)
-      if (!playbackUrl) {
-        playbackUrl = await textToSpeechMp3(replyText, "pi");
-      }
+      if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "pi");
 
       if (["tien", "lui", "trai", "phai"].includes(label)) {
         mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
@@ -1101,7 +1293,7 @@ app.post(
         mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
       }
 
-      res.json({ status: "ok", text, label, audio_url: playbackUrl, country: ITUNES_COUNTRY, lang: ITUNES_LANG });
+      res.json({ status: "ok", text, label, audio_url: playbackUrl });
     } catch (err) {
       console.error("pi_upload_audio error:", err);
       res.status(500).json({ error: err.message });
@@ -1173,7 +1365,7 @@ app.get("/", (req, res) => {
    START SERVER  
 ===========================================================================*/
 app.listen(PORT, () => {
-  console.log(` Server listening on port ${PORT}`);
-  console.log(` iTunes region: country=${ITUNES_COUNTRY} lang=${ITUNES_LANG}`);
-  console.log(` Voice server: ${VOICE_SERVER_URL}`);
+  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`🎵 iTunes region: primary=${ITUNES_COUNTRY_PRIMARY} fallback=${ITUNES_COUNTRY_FALLBACK} lang=${ITUNES_LANG}`);
+  console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
 });
