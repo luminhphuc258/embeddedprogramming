@@ -4,6 +4,7 @@
    - Auto điều hướng với LIDAR + ULTRASONIC
    - Label override + camera + scan 360
    - IMPROVED: iTunes search (VN region) + candidates + user choice -> play immediately
+   - UPDATE: all replyText -> Eleven voice server -> MP3 (except iTunes music playback)
 ===========================================================================*/
 
 import express from "express";
@@ -80,7 +81,7 @@ function uploadLimiter(req, res, next) {
 app.use("/audio", express.static(audioDir));
 
 /* ===========================================================================  
-   MQTT CLIENT  
+   MQTT CLIENT  (giữ y như bạn đang dùng)
 ===========================================================================*/
 const MQTT_HOST = "rfff7184.ala.us-east-1.emqxsl.com";
 const MQTT_PORT = 8883;
@@ -142,7 +143,6 @@ function stripDiacritics(s = "") {
 }
 
 function getClientKey(req) {
-  // best-effort key per user
   const ip = (req.headers["x-forwarded-for"] || req.ip || "unknown").toString();
   return ip.split(",")[0].trim();
 }
@@ -152,6 +152,114 @@ function getPublicHost() {
   const r = process.env.RAILWAY_STATIC_URL;
   if (r) return `https://${r}`;
   return `http://localhost:${PORT}`;
+}
+
+/* ===========================================================================  
+   VOICE (Eleven proxy server -> WAV -> MP3)
+   - Tất cả replyText sẽ chạy qua đây (trừ trường hợp playbackUrl đã là nhạc iTunes)
+===========================================================================*/
+const VOICE_SERVER_URL =
+  process.env.VOICE_SERVER_URL ||
+  "https://eleven-tts-wav-server-matthewrobotvoice.up.railway.app/convertvoice";
+
+const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
+
+// default settings
+const DEFAULT_VOICE_PAYLOAD = {
+  voice_settings: {
+    stability: 0.45,
+    similarity_boost: 0.9,
+    style: 0,
+    use_speaker_boost: true,
+  },
+  optimize_streaming_latency: 0,
+};
+
+async function openaiTtsToMp3(replyText, prefix = "tts") {
+  const filename = `${prefix}_${Date.now()}.mp3`;
+  const outPath = path.join(audioDir, filename);
+
+  const speech = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "ballad",
+    format: "mp3",
+    input: replyText,
+  });
+
+  fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
+  return `${getPublicHost()}/audio/${filename}`;
+}
+
+async function voiceServerToMp3(replyText, prefix = "eleven") {
+  const ts = Date.now();
+  const wavTmp = path.join(audioDir, `${prefix}_${ts}.wav`);
+  const mp3Out = path.join(audioDir, `${prefix}_${ts}.mp3`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VOICE_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(VOICE_SERVER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: replyText, ...DEFAULT_VOICE_PAYLOAD }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      throw new Error(`VOICE_SERVER ${resp.status}: ${errText.slice(0, 400)}`);
+    }
+
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    const buf = Buffer.from(await resp.arrayBuffer());
+
+    // Nếu server trả MP3 trực tiếp -> lưu luôn
+    if (ct.includes("audio/mpeg") || ct.includes("audio/mp3")) {
+      fs.writeFileSync(mp3Out, buf);
+      return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
+    }
+
+    // Default: WAV -> convert MP3
+    fs.writeFileSync(wavTmp, buf);
+
+    await new Promise((resolve, reject) =>
+      ffmpeg(wavTmp)
+        .toFormat("mp3")
+        .on("end", resolve)
+        .on("error", reject)
+        .save(mp3Out)
+    );
+
+    try { fs.unlinkSync(wavTmp); } catch { }
+    return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
+  } catch (e) {
+    clearTimeout(timer);
+    try { if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp); } catch { }
+    try { if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out); } catch { }
+    throw e;
+  }
+}
+
+/**
+ * Convert replyText -> Eleven -> MP3, fallback OpenAI TTS
+ * NOTE: chỉ gọi hàm này khi bạn muốn speech từ text.
+ */
+async function textToSpeechMp3(replyText, prefix = "reply") {
+  const safeText = (replyText || "").trim();
+  if (!safeText) {
+    // tránh tạo file rỗng
+    return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
+  }
+
+  try {
+    return await voiceServerToMp3(safeText, `${prefix}_eleven`);
+  } catch (e) {
+    console.error("⚠️ voiceServerToMp3 failed -> fallback OpenAI:", e?.message || e);
+    return await openaiTtsToMp3(safeText, `${prefix}_openai`);
+  }
 }
 
 async function getMp3FromPreview(previewUrl) {
@@ -178,23 +286,14 @@ async function getMp3FromPreview(previewUrl) {
 /* ------------------------------ MUSIC QUERY CLEANING ------------------------------ */
 function cleanMusicQuery(q = "") {
   let t = (q || "").toLowerCase().trim();
-
-  // remove brackets tags
   t = t.replace(/\(.*?\)|\[.*?\]/g, " ");
-
-  // remove common junk words
   t = t.replace(/\b(official|mv|lyrics|karaoke|cover|8d|tiktok|sped\s*up|slowed|remix|ver\.?|version)\b/g, " ");
-
-  // normalize feat
   t = t.replace(/\b(feat|ft)\.?\b/g, " ");
-
-  // collapse
   t = t.replace(/\s+/g, " ").trim();
   return t;
 }
 
 function extractSongQuery(text) {
-  // less aggressive; avoid deleting real title
   let t = cleanMusicQuery(text);
   const tNoDau = stripDiacritics(t);
 
@@ -221,13 +320,10 @@ function extractSongQuery(text) {
     s = s.replace(new RegExp(`\\b${pp}\\b`, "g"), " ");
   }
   s = s.replace(/\s+/g, " ").trim();
-
-  // if too short, fallback to original cleaned
   if (!s || s.length < 2) return cleanMusicQuery(text);
   return cleanMusicQuery(s);
 }
 
-// parse "artist - title", "title by artist"
 function parseArtistTitle(raw = "") {
   const t = cleanMusicQuery(raw);
 
@@ -263,14 +359,10 @@ function scoreItunesSong(item, { title, artist }) {
     else if (art.includes(aa)) s += 45;
   }
 
-  // penalties
   const bad = ["karaoke", "instrumental", "tribute", "cover", "8d"];
   for (const w of bad) if (track.includes(w) || art.includes(w) || album.includes(w)) s -= 60;
 
-  // too short track => often wrong
   if ((item.trackTimeMillis || 0) < 60_000) s -= 12;
-
-  // slight preference
   if (album.includes("single")) s += 4;
 
   return s;
@@ -279,7 +371,7 @@ function scoreItunesSong(item, { title, artist }) {
 /* ------------------------------ iTunes cache + search ------------------------------ */
 const ITUNES_COUNTRY = "VN";
 const ITUNES_LANG = "vi_vn";
-const itunesCache = new Map(); // key -> { ts, data }
+const itunesCache = new Map();
 const ITUNES_CACHE_MS = 5 * 60 * 1000;
 
 function cacheGet(key) {
@@ -356,15 +448,14 @@ async function searchITunesSmart(rawQuery) {
   return null;
 }
 
-/* ------------------------------ detect user choice (bài số 2 / chọn 1 / bài thứ hai) ------------------------------ */
+/* ------------------------------ detect user choice ------------------------------ */
 function detectSongChoice(text = "") {
   const t = stripDiacritics(text.toLowerCase());
 
-  // patterns: "bai so 2", "chon 1", "so 3", "bai thu hai", "bai dau tien"
   const m1 = t.match(/\b(bai\s*so|so|chon|chọn)\s*(\d)\b/);
   if (m1) {
     const n = parseInt(m1[2], 10);
-    if (n >= 1 && n <= 5) return n; // 1..5
+    if (n >= 1 && n <= 5) return n;
   }
 
   if (t.includes("bai dau tien") || t.includes("bai 1") || t.includes("bai thu nhat")) return 1;
@@ -381,10 +472,7 @@ function detectSongChoice(text = "") {
 ===========================================================================*/
 function isClapText(text = "") {
   const t = stripDiacritics(text.toLowerCase());
-  const keys = [
-    "clap", "applause", "hand clap", "clapping",
-    "vo tay", "vo tay", "tieng vo tay"
-  ];
+  const keys = ["clap", "applause", "hand clap", "clapping", "vo tay", "tieng vo tay"];
   return keys.some(k => t.includes(stripDiacritics(k)));
 }
 
@@ -412,8 +500,6 @@ function overrideLabelByText(label, text) {
    MEMORY: store last candidates per user (IP-based)
 ===========================================================================*/
 const lastMusicCandidatesByUser = new Map();
-// key -> { ts, candidates: [ {trackName, artistName, previewUrl, trackId, ...} ], originalQuery }
-
 const CANDIDATES_TTL_MS = 3 * 60 * 1000;
 
 function setLastCandidates(userKey, payload) {
@@ -626,7 +712,7 @@ Return JSON schema exactly:
 );
 
 /* ===========================================================================  
-   UPLOAD_AUDIO — STT → (Music / Chatbot) → TTS  
+   UPLOAD_AUDIO — STT → (Music / Chatbot) → VOICE (Eleven)
 ===========================================================================*/
 app.post(
   "/pi_upload_audio_v2",
@@ -714,7 +800,6 @@ app.post(
         const result = await searchITunesSmart(query);
 
         if (result?.candidates?.length) {
-          // store candidates for later selection
           setLastCandidates(userKey, {
             candidates: result.candidates.map(x => ({
               trackName: x.trackName,
@@ -727,13 +812,11 @@ app.post(
 
           const top = result.top;
 
-          // If you want immediate play top1 (current behavior):
           playbackUrl = await getMp3FromPreview(top.previewUrl);
           replyText = `Dạ, em mở bài "${top.trackName}" của ${top.artistName} cho anh nhé.`;
 
           mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
 
-          // Optional: publish candidates list for UI
           mqttClient.publish("robot/music_candidates", JSON.stringify({
             query,
             candidates: result.candidates.map((x, i) => ({
@@ -752,8 +835,6 @@ app.post(
 
       /* ===========================
          GPT (only if NOT playing music)
-         - If user already chose song, we already played.
-         - If user said "bài số 2" but no candidates, GPT should ask short.
       =========================== */
       const hasImage = !!imageFile?.buffer;
 
@@ -782,7 +863,6 @@ Nếu không chắc thì nói rõ không chắc.
           messages.push({ role: "system", content: `Robot long-term memory (recent):\n${memoryText}`.slice(0, 6000) });
         }
 
-        // if user tries to choose but no candidates cached
         if (choice && !last?.candidates?.length) {
           replyText = "Anh nói lại tên bài hoặc ca sĩ giúp em nha.";
         } else if (hasImage) {
@@ -815,21 +895,12 @@ Nếu không chắc thì nói rõ không chắc.
       }
 
       /* ===========================
-         TTS if not music playbackUrl
+         VOICE:
+         - Nếu playbackUrl đã có (nhạc iTunes) => giữ nguyên, không convert
+         - Nếu chưa có => convert replyText thành MP3 (Eleven)
       =========================== */
       if (!playbackUrl) {
-        const filename = `pi_v2_tts_${Date.now()}.mp3`;
-        const outPath = path.join(audioDir, filename);
-
-        const speech = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: "ballad",
-          format: "mp3",
-          input: replyText,
-        });
-
-        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
-        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+        playbackUrl = await textToSpeechMp3(replyText, "pi_v2");
       }
 
       /* ===========================
@@ -845,7 +916,6 @@ Nếu không chắc thì nói rõ không chắc.
         );
       }
 
-      // cleanup wav
       try { fs.unlinkSync(wavPath); } catch { }
 
       return res.json({
@@ -866,11 +936,8 @@ Nếu không chắc thì nói rõ không chắc.
 );
 
 /* ===========================================================================  
-   (Optional) Keep your old endpoints. Here I keep them but they will use the same smart search.
-   If you don't need them, you can remove to simplify.
+   /upload_audio (WebM->WAV)  — giữ endpoint cũ nhưng replyText -> Eleven
 ===========================================================================*/
-
-// web upload_audio (WebM->WAV)
 app.post(
   "/upload_audio",
   uploadLimiter,
@@ -945,19 +1012,9 @@ app.post(
         replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
       }
 
+      // If NOT music playbackUrl => convert replyText to MP3 (Eleven)
       if (!playbackUrl) {
-        const filename = `tts_${Date.now()}.mp3`;
-        const outPath = path.join(audioDir, filename);
-
-        const speech = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: "ballad",
-          format: "mp3",
-          input: replyText,
-        });
-
-        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
-        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+        playbackUrl = await textToSpeechMp3(replyText, "web");
       }
 
       if (["tien", "lui", "trai", "phai"].includes(label)) {
@@ -976,7 +1033,9 @@ app.post(
   }
 );
 
-// PI upload_audio (WAV already)
+/* ===========================================================================  
+   /pi_upload_audio (WAV already) — replyText -> Eleven
+===========================================================================*/
 app.post(
   "/pi_upload_audio",
   uploadLimiter,
@@ -1031,19 +1090,9 @@ app.post(
         replyText = completion.choices?.[0]?.message?.content || "Em chưa hiểu.";
       }
 
+      // If NOT music playbackUrl => convert replyText to MP3 (Eleven)
       if (!playbackUrl) {
-        const filename = `pi_tts_${Date.now()}.mp3`;
-        const outPath = path.join(audioDir, filename);
-
-        const speech = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: "ballad",
-          format: "mp3",
-          input: replyText,
-        });
-
-        fs.writeFileSync(outPath, Buffer.from(await speech.arrayBuffer()));
-        playbackUrl = `${getPublicHost()}/audio/${filename}`;
+        playbackUrl = await textToSpeechMp3(replyText, "pi");
       }
 
       if (["tien", "lui", "trai", "phai"].includes(label)) {
@@ -1124,6 +1173,7 @@ app.get("/", (req, res) => {
    START SERVER  
 ===========================================================================*/
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`🎵 iTunes region: country=${ITUNES_COUNTRY} lang=${ITUNES_LANG}`);
+  console.log(` Server listening on port ${PORT}`);
+  console.log(` iTunes region: country=${ITUNES_COUNTRY} lang=${ITUNES_LANG}`);
+  console.log(` Voice server: ${VOICE_SERVER_URL}`);
 });
