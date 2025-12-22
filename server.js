@@ -9,6 +9,7 @@
      (2) Better general-knowledge answers (avoid "không biết" too often)
    - CHANGE requested:
      ✅ Revert iTunes search to OLD stable version (limit=1, pick first)
+     ✅ If user only says song name (or GPT says "mở bài ...") -> auto label=nhac & search iTunes
 ===========================================================================*/
 
 import express from "express";
@@ -323,8 +324,12 @@ async function searchITunesOld(query) {
   url.searchParams.set("country", ITUNES_COUNTRY);
   if (ITUNES_LANG) url.searchParams.set("lang", ITUNES_LANG);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 7000);
+
   try {
-    const resp = await fetch(url.toString(), { timeout: 7000 });
+    const resp = await fetch(url.toString(), { signal: controller.signal });
+    clearTimeout(timer);
     if (!resp.ok) return null;
 
     const data = await resp.json();
@@ -332,6 +337,7 @@ async function searchITunesOld(query) {
     if (item?.previewUrl) return item;
     return null;
   } catch (e) {
+    clearTimeout(timer);
     console.error("iTunes search error:", e?.message || e);
     return null;
   }
@@ -360,8 +366,58 @@ async function getMp3FromPreview(previewUrl) {
 }
 
 /* ===========================================================================  
-   VISION GATING (keep)
+   VISION + MUSIC INTENT HELPERS (keep)
 ===========================================================================*/
+function isQuestionLike(text = "") {
+  const t = stripDiacritics(text.toLowerCase());
+  const q = ["la ai", "la gi", "cai gi", "vi sao", "tai sao", "o dau", "khi nao", "bao nhieu", "how", "what", "why", "where", "?"];
+  return q.some(k => t.includes(stripDiacritics(k)));
+}
+
+function inMusicContext(memoryArr = []) {
+  const last = memoryArr.slice(-3).map(m => stripDiacritics(String(m?.reply_text || "").toLowerCase()));
+  const keys = [
+    "noi lai ten bai", "ten bai", "ca si", "chon giup em so", "so 1 den 5",
+    "em mo bai", "em bat nhac", "em phat nhac", "itunes"
+  ];
+  return last.some(r => keys.some(k => r.includes(stripDiacritics(k))));
+}
+
+function looksLikeSongTitleOnly(userText = "") {
+  const t = (userText || "").trim();
+  if (!t) return false;
+
+  const nd = stripDiacritics(t.toLowerCase());
+  const banned = ["xoay", "qua", "ben", "tien", "lui", "trai", "phai", "dung", "stop"];
+  if (banned.some(k => nd.includes(k))) return false;
+
+  if (t.length > 45) return false;
+  if (isQuestionLike(t)) return false;
+
+  const hasWord = /[a-zA-Z0-9À-ỹ]/.test(t);
+  return hasWord;
+}
+
+// ✅ NEW: if GPT says "mở bài ...", parse song name
+function extractSongFromReply(replyText = "") {
+  const s = (replyText || "").trim();
+  if (!s) return null;
+
+  const nd = stripDiacritics(s.toLowerCase());
+  const triggers = ["em mo bai", "em bat bai", "em phat bai", "em mo nhac", "em bat nhac", "em phat nhac"];
+  if (!triggers.some(k => nd.includes(stripDiacritics(k)))) return null;
+
+  // quote first
+  let m = s.match(/[“"](.*?)[”"]/);
+  if (m && m[1]) return m[1].trim();
+
+  // fallback after "mở bài"
+  m = s.match(/mở bài\s+(.+?)(?:\s+của\s+|\s+cho\s+|\s+nha|\s+nhé|[.!?]|$)/i);
+  if (m && m[1]) return m[1].trim();
+
+  return null;
+}
+
 function wantsVision(text = "") {
   const t = stripDiacritics((text || "").toLowerCase());
   const triggers = [
@@ -436,7 +492,7 @@ function overrideLabelByText(label, text) {
 }
 
 /* ===========================================================================  
-   MEMORY: store last candidates per user (IP-based)  (keep)
+   MEMORY: store last candidates per user (IP-based)
 ===========================================================================*/
 const lastMusicCandidatesByUser = new Map();
 const CANDIDATES_TTL_MS = 3 * 60 * 1000;
@@ -693,18 +749,14 @@ app.post(
         console.log("🎤 PI_V2 STT:", text);
       } catch (e) {
         console.error("PI_V2 STT error:", e);
-        try {
-          fs.unlinkSync(wavPath);
-        } catch { }
+        try { fs.unlinkSync(wavPath); } catch { }
         return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null });
       }
 
       // clap short-circuit
       if (isClapText(text)) {
         console.log("👏 Detected CLAP by STT -> return label=clap");
-        try {
-          fs.unlinkSync(wavPath);
-        } catch { }
+        try { fs.unlinkSync(wavPath); } catch { }
         return res.json({ status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null, used_vision: false });
       }
 
@@ -712,6 +764,11 @@ app.post(
       const last = getLastCandidates(userKey);
 
       let label = overrideLabelByText("unknown", text);
+
+      // ✅ NEW: if in music context and user only says song title -> label=nhac
+      if (label !== "nhac" && inMusicContext(memoryArr) && looksLikeSongTitleOnly(text)) {
+        label = "nhac";
+      }
 
       let replyText = "";
       let playbackUrl = null;
@@ -728,7 +785,6 @@ app.post(
           replyText = `Dạ ok anh, em mở "${picked.trackName}" của ${picked.artistName} nha.`;
 
           mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-
           console.log("✅ USER CHOICE -> PLAY:", { choice, track: picked.trackName, artist: picked.artistName });
         }
       }
@@ -738,7 +794,6 @@ app.post(
       =========================== */
       if (!playbackUrl && label === "nhac") {
         const query = extractSongQuery(text) || text;
-
         const m = await searchITunesOld(query);
 
         // store last as a single candidate so "bài số 1" vẫn dùng được
@@ -836,6 +891,34 @@ QUY TẮC ẢNH:
 
           replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
         }
+
+        // ✅ NEW: if GPT already decided "mở bài ..." -> auto switch to music & search iTunes
+        if (!playbackUrl) {
+          const songFromReply = extractSongFromReply(replyText);
+          const candidateQuery =
+            songFromReply ||
+            ((inMusicContext(memoryArr) && looksLikeSongTitleOnly(text)) ? text : null);
+
+          if (candidateQuery) {
+            const q = extractSongQuery(candidateQuery) || candidateQuery;
+            const m = await searchITunesOld(q);
+
+            if (m?.previewUrl) {
+              label = "nhac";
+              playbackUrl = await getMp3FromPreview(m.previewUrl);
+              replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
+
+              setLastCandidates(userKey, {
+                candidates: [
+                  { trackName: m.trackName, artistName: m.artistName, previewUrl: m.previewUrl, trackId: m.trackId },
+                ],
+                originalQuery: q,
+              });
+
+              mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
+            }
+          }
+        }
       }
 
       /* ===========================
@@ -860,9 +943,7 @@ QUY TẮC ẢNH:
         );
       }
 
-      try {
-        fs.unlinkSync(wavPath);
-      } catch { }
+      try { fs.unlinkSync(wavPath); } catch { }
 
       return res.json({
         status: "ok",
@@ -891,9 +972,7 @@ app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res
     fs.writeFileSync(inputFile, req.file.buffer);
 
     if (req.file.buffer.length < 2000) {
-      try {
-        fs.unlinkSync(inputFile);
-      } catch { }
+      try { fs.unlinkSync(inputFile); } catch { }
       return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null });
     }
 
@@ -920,10 +999,7 @@ app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res
       text = (tr.text || "").trim();
     } catch (err) {
       console.error("STT error:", err);
-      try {
-        fs.unlinkSync(inputFile);
-        fs.unlinkSync(wavFile);
-      } catch { }
+      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
       return res.status(500).json({ error: "STT failed" });
     }
 
@@ -966,10 +1042,7 @@ app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res
       mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
     }
 
-    try {
-      fs.unlinkSync(inputFile);
-      fs.unlinkSync(wavFile);
-    } catch { }
+    try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
 
     res.json({ status: "ok", transcript: text, label, audio_url: playbackUrl });
   } catch (err) {
