@@ -20,7 +20,7 @@ import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import cors from "cors";
 import yts from "yt-search";
-import { spawn } from "child_process";
+import ytdlp from "yt-dlp-exec";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -79,70 +79,41 @@ function uploadLimiter(req, res, next) {
   next();
 }
 // support get mp3 from yt
-function run(cmd, args, { timeoutMs = 120000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
-
-    const timer = setTimeout(() => {
-      try { p.kill("SIGKILL"); } catch { }
-      reject(new Error(`Timeout: ${cmd} ${args.join(" ")}`));
-    }, timeoutMs);
-
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
-
-    p.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-
-    p.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) return resolve({ out, err });
-      reject(new Error(`Exit ${code}\nSTDERR:\n${err}\nSTDOUT:\n${out}`));
-    });
-  });
-}
-
-/**
- * Extract audio mp3 from a SOURCE YOU HAVE RIGHTS TO USE.
- * source: local file path OR URL (non-YouTube) that you have permission to download/convert.
- */
-export async function ytdlpExtractMp3Legal(source, outDir) {
-  if (!source) throw new Error("Missing source");
-  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+// ===== yt-dlp via yt-dlp-exec (no ENOENT) =====
+async function ytdlpExtractMp3FromYoutube(url, outDir) {
+  if (!url) throw new Error("Missing url");
+  fs.mkdirSync(outDir, { recursive: true });
 
   const ts = Date.now();
-  const outTemplate = path.join(outDir, `legal_${ts}.%(ext)s`);
+  const outTemplate = path.join(outDir, `yt_${ts}.%(ext)s`);
 
-  // -x: extract audio
-  // --audio-format mp3: output mp3 (requires ffmpeg)
-  // -o: output template
-  // --no-playlist: avoid playlists
+  // IMPORTANT: yt-dlp needs ffmpeg to convert to mp3
+  // ffmpegPath is from "ffmpeg-static"
   const args = [
     "--no-playlist",
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "0",
+    "--ffmpeg-location", ffmpegPath,
     "-o", outTemplate,
-    source
+    url
   ];
 
-  await run("yt-dlp", args, { timeoutMs: 180000 });
+  // ytdlp-exec usage: ytdlp(rawArgsArray, options)
+  // (We pass raw args array to avoid option mapping confusion)
+  await ytdlp(args, {
+    timeout: 180000,
+    stdio: "pipe",
+  });
 
-  // Find the produced mp3
-  const mp3Path = path.join(outDir, `legal_${ts}.mp3`);
-  if (!fs.existsSync(mp3Path)) {
-    // Sometimes ext naming differs; do a quick scan:
-    const files = fs.readdirSync(outDir).filter(f => f.startsWith(`legal_${ts}.`));
-    const mp3 = files.find(f => f.endsWith(".mp3"));
-    if (!mp3) throw new Error("MP3 not found after yt-dlp run");
-    return path.join(outDir, mp3);
-  }
-  return mp3Path;
+  // find produced mp3
+  const files = fs.readdirSync(outDir).filter(f => f.startsWith(`yt_${ts}.`));
+  const mp3 = files.find(f => f.endsWith(".mp3"));
+  if (!mp3) throw new Error("MP3 not found after yt-dlp run");
+
+  return path.join(outDir, mp3);
 }
+
 
 /* ===========================================================================  
    STATIC  
@@ -716,6 +687,7 @@ app.post(
           const replyText = `Dạ, em mở YouTube: "${play.title}" nha.`;
           const mp3Path = await ytdlpExtractMp3Legal(play?.url, audioDir);
           const filename = path.basename(mp3Path);
+          const audio_url = `${getPublicHost()}/audio/${filename}`;
           // optional MQTT broadcast
           mqttClient.publish(
             "robot/music",
@@ -728,8 +700,8 @@ app.post(
             transcript: text,
             label: "nhac",
             reply_text: replyText,
-            audio_url: `/audio/${filename}`,
-            play,
+            audio_url,
+            play: null,
             used_vision: false,
           });
         }
@@ -852,6 +824,21 @@ QUY TẮC ẢNH:
   }
 );
 
+app.get("/test_ytdlp", async (req, res) => {
+  try {
+    const url = (req.query.url || "").toString().trim();
+    if (!url) return res.status(400).json({ error: "Missing ?url=" });
+
+    const mp3Path = await ytdlpExtractMp3FromYoutube(url, audioDir);
+    const filename = path.basename(mp3Path);
+    const audio_url = `${getPublicHost()}/audio/${filename}`;
+
+    res.json({ ok: true, filename, audio_url });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 /* ===========================================================================  
    web upload_audio (WebM->WAV) — minimal, still works
 ===========================================================================*/
@@ -910,7 +897,8 @@ app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res
       if (play?.url) {
         const mp3Path1 = await ytdlpExtractMp3Legal(play?.url, audioDir);
         const filename1 = path.basename(mp3Path1);
-        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: `/audio/${filename1}`, play });
+        const audio_url1 = `${getPublicHost()}/audio/${filename1}`;
+        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: audio_url1, play });
       }
       const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
       const audio_url = await textToSpeechMp3(replyText, "yt_fail_web");
