@@ -28,7 +28,6 @@
   "mqtt": "^5.3.0",
   "node-fetch": "^3.3.2",
   "openai": "^4.54.0",
-  "yt-search": "^2.12.1",
-  "yt-dlp-exec": "github:microlinkhq/yt-dlp-exec"
+  "yt-search": "^2.12.1"
   }
 }

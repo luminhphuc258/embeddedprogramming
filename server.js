@@ -1,7 +1,7 @@
 /* ===========================================================================
    Matthew Robot — Node.js Server (Chatbot + YouTube + Auto Navigation)
    - STT + ChatGPT -> TTS (Eleven WAV server -> MP3, fallback OpenAI TTS)
-   - MUSIC: YouTube search (yt-search) -> return `play` field for client
+   - MUSIC: YouTube search (yt-search) -> yt-dlp extract mp3 -> return audio_url (NO VIDEO)
    - Vision only when user asks
    - Label override + scan endpoints + camera rotate
    - NO iTunes code
@@ -20,7 +20,7 @@ import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import cors from "cors";
 import yts from "yt-search";
-import ytdlp from "yt-dlp-exec";
+import { spawn } from "child_process";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -30,12 +30,13 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "3mb" }));
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const audioDir = path.join(__dirname, "public/audio");
+const publicDir = path.join(__dirname, "public");
+const audioDir = path.join(publicDir, "audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
 /* ===========================================================================  
@@ -78,8 +79,55 @@ function uploadLimiter(req, res, next) {
   requestLimitMap[ip].push(now);
   next();
 }
-// support get mp3 from yt
-// ===== yt-dlp via yt-dlp-exec (no ENOENT) =====
+
+/* ===========================================================================  
+   RUN helper (spawn)
+===========================================================================*/
+function run(cmd, args, { timeoutMs = 180000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+
+    const timer = setTimeout(() => {
+      try { p.kill("SIGKILL"); } catch { }
+      reject(new Error(`Timeout: ${cmd} ${args.join(" ")}`));
+    }, timeoutMs);
+
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`Exit ${code}\nSTDERR:\n${err}\nSTDOUT:\n${out}`));
+    });
+  });
+}
+
+/* ===========================================================================  
+   yt-dlp (binary) -> mp3
+   NOTE: This expects yt-dlp is installed in Docker (pip install yt-dlp).
+===========================================================================*/
+const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+
+async function checkYtdlpReady() {
+  try {
+    const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
+    console.log("✅ yt-dlp ready:", out.trim());
+    return true;
+  } catch (e) {
+    console.error("❌ yt-dlp not found/failed:", e?.message || e);
+    return false;
+  }
+}
+
+/** Extract mp3 from YouTube URL into audioDir, return absolute mp3 filepath */
 async function ytdlpExtractMp3FromYoutube(url, outDir) {
   if (!url) throw new Error("Missing url");
   fs.mkdirSync(outDir, { recursive: true });
@@ -87,8 +135,6 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
   const ts = Date.now();
   const outTemplate = path.join(outDir, `yt_${ts}.%(ext)s`);
 
-  // IMPORTANT: yt-dlp needs ffmpeg to convert to mp3
-  // ffmpegPath is from "ffmpeg-static"
   const args = [
     "--no-playlist",
     "-x",
@@ -96,24 +142,16 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
     "--audio-quality", "0",
     "--ffmpeg-location", ffmpegPath,
     "-o", outTemplate,
-    url
+    url,
   ];
 
-  // ytdlp-exec usage: ytdlp(rawArgsArray, options)
-  // (We pass raw args array to avoid option mapping confusion)
-  await ytdlp(args, {
-    timeout: 180000,
-    stdio: "pipe",
-  });
+  await run(YTDLP_BIN, args, { timeoutMs: 220000 });
 
-  // find produced mp3
   const files = fs.readdirSync(outDir).filter(f => f.startsWith(`yt_${ts}.`));
   const mp3 = files.find(f => f.endsWith(".mp3"));
   if (!mp3) throw new Error("MP3 not found after yt-dlp run");
-
   return path.join(outDir, mp3);
 }
-
 
 /* ===========================================================================  
    STATIC  
@@ -400,20 +438,15 @@ function shouldAutoSwitchToMusic(text = "") {
 
 function detectStopPlayback(text = "") {
   const t = stripDiacritics((text || "").toLowerCase()).trim();
-
-  // Match theo CỤM và theo word-boundary để tránh dính "tím" -> "tim"
   const patterns = [
     /\b(tat|tat\s*di|tat\s*giup|tắt|tắt\s*đi|tắt\s*giúp)\s*(nhac|nhạc|music|video)\b/u,
     /\b(dung|dung\s*lai|dung\s*di|dừng|dừng\s*lại|dừng\s*đi)\s*(nhac|nhạc|music|video)\b/u,
     /\b(stop|stop\s*now|stop\s*it)\b/u,
     /\b(skip|bo\s*qua|bỏ\s*qua)\b/u,
-    // nếu bạn vẫn muốn “im đi” thì match nguyên cụm (KHÔNG match "im")
     /\b(im\s*di|im\s*đi)\b/u,
   ];
-
   return patterns.some((re) => re.test(t));
 }
-
 
 /* ===========================================================================  
    YouTube search (yt-search) -> TOP 1
@@ -428,14 +461,10 @@ async function searchYouTubeTop1(query) {
     if (!v?.url) return null;
 
     return {
-      type: "youtube",
       url: v.url,
       title: v.title || "",
-      thumbnail: v.thumbnail || (v.image || ""),
-      duration: v.timestamp || "",
       seconds: typeof v.seconds === "number" ? v.seconds : null,
       author: v.author?.name || "",
-      views: typeof v.views === "number" ? v.views : null,
     };
   } catch (e) {
     console.error("YouTube search error:", e?.message || e);
@@ -467,7 +496,7 @@ function overrideLabelByText(label, text) {
 }
 
 /* ===========================================================================  
-   clap detect by STT text (as bạn đang dùng)
+   clap detect by STT text
 ===========================================================================*/
 function isClapText(text = "") {
   const t = stripDiacritics(text.toLowerCase());
@@ -559,7 +588,6 @@ Return JSON schema exactly:
       if (m) { try { plan = JSON.parse(m[0]); } catch { } }
     }
 
-    // fallback
     const fallbackCenter = typeof corridorCenterX === "number" ? corridorCenterX : Math.floor(roiW / 2);
     const fallbackBest = typeof localBest === "number" ? localBest : 4;
     const fallbackPoly = (() => {
@@ -585,9 +613,7 @@ Return JSON schema exactly:
     if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
     if (!Array.isArray(plan.walkway_poly)) plan.walkway_poly = fallbackPoly;
 
-    if (typeof plan.walkway_center_x !== "number") {
-      plan.walkway_center_x = fallbackCenter;
-    }
+    if (typeof plan.walkway_center_x !== "number") plan.walkway_center_x = fallbackCenter;
     plan.walkway_center_x = Math.max(0, Math.min(roiW - 1, Number(plan.walkway_center_x)));
     plan.n_obstacles = plan.obstacles.length;
     if (typeof plan.confidence !== "number") plan.confidence = 0.4;
@@ -656,7 +682,7 @@ app.post(
 
       // stop playback intent
       if (detectStopPlayback(text)) {
-        const replyText = "Dạ, em tắt nhạc / video nha.";
+        const replyText = "Dạ, em tắt nhạc nha.";
         const audio_url = await textToSpeechMp3(replyText, "stop");
         return res.json({
           status: "ok",
@@ -664,34 +690,33 @@ app.post(
           label: "stop_playback",
           reply_text: replyText,
           audio_url,
-          play: { type: "stop" },
+          play: null,
           used_vision: false,
         });
       }
 
       // label detect + AUTO SWITCH to MUSIC
       let label = overrideLabelByText("unknown", text);
-      if (label !== "nhac" && shouldAutoSwitchToMusic(text)) {
-        label = "nhac";
-      }
+      if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC (YouTube)
+      // MUSIC (YouTube -> MP3)
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
-        const play = await searchYouTubeTop1(q);
-        console.log(" MUSIC from youtube info:", { text, q, found: !!play?.url, url: play?.url });
+        const top = await searchYouTubeTop1(q);
+        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url });
 
-        if (play?.url) {
-          const replyText = `Dạ, em mở YouTube: "${play.title}" nha.`;
-          const mp3Path = await ytdlpExtractMp3Legal(play?.url, audioDir);
+        if (top?.url) {
+          const replyText = `Dạ, em mở "${top.title}" nha.`;
+
+          const mp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
           const filename = path.basename(mp3Path);
           const audio_url = `${getPublicHost()}/audio/${filename}`;
-          // optional MQTT broadcast
+
           mqttClient.publish(
             "robot/music",
-            JSON.stringify({ label: "nhac", text: replyText, play, user: userKey }),
+            JSON.stringify({ label: "nhac", text: replyText, audio_url, user: userKey }),
             { qos: 1 }
           );
 
@@ -801,7 +826,6 @@ QUY TẮC ẢNH:
 
       const audio_url = await textToSpeechMp3(replyText, "pi_v2");
 
-      // optional MQTT broadcast for voice reply
       mqttClient.publish(
         "robot/music",
         JSON.stringify({ audio_url, text: replyText, label, user: userKey }),
@@ -824,6 +848,18 @@ QUY TẮC ẢNH:
   }
 );
 
+/* ===========================================================================  
+   Debug: test yt-dlp
+===========================================================================*/
+app.get("/debug_ytdlp", async (req, res) => {
+  try {
+    const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
+    return res.json({ ok: true, ytdlp: out.trim(), ffmpeg_static: !!ffmpegPath });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 app.get("/test_ytdlp", async (req, res) => {
   try {
     const url = (req.query.url || "").toString().trim();
@@ -836,158 +872,6 @@ app.get("/test_ytdlp", async (req, res) => {
     res.json({ ok: true, filename, audio_url });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-/* ===========================================================================  
-   web upload_audio (WebM->WAV) — minimal, still works
-===========================================================================*/
-app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
-
-    const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
-    fs.writeFileSync(inputFile, req.file.buffer);
-
-    if (req.file.buffer.length < 2000) {
-      try { fs.unlinkSync(inputFile); } catch { }
-      return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null, play: null });
-    }
-
-    const wavFile = inputFile.replace(".webm", ".wav");
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputFile)
-        .inputOptions("-fflags +genpts")
-        .outputOptions("-vn")
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(16000)
-        .on("error", reject)
-        .on("end", resolve)
-        .save(wavFile);
-    });
-
-    let text = "";
-    try {
-      const tr = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: "gpt-4o-mini-transcribe",
-      });
-      text = (tr.text || "").trim();
-    } catch (err) {
-      console.error("STT error:", err);
-      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-      return res.status(500).json({ error: "STT failed" });
-    } finally {
-      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-    }
-
-    if (detectStopPlayback(text)) {
-      const replyText = "Dạ, em tắt nhạc / video nha.";
-      const audio_url = await textToSpeechMp3(replyText, "stop_web");
-      return res.json({ status: "ok", transcript: text, label: "stop_playback", reply_text: replyText, audio_url, play: { type: "stop" } });
-    }
-
-    let label = overrideLabelByText("unknown", text);
-    if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
-
-    if (label === "nhac") {
-      const q = extractSongQuery(text) || text;
-      const play = await searchYouTubeTop1(q);
-      if (play?.url) {
-        const mp3Path1 = await ytdlpExtractMp3Legal(play?.url, audioDir);
-        const filename1 = path.basename(mp3Path1);
-        const audio_url1 = `${getPublicHost()}/audio/${filename1}`;
-        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: audio_url1, play });
-      }
-      const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
-      const audio_url = await textToSpeechMp3(replyText, "yt_fail_web");
-      return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url, play: null });
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn, dễ hiểu. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-        { role: "user", content: text },
-      ],
-      temperature: 0.25,
-      max_tokens: 260,
-    });
-
-    const replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
-    const audio_url = await textToSpeechMp3(replyText, "web");
-
-    res.json({ status: "ok", transcript: text, label, reply_text: replyText, audio_url, play: null });
-  } catch (err) {
-    console.error("upload_audio error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ===========================================================================  
-   PI upload_audio (WAV) — minimal, still works
-===========================================================================*/
-app.post("/pi_upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
-
-    const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
-    fs.writeFileSync(wavFile, req.file.buffer);
-
-    let text = "";
-    try {
-      const tr = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: "gpt-4o-mini-transcribe",
-      });
-      text = (tr.text || "").trim();
-      console.log("🎤 PI STT:", text);
-    } catch (err) {
-      console.error("PI STT error:", err);
-      try { fs.unlinkSync(wavFile); } catch { }
-      return res.json({ status: "error", text: "", label: "unknown", audio_url: null, play: null });
-    } finally {
-      try { fs.unlinkSync(wavFile); } catch { }
-    }
-
-    if (detectStopPlayback(text)) {
-      const replyText = "Dạ, em tắt nhạc / video nha.";
-      const audio_url = await textToSpeechMp3(replyText, "stop_pi");
-      return res.json({ status: "ok", text, label: "stop_playback", reply_text: replyText, audio_url, play: { type: "stop" } });
-    }
-
-    let label = overrideLabelByText("unknown", text);
-    if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
-
-    if (label === "nhac") {
-      const q = extractSongQuery(text) || text;
-      const play = await searchYouTubeTop1(q);
-      if (play?.url) {
-        return res.json({ status: "ok", text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: null, play });
-      }
-      const replyText = "Em không tìm thấy bài trên YouTube.";
-      const audio_url = await textToSpeechMp3(replyText, "yt_fail_pi");
-      return res.json({ status: "ok", text, label: "nhac", reply_text: replyText, audio_url, play: null });
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-        { role: "user", content: text },
-      ],
-      temperature: 0.25,
-      max_tokens: 260,
-    });
-
-    const replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu.";
-    const audio_url = await textToSpeechMp3(replyText, "pi");
-
-    res.json({ status: "ok", text, label, reply_text: replyText, audio_url, play: null });
-  } catch (err) {
-    console.error("pi_upload_audio error:", err);
-    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1047,13 +931,14 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube-only)");
+  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 only)");
 });
 
 /* ===========================================================================  
    START SERVER
 ===========================================================================*/
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Server listening on port ${PORT}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
+  await checkYtdlpReady();
 });

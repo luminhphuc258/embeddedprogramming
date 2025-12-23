@@ -1,18 +1,26 @@
-# ===== Base image =====
 FROM node:20-alpine
 
-# ===== Set working directory =====
 WORKDIR /app
 
-# ===== Copy package files and install dependencies =====
-COPY package*.json ./
-RUN npm install --production
+# 1) Cài system deps: git (để npm install không bị spawn git ENOENT),
+#    ffmpeg (yt-dlp extract mp3 cần), python/pip (để cài yt-dlp)
+RUN apk add --no-cache \
+  git \
+  ffmpeg \
+  python3 \
+  py3-pip \
+  ca-certificates \
+  && pip3 install --no-cache-dir -U yt-dlp
 
-# ===== Copy source code =====
+# 2) Install node deps
+COPY package*.json ./
+# npm mới khuyên dùng --omit=dev thay vì --production
+RUN npm ci --omit=dev
+
+# 3) Copy code
 COPY . .
 
-# ===== Expose port =====
-EXPOSE 3000
+# 4) Port: phải khớp với server bạn đang dùng (thường 8080)
+EXPOSE 8080
 
-# ===== Start the app =====
 CMD ["node", "server.js"]
