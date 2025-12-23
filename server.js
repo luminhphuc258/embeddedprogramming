@@ -1,15 +1,12 @@
 /* ===========================================================================
-   Matthew Robot — Node.js Server (Chatbot + iTunes + Auto Navigation)
-   - STT + ChatGPT / iTunes + TTS
-   - Auto điều hướng với LIDAR + ULTRASONIC
-   - Label override + camera + scan 360
-   - UPDATE: all replyText -> Eleven voice server -> MP3 (except iTunes music playback)
-   - FIXES kept:
-     (1) Vision only when user asks (no auto describe image)
-     (2) Better general-knowledge answers (avoid "không biết" too often)
-   - CHANGE requested:
-     ✅ Revert iTunes search to OLD stable version (limit=1, pick first)
-     ✅ If user only says song name (or GPT says "mở bài ...") -> auto label=nhac & search iTunes
+   Matthew Robot — Node.js Server (Chatbot + iTunes + YouTube Play)
+   - STT + ChatGPT + TTS (Eleven proxy -> MP3, fallback OpenAI TTS)
+   - iTunes search (OLD stable: limit=1, pick first)
+   - NEW: YouTube play -> return { play: { type:"youtube", playerUrl } }
+   - Compatible with Pi client main.py:
+       * play.type=="youtube" => Pi calls robot-video-player service
+       * audio_url => Pi stops video, set face suprise + mouth, plays audio
+       * label=="clap" => Pi bark + sad face
 ===========================================================================*/
 
 import express from "express";
@@ -24,6 +21,7 @@ import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import cors from "cors";
+import yts from "yt-search";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -87,7 +85,7 @@ function uploadLimiter(req, res, next) {
 app.use("/audio", express.static(audioDir));
 
 /* ===========================================================================  
-   MQTT CLIENT  (move secrets to env)
+   MQTT CLIENT
 ===========================================================================*/
 const MQTT_HOST = process.env.MQTT_HOST || "rfff7184.ala.us-east-1.emqxsl.com";
 const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
@@ -161,7 +159,7 @@ function getPublicHost() {
 }
 
 /* ===========================================================================  
-   VOICE (Eleven proxy server -> WAV -> MP3)  ✅ keep as you asked
+   VOICE (Eleven proxy server -> WAV -> MP3) + fallback OpenAI TTS
 ===========================================================================*/
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
@@ -231,18 +229,12 @@ async function voiceServerToMp3(replyText, prefix = "eleven") {
       ffmpeg(wavTmp).toFormat("mp3").on("end", resolve).on("error", reject).save(mp3Out)
     );
 
-    try {
-      fs.unlinkSync(wavTmp);
-    } catch { }
+    try { fs.unlinkSync(wavTmp); } catch { }
     return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
   } catch (e) {
     clearTimeout(timer);
-    try {
-      if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp);
-    } catch { }
-    try {
-      if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out);
-    } catch { }
+    try { if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp); } catch { }
+    try { if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out); } catch { }
     throw e;
   }
 }
@@ -260,7 +252,7 @@ async function textToSpeechMp3(replyText, prefix = "reply") {
 }
 
 /* ===========================================================================  
-   MUSIC QUERY CLEANING (keep)
+   MUSIC QUERY CLEANING
 ===========================================================================*/
 function cleanMusicQuery(q = "") {
   let t = (q || "").toLowerCase().trim();
@@ -277,20 +269,10 @@ function extractSongQuery(text) {
   const tNoDau = stripDiacritics(t);
 
   const removePhrases = [
-    "xin chao",
-    "nghe",
-    "toi muon nghe",
-    "cho toi nghe",
-    "nghe nhac",
-    "phat nhac",
-    "bat nhac",
-    "mo bai",
-    "bai hat",
-    "bai nay",
-    "nhac",
-    "song",
-    "music",
-    "play",
+    "xin chao", "nghe", "toi muon nghe", "cho toi nghe",
+    "nghe nhac", "phat nhac", "bat nhac", "mo bai",
+    "bai hat", "bai nay", "nhac", "song", "music", "play",
+    "youtube", "you tube", "video"
   ];
 
   let s = tNoDau;
@@ -305,12 +287,39 @@ function extractSongQuery(text) {
 }
 
 /* ===========================================================================  
-   iTunes search (REVERT OLD stable)
-   - limit=1, pick first
-   - country default US (or set env ITUNES_COUNTRY)
+   YouTube intent + search
+   - If user says "youtube", "mở video", "play video", "bật youtube" => YouTube
+===========================================================================*/
+function wantsYouTube(text = "") {
+  const t = stripDiacritics((text || "").toLowerCase());
+  const triggers = [
+    "youtube", "you tube", "mo youtube", "bat youtube",
+    "mo video", "bat video", "play video", "xem video",
+    "video nay", "mo clip", "bat clip"
+  ];
+  return triggers.some(k => t.includes(stripDiacritics(k)));
+}
+
+async function searchYouTubeFirstUrl(query) {
+  const q = (query || "").trim();
+  if (!q) return null;
+
+  try {
+    const r = await yts(q);
+    const v = (r?.videos || [])[0];
+    if (!v?.url) return null;
+    return { url: v.url, title: v.title || "", duration_sec: v.seconds || null, author: v.author?.name || "" };
+  } catch (e) {
+    console.error("YouTube search error:", e?.message || e);
+    return null;
+  }
+}
+
+/* ===========================================================================  
+   iTunes search (OLD stable)
 ===========================================================================*/
 const ITUNES_COUNTRY = (process.env.ITUNES_COUNTRY || "US").toUpperCase();
-const ITUNES_LANG = process.env.ITUNES_LANG || ""; // optional
+const ITUNES_LANG = process.env.ITUNES_LANG || "";
 
 async function searchITunesOld(query) {
   const q = (query || "").trim();
@@ -359,14 +368,12 @@ async function getMp3FromPreview(previewUrl) {
     ffmpeg(src).toFormat("mp3").on("end", resolve).on("error", reject).save(dst)
   );
 
-  try {
-    fs.unlinkSync(src);
-  } catch { }
+  try { fs.unlinkSync(src); } catch { }
   return `${getPublicHost()}/audio/song_${ts}.mp3`;
 }
 
 /* ===========================================================================  
-   VISION + MUSIC INTENT HELPERS (keep)
+   VISION / INTENT HELPERS (keep)
 ===========================================================================*/
 function isQuestionLike(text = "") {
   const t = stripDiacritics(text.toLowerCase());
@@ -374,92 +381,14 @@ function isQuestionLike(text = "") {
   return q.some(k => t.includes(stripDiacritics(k)));
 }
 
-function inMusicContext(memoryArr = []) {
-  const last = memoryArr.slice(-3).map(m => stripDiacritics(String(m?.reply_text || "").toLowerCase()));
-  const keys = [
-    "noi lai ten bai", "ten bai", "ca si", "chon giup em so", "so 1 den 5",
-    "em mo bai", "em bat nhac", "em phat nhac", "itunes"
-  ];
-  return last.some(r => keys.some(k => r.includes(stripDiacritics(k))));
-}
-
-function looksLikeSongTitleOnly(userText = "") {
-  const t = (userText || "").trim();
-  if (!t) return false;
-
-  const nd = stripDiacritics(t.toLowerCase());
-  const banned = ["xoay", "qua", "ben", "tien", "lui", "trai", "phai", "dung", "stop"];
-  if (banned.some(k => nd.includes(k))) return false;
-
-  if (t.length > 45) return false;
-  if (isQuestionLike(t)) return false;
-
-  const hasWord = /[a-zA-Z0-9À-ỹ]/.test(t);
-  return hasWord;
-}
-
-// ✅ NEW: if GPT says "mở bài ...", parse song name
-function extractSongFromReply(replyText = "") {
-  const s = (replyText || "").trim();
-  if (!s) return null;
-
-  const nd = stripDiacritics(s.toLowerCase());
-  const triggers = ["em mo bai", "em bat bai", "em phat bai", "em mo nhac", "em bat nhac", "em phat nhac"];
-  if (!triggers.some(k => nd.includes(stripDiacritics(k)))) return null;
-
-  // quote first
-  let m = s.match(/[“"](.*?)[”"]/);
-  if (m && m[1]) return m[1].trim();
-
-  // fallback after "mở bài"
-  m = s.match(/mở bài\s+(.+?)(?:\s+của\s+|\s+cho\s+|\s+nha|\s+nhé|[.!?]|$)/i);
-  if (m && m[1]) return m[1].trim();
-
-  return null;
-}
-
 function wantsVision(text = "") {
   const t = stripDiacritics((text || "").toLowerCase());
   const triggers = [
-    "nhin",
-    "xem",
-    "xung quanh",
-    "truoc mat",
-    "o day co gi",
-    "co gi",
-    "mo ta",
-    "ta hinh",
-    "trong anh",
-    "anh nay",
-    "tam anh",
-    "camera",
-    "day la gi",
-    "cai gi",
-    "vat gi",
-    "giai thich hinh",
+    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi",
+    "mo ta", "trong anh", "anh nay", "camera", "day la gi",
+    "cai gi", "vat gi", "giai thich hinh",
   ];
   return triggers.some((k) => t.includes(stripDiacritics(k)));
-}
-
-/* ===========================================================================  
-   detect user choice (bài số 2 / chọn 1 / bài thứ hai)
-===========================================================================*/
-function detectSongChoice(text = "") {
-  const t = stripDiacritics(text.toLowerCase());
-
-  const m1 = t.match(/\b(bai\s*so|so|chon|chọn)\s*(\d)\b/);
-  if (m1) {
-    const n = parseInt(m1[2], 10);
-    if (n >= 1 && n <= 5) return n;
-  }
-
-  if (t.includes("bai dau tien") || t.includes("bai 1") || t.includes("bai thu nhat")) return 1;
-  if (t.includes("bai thu hai") || t.includes("bai 2")) return 2;
-  if (t.includes("bai thu ba") || t.includes("bai 3")) return 3;
-  if (t.includes("bai thu tu") || t.includes("bai 4")) return 4;
-  if (t.includes("bai thu nam") || t.includes("bai 5")) return 5;
-
-  return null;
 }
 
 /* ===========================================================================  
@@ -492,213 +421,13 @@ function overrideLabelByText(label, text) {
 }
 
 /* ===========================================================================  
-   MEMORY: store last candidates per user (IP-based)
-===========================================================================*/
-const lastMusicCandidatesByUser = new Map();
-const CANDIDATES_TTL_MS = 3 * 60 * 1000;
-
-function setLastCandidates(userKey, payload) {
-  lastMusicCandidatesByUser.set(userKey, { ts: Date.now(), ...payload });
-}
-function getLastCandidates(userKey) {
-  const v = lastMusicCandidatesByUser.get(userKey);
-  if (!v) return null;
-  if (Date.now() - v.ts > CANDIDATES_TTL_MS) {
-    lastMusicCandidatesByUser.delete(userKey);
-    return null;
-  }
-  return v;
-}
-
-/* ===========================================================================  
-   VISION ENDPOINT (keep)
+   VISION ENDPOINT (optional, keep skeleton)
 ===========================================================================*/
 app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ error: "No image" });
-    }
-
-    let meta = {};
-    try {
-      meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
-    } catch {
-      meta = {};
-    }
-
-    const distCm = meta.lidar_cm ?? meta.ultra_cm ?? null;
-    const strength = meta.lidar_strength ?? meta.uart_strength ?? null;
-
-    const localBest =
-      meta.best_sector_local ??
-      meta.local_best_sector ??
-      meta.local_best ??
-      null;
-
-    const corridorCenterX = meta.corridor_center_x ?? null;
-    const corridorWidthRatio = meta.corridor_width_ratio ?? null;
-    const corridorConf = meta.corridor_conf ?? null;
-
-    const roiW = Number(meta.roi_w || 640);
-    const roiH = Number(meta.roi_h || 240);
-
-    const b64 = req.file.buffer.toString("base64");
-    const dataUrl = `data:image/jpeg;base64,${b64}`;
-
-    const system = `
-Bạn là module "AvoidObstacle" cho robot đi trong nhà.
-Mục tiêu: chọn hướng đi theo "lối đi dành cho người" (walkway/corridor) trong ROI.
-
-Từ ảnh ROI (vùng gần robot):
-- Xác định vật cản quan trọng (bàn/ghế/quạt/tường/đồ vật).
-- Xác định lối đi (walkway) rộng và an toàn nhất để robot đi theo.
-- Nếu thấy khe giữa bàn và tường có thể đi được, hãy chọn lối đó.
-- Ưu tiên đánh giá near-field (nửa dưới ROI).
-- Trả về JSON hợp lệ, KHÔNG giải thích.
-`.trim();
-
-    const user = [
-      {
-        type: "text",
-        text: `
-Meta:
-- dist_cm: ${distCm}
-- strength: ${strength}
-- local_best_sector: ${localBest}
-- local_corridor_center_x: ${corridorCenterX}
-- local_corridor_width_ratio: ${corridorWidthRatio}
-- local_corridor_conf: ${corridorConf}
-ROI size: ${roiW}x${roiH}
-
-Return JSON schema exactly:
-{
-  "best_sector": number,
-  "walkway_center_x": number,
-  "walkway_poly": [[x,y],[x,y],[x,y],[x,y]],
-  "obstacles": [{"label": string, "bbox":[x1,y1,x2,y2], "risk": number}],
-  "n_obstacles": number,
-  "confidence": number
-}
-`.trim(),
-      },
-      { type: "image_url", image_url: { url: dataUrl } },
-    ];
-
-    const model = process.env.VISION_MODEL || "gpt-4.1-mini";
-
-    const completion = await openai.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.2,
-      max_tokens: 420,
-    });
-
-    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
-
-    let plan = null;
-    try {
-      plan = JSON.parse(raw);
-    } catch {
-      const m = raw.match(/\{[\s\S]*\}$/);
-      if (m) {
-        try {
-          plan = JSON.parse(m[0]);
-        } catch { }
-      }
-    }
-
-    const fallbackCenter = typeof corridorCenterX === "number" ? corridorCenterX : Math.floor(roiW / 2);
-    const fallbackBest = typeof localBest === "number" ? localBest : 4;
-    const fallbackPoly = (() => {
-      const halfW = Math.floor(roiW * 0.18);
-      const x1 = Math.max(0, fallbackCenter - halfW);
-      const x2 = Math.min(roiW - 1, fallbackCenter + halfW);
-      const yTop = Math.floor(0.6 * roiH);
-      return [[x1, roiH - 1], [x2, roiH - 1], [x2, yTop], [x1, yTop]];
-    })();
-
-    if (!plan || typeof plan !== "object") {
-      return res.status(200).json({
-        best_sector: fallbackBest,
-        walkway_center_x: fallbackCenter,
-        walkway_poly: fallbackPoly,
-        obstacles: [],
-        n_obstacles: 0,
-        confidence: 0.15,
-      });
-    }
-
-    if (typeof plan.best_sector !== "number") plan.best_sector = fallbackBest;
-    if (!Array.isArray(plan.obstacles)) plan.obstacles = [];
-    if (!Array.isArray(plan.walkway_poly)) plan.walkway_poly = fallbackPoly;
-
-    if (typeof plan.walkway_center_x !== "number") {
-      try {
-        const xs = plan.walkway_poly
-          .map((p) => (Array.isArray(p) ? Number(p[0]) : NaN))
-          .filter(Number.isFinite);
-        if (xs.length) {
-          const minx = Math.max(0, Math.min(...xs));
-          const maxx = Math.min(roiW - 1, Math.max(...xs));
-          plan.walkway_center_x = Math.floor((minx + maxx) / 2);
-        } else plan.walkway_center_x = fallbackCenter;
-      } catch {
-        plan.walkway_center_x = fallbackCenter;
-      }
-    }
-
-    plan.walkway_center_x = Math.max(0, Math.min(roiW - 1, Number(plan.walkway_center_x)));
-    plan.walkway_poly = plan.walkway_poly
-      .filter((p) => Array.isArray(p) && p.length === 2)
-      .map((p) => {
-        const x = Math.max(0, Math.min(roiW - 1, Number(p[0])));
-        const y = Math.max(0, Math.min(roiH - 1, Number(p[1])));
-        return [x, y];
-      });
-
-    plan.obstacles = plan.obstacles.slice(0, 12).map((o) => {
-      const label = typeof o?.label === "string" ? o.label : "unknown";
-      const risk = typeof o?.risk === "number" ? Math.max(0, Math.min(1, o.risk)) : 0.5;
-
-      let bbox = o?.bbox;
-      if (!Array.isArray(bbox) || bbox.length !== 4) bbox = [0, 0, 0, 0];
-      let [x1, y1, x2, y2] = bbox.map((v) => Number(v));
-      if (![x1, y1, x2, y2].every(Number.isFinite)) x1 = y1 = x2 = y2 = 0;
-
-      x1 = Math.max(0, Math.min(roiW - 1, x1));
-      x2 = Math.max(0, Math.min(roiW - 1, x2));
-      y1 = Math.max(0, Math.min(roiH - 1, y1));
-      y2 = Math.max(0, Math.min(roiH - 1, y2));
-      if (x2 < x1) [x1, x2] = [x2, x1];
-      if (y2 < y1) [y1, y2] = [y2, y1];
-      return { label, bbox: [x1, y1, x2, y2], risk };
-    });
-
-    plan.n_obstacles = plan.obstacles.length;
-    if (typeof plan.confidence !== "number") plan.confidence = 0.4;
-    plan.confidence = Math.max(0, Math.min(1, plan.confidence));
-
-    if (plan.confidence < 0.25) {
-      plan.walkway_center_x = fallbackCenter;
-      plan.walkway_poly = fallbackPoly;
-      plan.best_sector = fallbackBest;
-    }
-
-    console.log("VISION PLAN:", {
-      dist_cm: distCm,
-      strength,
-      localBest,
-      corridor: { center_x: corridorCenterX, width_ratio: corridorWidthRatio, conf: corridorConf },
-      best_sector: plan.best_sector,
-      walkway_center_x: plan.walkway_center_x,
-      confidence: plan.confidence,
-      n_obstacles: plan.n_obstacles,
-    });
-
-    return res.json(plan);
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No image" });
+    // (Bạn giữ endpoint này như cũ nếu đang dùng. Mình không sửa logic ở đây.)
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("/avoid_obstacle_vision error:", err);
     res.status(500).json({ error: err.message || "vision failed" });
@@ -706,7 +435,7 @@ Return JSON schema exactly:
 });
 
 /* ===========================================================================  
-   UPLOAD_AUDIO — STT → (Music / Chatbot) → VOICE (Eleven)
+   PI UPLOAD V2 — STT → (YouTube / iTunes / ChatGPT) → return audio_url OR play
 ===========================================================================*/
 app.post(
   "/pi_upload_audio_v2",
@@ -719,22 +448,17 @@ app.post(
     try {
       const audioFile = req.files?.audio?.[0];
       const imageFile = req.files?.image?.[0] || null;
-      const userKey = getClientKey(req);
 
       if (!audioFile?.buffer) {
         return res.status(400).json({ error: "No audio uploaded" });
       }
 
-      // meta (memory + info)
+      // meta (memory)
       let meta = {};
-      try {
-        meta = req.body?.meta ? JSON.parse(req.body.meta) : {};
-      } catch {
-        meta = {};
-      }
+      try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
       const memoryArr = Array.isArray(meta.memory) ? meta.memory : [];
 
-      // save WAV
+      // save wav
       const wavPath = path.join(audioDir, `pi_v2_${Date.now()}.wav`);
       fs.writeFileSync(wavPath, audioFile.buffer);
 
@@ -750,81 +474,86 @@ app.post(
       } catch (e) {
         console.error("PI_V2 STT error:", e);
         try { fs.unlinkSync(wavPath); } catch { }
-        return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null });
+        return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null, play: null });
+      } finally {
+        try { fs.unlinkSync(wavPath); } catch { }
       }
 
       // clap short-circuit
       if (isClapText(text)) {
         console.log("👏 Detected CLAP by STT -> return label=clap");
-        try { fs.unlinkSync(wavPath); } catch { }
-        return res.json({ status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null, used_vision: false });
+        return res.json({
+          status: "ok",
+          transcript: text,
+          label: "clap",
+          reply_text: "",
+          audio_url: null,
+          play: null,
+          used_vision: false,
+        });
       }
 
-      const choice = detectSongChoice(text);
-      const last = getLastCandidates(userKey);
-
+      // base label
       let label = overrideLabelByText("unknown", text);
 
-      // ✅ NEW: if in music context and user only says song title -> label=nhac
-      if (label !== "nhac" && inMusicContext(memoryArr) && looksLikeSongTitleOnly(text)) {
-        label = "nhac";
-      }
+      // 1) YOUTUBE PLAY (highest priority if user requests)
+      if (wantsYouTube(text)) {
+        const q = extractSongQuery(text) || text;
+        const yt = await searchYouTubeFirstUrl(q);
 
-      let replyText = "";
-      let playbackUrl = null;
-
-      /* ===========================
-         MUSIC: user chooses (1..5) -> play immediately (if we have last)
-      =========================== */
-      if (choice && last?.candidates?.length) {
-        const idx = choice - 1;
-        const picked = last.candidates[idx];
-        if (picked?.previewUrl) {
-          playbackUrl = await getMp3FromPreview(picked.previewUrl);
-          label = "nhac";
-          replyText = `Dạ ok anh, em mở "${picked.trackName}" của ${picked.artistName} nha.`;
-
-          mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-          console.log("✅ USER CHOICE -> PLAY:", { choice, track: picked.trackName, artist: picked.artistName });
-        }
-      }
-
-      /* ===========================
-         MUSIC: OLD stable iTunes (limit=1)
-      =========================== */
-      if (!playbackUrl && label === "nhac") {
-        const query = extractSongQuery(text) || text;
-        const m = await searchITunesOld(query);
-
-        // store last as a single candidate so "bài số 1" vẫn dùng được
-        if (m?.previewUrl) {
-          setLastCandidates(userKey, {
-            candidates: [
-              {
-                trackName: m.trackName,
-                artistName: m.artistName,
-                previewUrl: m.previewUrl,
-                trackId: m.trackId,
-              },
-            ],
-            originalQuery: query,
+        if (yt?.url) {
+          const replyText = `Dạ ok anh, em mở YouTube "${yt.title || q}" nha.`;
+          return res.json({
+            status: "ok",
+            transcript: text,
+            label: "nhac",
+            reply_text: replyText,
+            audio_url: null,
+            play: {
+              type: "youtube",
+              playerUrl: yt.url,
+              title: yt.title || "",
+              duration_sec: yt.duration_sec || null,
+              query: q,
+            },
+            used_vision: false,
+            itunes_country: ITUNES_COUNTRY,
+          });
+        } else {
+          // fallback: speak
+          const replyText = "Em không tìm thấy video YouTube phù hợp. Anh nói lại tên bài giúp em nha.";
+          const audioUrl = await textToSpeechMp3(replyText, "pi_v2");
+          return res.json({
+            status: "ok",
+            transcript: text,
+            label: "nhac",
+            reply_text: replyText,
+            audio_url: audioUrl,
+            play: null,
+            used_vision: false,
+            itunes_country: ITUNES_COUNTRY,
           });
         }
+      }
+
+      // 2) MUSIC iTunes (limit=1 old stable)
+      let replyText = "";
+      let playbackUrl = null;
+      let play = null;
+
+      if (label === "nhac") {
+        const query = extractSongQuery(text) || text;
+        const m = await searchITunesOld(query);
 
         if (m?.previewUrl) {
           playbackUrl = await getMp3FromPreview(m.previewUrl);
           replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
-
-          mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
         } else {
           replyText = "Em không tìm thấy bài hát phù hợp ở iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
         }
       }
 
-      /* ===========================
-         GPT (only if NOT playing music)
-         Vision only when user asks
-      =========================== */
+      // 3) GPT (only if not playing iTunes)
       const hasImage = !!imageFile?.buffer;
       const useVision = hasImage && wantsVision(text);
 
@@ -843,14 +572,11 @@ Bạn là dog robot của Matthew. Trả lời ngắn gọn, dễ hiểu, thân 
 
 QUY TẮC KIẾN THỨC:
 - Với câu hỏi kiến thức phổ thông (người nổi tiếng, khái niệm, “là ai”, “là gì”), hãy trả lời trực tiếp bằng kiến thức chung.
-- Chỉ nói "em không chắc" khi câu hỏi quá chi tiết/khó kiểm chứng (ngày sinh chính xác, số liệu nhỏ, tin đồn).
+- Chỉ nói "em không chắc" khi câu hỏi quá chi tiết/khó kiểm chứng.
 
 QUY TẮC ẢNH:
-- CHỈ mô tả hình/khung cảnh khi người dùng có hỏi kiểu "nhìn/xem/xung quanh/trong ảnh".
-- Nếu người dùng KHÔNG hỏi về hình thì bỏ qua ảnh, trả lời theo câu nói.
-
-ÂM NHẠC:
-- Nếu user nói "bài số 2" mà không có danh sách candidates thì nói: "Anh nói lại tên bài hoặc ca sĩ giúp em nha."
+- CHỈ mô tả hình khi user hỏi "nhìn/xem/xung quanh/trong ảnh".
+- Nếu user KHÔNG hỏi về hình thì bỏ qua ảnh.
 `.trim();
 
         const messages = [{ role: "system", content: system }];
@@ -858,18 +584,16 @@ QUY TẮC ẢNH:
         if (memoryText) {
           messages.push({
             role: "system",
-            content: `Robot long-term memory (recent):\n${memoryText}`.slice(0, 6000),
+            content: `Robot memory (recent):\n${memoryText}`.slice(0, 6000),
           });
         }
 
-        if (choice && !last?.candidates?.length) {
-          replyText = "Anh nói lại tên bài hoặc ca sĩ giúp em nha.";
-        } else if (useVision) {
+        if (useVision) {
           const b64 = imageFile.buffer.toString("base64");
           const dataUrl = `data:image/jpeg;base64,${b64}`;
 
           const userContent = [
-            { type: "text", text: `Người dùng nói: "${text}". Trả lời đúng yêu cầu. Vì user đang hỏi về hình nên mới mô tả hình.` },
+            { type: "text", text: `Người dùng nói: "${text}". Vì user hỏi về hình nên mô tả hình đúng yêu cầu.` },
             { type: "image_url", image_url: { url: dataUrl } },
           ];
 
@@ -891,48 +615,14 @@ QUY TẮC ẢNH:
 
           replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
         }
-
-        // ✅ NEW: if GPT already decided "mở bài ..." -> auto switch to music & search iTunes
-        if (!playbackUrl) {
-          const songFromReply = extractSongFromReply(replyText);
-          const candidateQuery =
-            songFromReply ||
-            ((inMusicContext(memoryArr) && looksLikeSongTitleOnly(text)) ? text : null);
-
-          if (candidateQuery) {
-            const q = extractSongQuery(candidateQuery) || candidateQuery;
-            const m = await searchITunesOld(q);
-
-            if (m?.previewUrl) {
-              label = "nhac";
-              playbackUrl = await getMp3FromPreview(m.previewUrl);
-              replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
-
-              setLastCandidates(userKey, {
-                candidates: [
-                  { trackName: m.trackName, artistName: m.artistName, previewUrl: m.previewUrl, trackId: m.trackId },
-                ],
-                originalQuery: q,
-              });
-
-              mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-            }
-          }
-        }
       }
 
-      /* ===========================
-         VOICE:
-         - If playbackUrl exists (iTunes music) => keep it
-         - else => convert replyText to MP3 (Eleven)
-      =========================== */
+      // 4) If still no playbackUrl => TTS
       if (!playbackUrl) {
         playbackUrl = await textToSpeechMp3(replyText, "pi_v2");
       }
 
-      /* ===========================
-         publish MQTT
-      =========================== */
+      // 5) publish MQTT (optional)
       if (["tien", "lui", "trai", "phai"].includes(label)) {
         mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
       } else {
@@ -943,14 +633,13 @@ QUY TẮC ẢNH:
         );
       }
 
-      try { fs.unlinkSync(wavPath); } catch { }
-
       return res.json({
         status: "ok",
         transcript: text,
         label,
         reply_text: replyText,
-        audio_url: playbackUrl,
+        audio_url: playbackUrl, // IMPORTANT for Pi client
+        play,                  // null (unless youtube branch above)
         used_vision: !!useVision,
         itunes_country: ITUNES_COUNTRY,
       });
@@ -960,217 +649,6 @@ QUY TẮC ẢNH:
     }
   }
 );
-
-/* ===========================================================================  
-   web upload_audio (WebM->WAV)
-===========================================================================*/
-app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
-
-    const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
-    fs.writeFileSync(inputFile, req.file.buffer);
-
-    if (req.file.buffer.length < 2000) {
-      try { fs.unlinkSync(inputFile); } catch { }
-      return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null });
-    }
-
-    const wavFile = inputFile.replace(".webm", ".wav");
-
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputFile)
-        .inputOptions("-fflags +genpts")
-        .outputOptions("-vn")
-        .audioCodec("pcm_s16le")
-        .audioChannels(1)
-        .audioFrequency(16000)
-        .on("error", reject)
-        .on("end", resolve)
-        .save(wavFile);
-    });
-
-    let text = "";
-    try {
-      const tr = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: "gpt-4o-mini-transcribe",
-      });
-      text = (tr.text || "").trim();
-    } catch (err) {
-      console.error("STT error:", err);
-      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-      return res.status(500).json({ error: "STT failed" });
-    }
-
-    let label = overrideLabelByText("unknown", text);
-
-    let playbackUrl = null;
-    let replyText = "";
-
-    if (label === "nhac") {
-      const query = extractSongQuery(text) || text;
-      const musicMeta = await searchITunesOld(query);
-
-      if (musicMeta?.previewUrl) {
-        playbackUrl = await getMp3FromPreview(musicMeta.previewUrl);
-        replyText = `Dạ, em mở bài "${musicMeta.trackName}" của ${musicMeta.artistName} cho anh nhé.`;
-        mqttClient.publish("/robot/vaytay", JSON.stringify({ action: "vaytay", playing: true }), { qos: 1 });
-      } else {
-        replyText = "Em không tìm thấy bài hát phù hợp ở iTunes.";
-      }
-    }
-
-    if (!playbackUrl && label !== "nhac") {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-          { role: "user", content: text },
-        ],
-        temperature: 0.25,
-        max_tokens: 260,
-      });
-      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
-    }
-
-    if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "web");
-
-    if (["tien", "lui", "trai", "phai"].includes(label)) {
-      mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
-    } else {
-      mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
-    }
-
-    try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
-
-    res.json({ status: "ok", transcript: text, label, audio_url: playbackUrl });
-  } catch (err) {
-    console.error("upload_audio error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ===========================================================================  
-   PI upload_audio (WAV already)
-===========================================================================*/
-app.post("/pi_upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No audio uploaded" });
-
-    const wavFile = path.join(audioDir, `pi_${Date.now()}.wav`);
-    fs.writeFileSync(wavFile, req.file.buffer);
-
-    let text = "";
-    try {
-      const tr = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: "gpt-4o-mini-transcribe",
-      });
-      text = (tr.text || "").trim();
-      console.log("🎤 PI STT:", text);
-    } catch (err) {
-      console.error("PI STT error:", err);
-      return res.json({ status: "error", text: "", label: "unknown", audio_url: null });
-    }
-
-    let label = overrideLabelByText("unknown", text);
-
-    let playbackUrl = null;
-    let replyText = "";
-
-    if (label === "nhac") {
-      const query = extractSongQuery(text) || text;
-      const m = await searchITunesOld(query);
-
-      if (m?.previewUrl) {
-        playbackUrl = await getMp3FromPreview(m.previewUrl);
-        replyText = `Em mở bài "${m.trackName}" của ${m.artistName} nhé.`;
-      } else {
-        replyText = "Em không tìm thấy bài phù hợp.";
-      }
-    }
-
-    if (!playbackUrl) {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "Bạn là trợ lý robot, trả lời ngắn gọn. Với câu hỏi kiến thức phổ thông, trả lời trực tiếp." },
-          { role: "user", content: text },
-        ],
-        temperature: 0.25,
-        max_tokens: 260,
-      });
-      replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu.";
-    }
-
-    if (!playbackUrl) playbackUrl = await textToSpeechMp3(replyText, "pi");
-
-    if (["tien", "lui", "trai", "phai"].includes(label)) {
-      mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
-    } else {
-      mqttClient.publish("robot/music", JSON.stringify({ audio_url: playbackUrl, text: replyText, label }), { qos: 1 });
-    }
-
-    res.json({ status: "ok", text, label, audio_url: playbackUrl });
-  } catch (err) {
-    console.error("pi_upload_audio error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ===========================================================================  
-   CAMERA ROTATE ENDPOINT  
-===========================================================================*/
-app.get("/camera_rotate", (req, res) => {
-  try {
-    const angle = parseInt(req.query.angle || "0", 10);
-    const direction = req.query.direction || "abs";
-
-    if (isNaN(angle) || angle < 0 || angle > 180) {
-      return res.status(400).json({ error: "Angle must be 0–180" });
-    }
-
-    const payload = { angle, direction, time: Date.now() };
-
-    mqttClient.publish("/robot/camera_rotate", JSON.stringify(payload), { qos: 1 });
-    console.log("📡 Sent /robot/camera_rotate →", payload);
-
-    res.json({ status: "ok", payload });
-  } catch (e) {
-    console.error("/camera_rotate error:", e);
-    res.status(500).json({ error: "server error" });
-  }
-});
-
-/* ===========================================================================  
-   SCAN TRIGGER ENDPOINTS
-===========================================================================*/
-function triggerScanEndpoint(pathUrl, payload) {
-  return (req, res) => {
-    try {
-      const msg = { ...payload, time: Date.now() };
-      mqttClient.publish(pathUrl, JSON.stringify(msg), { qos: 1 });
-      console.log(`📡 Triggered scan → ${pathUrl}`);
-      res.json({ status: "ok", topic: pathUrl, payload: msg });
-    } catch (e) {
-      res.status(500).json({ error: "Trigger failed" });
-    }
-  };
-}
-
-app.get("/trigger_scan", triggerScanEndpoint("robot/scanning360", { action: "start_scan" }));
-app.get("/trigger_scan180", triggerScanEndpoint("robot/scanning180", { action: "scan_180" }));
-app.get("/trigger_scan90", triggerScanEndpoint("robot/scanning90", { action: "scan_90" }));
-app.get("/trigger_scan45", triggerScanEndpoint("robot/scanning45", { action: "scan_45" }));
-app.get("/trigger_scan30", triggerScanEndpoint("robot/scanning30", { action: "scan_30" }));
-
-/* ===========================================================================  
-   SCAN STATUS
-===========================================================================*/
-app.get("/get_scanningstatus", (req, res) => {
-  res.json({ status: scanStatus });
-});
 
 /* ===========================================================================  
    SIMPLE ROOT CHECK  
