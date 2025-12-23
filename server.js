@@ -21,8 +21,6 @@ import multer from "multer";
 import cors from "cors";
 import yts from "yt-search";
 import { spawn } from "child_process";
-import path from "path";
-import fs from "fs";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
