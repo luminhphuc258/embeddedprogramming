@@ -643,6 +643,7 @@ app.post(
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
         const play = await searchYouTubeTop1(q);
+        console.log(" MUSIC from youtube info:", { text, q, found: !!play?.url, url: play?.url });
 
         if (play?.url) {
           const replyText = `Dạ, em mở YouTube: "${play.title}" nha.`;
