@@ -361,14 +361,21 @@ function shouldAutoSwitchToMusic(text = "") {
 }
 
 function detectStopPlayback(text = "") {
-  const t = stripDiacritics((text || "").toLowerCase());
-  const keys = [
-    "tat nhac", "tắt nhạc", "dung nhac", "dừng nhạc", "stop nhac", "stop music",
-    "tat video", "tắt video", "dung video", "dừng video", "stop video",
-    "im di", "im", "stop", "dung lai", "dừng lại"
+  const t = stripDiacritics((text || "").toLowerCase()).trim();
+
+  // Match theo CỤM và theo word-boundary để tránh dính "tím" -> "tim"
+  const patterns = [
+    /\b(tat|tat\s*di|tat\s*giup|tắt|tắt\s*đi|tắt\s*giúp)\s*(nhac|nhạc|music|video)\b/u,
+    /\b(dung|dung\s*lai|dung\s*di|dừng|dừng\s*lại|dừng\s*đi)\s*(nhac|nhạc|music|video)\b/u,
+    /\b(stop|stop\s*now|stop\s*it)\b/u,
+    /\b(skip|bo\s*qua|bỏ\s*qua)\b/u,
+    // nếu bạn vẫn muốn “im đi” thì match nguyên cụm (KHÔNG match "im")
+    /\b(im\s*di|im\s*đi)\b/u,
   ];
-  return keys.some(k => t.includes(stripDiacritics(k)));
+
+  return patterns.some((re) => re.test(t));
 }
+
 
 /* ===========================================================================  
    YouTube search (yt-search) -> TOP 1
