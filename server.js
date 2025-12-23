@@ -20,6 +20,9 @@ import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import cors from "cors";
 import yts from "yt-search";
+import { spawn } from "child_process";
+import path from "path";
+import fs from "fs";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -29,6 +32,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+app.use(express.json());
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -75,6 +79,71 @@ function uploadLimiter(req, res, next) {
     return res.status(429).json({ error: "Server busy, try again" });
   requestLimitMap[ip].push(now);
   next();
+}
+// support get mp3 from yt
+function run(cmd, args, { timeoutMs = 120000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+
+    const timer = setTimeout(() => {
+      try { p.kill("SIGKILL"); } catch { }
+      reject(new Error(`Timeout: ${cmd} ${args.join(" ")}`));
+    }, timeoutMs);
+
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`Exit ${code}\nSTDERR:\n${err}\nSTDOUT:\n${out}`));
+    });
+  });
+}
+
+/**
+ * Extract audio mp3 from a SOURCE YOU HAVE RIGHTS TO USE.
+ * source: local file path OR URL (non-YouTube) that you have permission to download/convert.
+ */
+export async function ytdlpExtractMp3Legal(source, outDir) {
+  if (!source) throw new Error("Missing source");
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+  const ts = Date.now();
+  const outTemplate = path.join(outDir, `legal_${ts}.%(ext)s`);
+
+  // -x: extract audio
+  // --audio-format mp3: output mp3 (requires ffmpeg)
+  // -o: output template
+  // --no-playlist: avoid playlists
+  const args = [
+    "--no-playlist",
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "-o", outTemplate,
+    source
+  ];
+
+  await run("yt-dlp", args, { timeoutMs: 180000 });
+
+  // Find the produced mp3
+  const mp3Path = path.join(outDir, `legal_${ts}.mp3`);
+  if (!fs.existsSync(mp3Path)) {
+    // Sometimes ext naming differs; do a quick scan:
+    const files = fs.readdirSync(outDir).filter(f => f.startsWith(`legal_${ts}.`));
+    const mp3 = files.find(f => f.endsWith(".mp3"));
+    if (!mp3) throw new Error("MP3 not found after yt-dlp run");
+    return path.join(outDir, mp3);
+  }
+  return mp3Path;
 }
 
 /* ===========================================================================  
@@ -647,6 +716,8 @@ app.post(
 
         if (play?.url) {
           const replyText = `Dạ, em mở YouTube: "${play.title}" nha.`;
+          const mp3Path = await ytdlpExtractMp3Legal(play?.url, audioDir);
+          const filename = path.basename(mp3Path);
           // optional MQTT broadcast
           mqttClient.publish(
             "robot/music",
@@ -659,7 +730,7 @@ app.post(
             transcript: text,
             label: "nhac",
             reply_text: replyText,
-            audio_url: null, // IMPORTANT: để client không stop video vì audio_url
+            audio_url: `/audio/${filename}`,
             play,
             used_vision: false,
           });
@@ -839,7 +910,9 @@ app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res
       const q = extractSongQuery(text) || text;
       const play = await searchYouTubeTop1(q);
       if (play?.url) {
-        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: null, play });
+        const mp3Path1 = await ytdlpExtractMp3Legal(play?.url, audioDir);
+        const filename1 = path.basename(mp3Path1);
+        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Dạ, em mở YouTube: "${play.title}" nha.`, audio_url: `/audio/${filename1}`, play });
       }
       const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
       const audio_url = await textToSpeechMp3(replyText, "yt_fail_web");
