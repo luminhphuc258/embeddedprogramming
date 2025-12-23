@@ -1,13 +1,10 @@
 /* ===========================================================================
-   Matthew Robot — Node.js Server (Chatbot + iTunes + YouTube Play)
-   - STT + ChatGPT + TTS (Eleven proxy -> MP3, fallback OpenAI TTS)
-   - iTunes search (OLD stable: limit=1, pick first)
-   - NEW: YouTube play -> return { play: { type:"youtube", playerUrl } }
-   - Compatible with Pi client main.py:
-       * play.type=="youtube" => Pi calls robot-video-player service
-       * audio_url => Pi stops video, set face suprise + mouth, plays audio
-       * label=="clap" => Pi bark + sad face
-===========================================================================*/
+   Matthew Robot — Node.js Server (Chatbot + YouTube Music + Auto Navigation)
+   - STT (OpenAI) -> detect intent
+   - MUSIC: YouTube search (TOP1) -> return play:{type:"youtube", url,...}
+   - CHAT: GPT -> Eleven voice server (WAV->MP3) fallback OpenAI TTS
+   - Vision only when user asks
+=========================================================================== */
 
 import express from "express";
 import fs from "fs";
@@ -102,7 +99,6 @@ let scanStatus = "idle";
 
 mqttClient.on("connect", () => {
   console.log("✅ MQTT connected");
-
   mqttClient.subscribe("/dieuhuongrobot");
   mqttClient.subscribe("robot/scanning_done");
   mqttClient.subscribe("/done_rotate_lidarleft");
@@ -120,12 +116,10 @@ mqttClient.on("message", (topic, message) => {
       console.log("==> Robot quyết định hướng:", msg);
       return;
     }
-
     if (topic === "robot/scanning180") {
       console.log("==> Quyết định xoay 180 độ:", msg);
       return;
     }
-
     if (topic === "robot/scanning_done") {
       scanStatus = "done";
       return;
@@ -136,7 +130,7 @@ mqttClient.on("message", (topic, message) => {
 });
 
 /* ===========================================================================  
-   HELPERS — normalize / routing
+   HELPERS
 ===========================================================================*/
 function stripDiacritics(s = "") {
   return s
@@ -159,7 +153,7 @@ function getPublicHost() {
 }
 
 /* ===========================================================================  
-   VOICE (Eleven proxy server -> WAV -> MP3) + fallback OpenAI TTS
+   VOICE (Eleven proxy server -> WAV -> MP3)  ✅ keep
 ===========================================================================*/
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
@@ -220,7 +214,7 @@ async function voiceServerToMp3(replyText, prefix = "eleven") {
 
     if (ct.includes("audio/mpeg") || ct.includes("audio/mp3")) {
       fs.writeFileSync(mp3Out, buf);
-      return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
+      return `${getPublicHost()}/audio/${path.basename(mppath.basename(mp3Out)}`;
     }
 
     fs.writeFileSync(wavTmp, buf);
@@ -252,7 +246,7 @@ async function textToSpeechMp3(replyText, prefix = "reply") {
 }
 
 /* ===========================================================================  
-   MUSIC QUERY CLEANING
+   MUSIC INTENT + QUERY CLEANING
 ===========================================================================*/
 function cleanMusicQuery(q = "") {
   let t = (q || "").toLowerCase().trim();
@@ -269,10 +263,20 @@ function extractSongQuery(text) {
   const tNoDau = stripDiacritics(t);
 
   const removePhrases = [
-    "xin chao", "nghe", "toi muon nghe", "cho toi nghe",
-    "nghe nhac", "phat nhac", "bat nhac", "mo bai",
-    "bai hat", "bai nay", "nhac", "song", "music", "play",
-    "youtube", "you tube", "video"
+    "xin chao",
+    "nghe",
+    "toi muon nghe",
+    "cho toi nghe",
+    "nghe nhac",
+    "phat nhac",
+    "bat nhac",
+    "mo bai",
+    "bai hat",
+    "bai nay",
+    "nhac",
+    "song",
+    "music",
+    "play",
   ];
 
   let s = tNoDau;
@@ -281,133 +285,50 @@ function extractSongQuery(text) {
     s = s.replace(new RegExp(`\\b${pp}\\b`, "g"), " ");
   }
   s = s.replace(/\s+/g, " ").trim();
-
   if (!s || s.length < 2) return cleanMusicQuery(text);
   return cleanMusicQuery(s);
 }
 
-/* ===========================================================================  
-   YouTube intent + search
-   - If user says "youtube", "mở video", "play video", "bật youtube" => YouTube
-===========================================================================*/
-function wantsYouTube(text = "") {
-  const t = stripDiacritics((text || "").toLowerCase());
-  const triggers = [
-    "youtube", "you tube", "mo youtube", "bat youtube",
-    "mo video", "bat video", "play video", "xem video",
-    "video nay", "mo clip", "bat clip"
-  ];
-  return triggers.some(k => t.includes(stripDiacritics(k)));
-}
-
-async function searchYouTubeFirstUrl(query) {
-  const q = (query || "").trim();
-  if (!q) return null;
-
-  try {
-    const r = await yts(q);
-    const v = (r?.videos || [])[0];
-    if (!v?.url) return null;
-    return { url: v.url, title: v.title || "", duration_sec: v.seconds || null, author: v.author?.name || "" };
-  } catch (e) {
-    console.error("YouTube search error:", e?.message || e);
-    return null;
-  }
-}
-
-/* ===========================================================================  
-   iTunes search (OLD stable)
-===========================================================================*/
-const ITUNES_COUNTRY = (process.env.ITUNES_COUNTRY || "US").toUpperCase();
-const ITUNES_LANG = process.env.ITUNES_LANG || "";
-
-async function searchITunesOld(query) {
-  const q = (query || "").trim();
-  if (!q) return null;
-
-  const url = new URL("https://itunes.apple.com/search");
-  url.searchParams.set("media", "music");
-  url.searchParams.set("entity", "song");
-  url.searchParams.set("limit", "1");
-  url.searchParams.set("term", q);
-  url.searchParams.set("country", ITUNES_COUNTRY);
-  if (ITUNES_LANG) url.searchParams.set("lang", ITUNES_LANG);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7000);
-
-  try {
-    const resp = await fetch(url.toString(), { signal: controller.signal });
-    clearTimeout(timer);
-    if (!resp.ok) return null;
-
-    const data = await resp.json();
-    const item = data?.results?.[0] || null;
-    if (item?.previewUrl) return item;
-    return null;
-  } catch (e) {
-    clearTimeout(timer);
-    console.error("iTunes search error:", e?.message || e);
-    return null;
-  }
-}
-
-/* ===========================================================================  
-   MP3 from iTunes preview
-===========================================================================*/
-async function getMp3FromPreview(previewUrl) {
-  const ts = Date.now();
-  const src = path.join(audioDir, `song_${ts}.m4a`);
-  const dst = path.join(audioDir, `song_${ts}.mp3`);
-
-  const resp = await fetch(previewUrl);
-  const buffer = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(src, buffer);
-
-  await new Promise((resolve, reject) =>
-    ffmpeg(src).toFormat("mp3").on("end", resolve).on("error", reject).save(dst)
-  );
-
-  try { fs.unlinkSync(src); } catch { }
-  return `${getPublicHost()}/audio/song_${ts}.mp3`;
-}
-
-/* ===========================================================================  
-   VISION / INTENT HELPERS (keep)
-===========================================================================*/
 function isQuestionLike(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const q = ["la ai", "la gi", "cai gi", "vi sao", "tai sao", "o dau", "khi nao", "bao nhieu", "how", "what", "why", "where", "?"];
   return q.some(k => t.includes(stripDiacritics(k)));
 }
 
+function looksLikeSongTitleOnly(userText = "") {
+  const t = (userText || "").trim();
+  if (!t) return false;
+
+  const nd = stripDiacritics(t.toLowerCase());
+  const banned = ["xoay", "qua", "ben", "tien", "lui", "trai", "phai", "dung", "stop"];
+  if (banned.some(k => nd.includes(k))) return false;
+
+  if (t.length > 45) return false;
+  if (isQuestionLike(t)) return false;
+
+  return /[a-zA-Z0-9À-ỹ]/.test(t);
+}
+
 function wantsVision(text = "") {
   const t = stripDiacritics((text || "").toLowerCase());
   const triggers = [
-    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi",
-    "mo ta", "trong anh", "anh nay", "camera", "day la gi",
-    "cai gi", "vat gi", "giai thich hinh",
+    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi", "mo ta", "trong anh", "anh nay", "tam anh", "camera", "day la gi", "cai gi", "vat gi", "giai thich hinh",
   ];
   return triggers.some((k) => t.includes(stripDiacritics(k)));
-}
-
-/* ===========================================================================  
-   OVERRIDE LABEL
-===========================================================================*/
-function isClapText(text = "") {
-  const t = stripDiacritics(text.toLowerCase());
-  const keys = ["clap", "applause", "hand clap", "clapping", "vo tay", "tieng vo tay"];
-  return keys.some((k) => t.includes(stripDiacritics(k)));
 }
 
 function overrideLabelByText(label, text) {
   const t = stripDiacritics(text.toLowerCase());
 
+  // stop media
+  const stopKeys = ["tat nhac", "tat video", "dung nhac", "stop music", "stop video", "stop", "dung lai"];
+  if (stopKeys.some(k => t.includes(stripDiacritics(k)))) return "stop";
+
   const question = ["la ai", "cho toi biet", "cho toi hoi", "cau hoi", "ban co biet"];
-  if (question.some((k) => t.includes(k))) return "question";
+  if (question.some((k) => t.includes(stripDiacritics(k)))) return "question";
 
   const rules = [
-    { keys: ["nhac", "music", "play", "nghe bai hat", "nghe", "phat nhac", "cho toi nghe", "bat nhac", "mo nhac"], out: "nhac" },
+    { keys: ["nhac", "music", "play", "nghe bai hat", "nghe", "phat nhac", "cho toi nghe", "bat nhac", "mo nhac", "mo bai"], out: "nhac" },
     { keys: ["qua trai", "xoay trai", "ben trai"], out: "trai" },
     { keys: ["qua phai", "xoay phai", "ben phai"], out: "phai" },
     { keys: ["tien", "di len"], out: "tien" },
@@ -421,13 +342,78 @@ function overrideLabelByText(label, text) {
 }
 
 /* ===========================================================================  
-   VISION ENDPOINT (optional, keep skeleton)
+   CLAP detector shortcut (from STT)
+===========================================================================*/
+function isClapText(text = "") {
+  const t = stripDiacritics(text.toLowerCase());
+  const keys = ["clap", "applause", "hand clap", "clapping", "vo tay", "tieng vo tay"];
+  return keys.some((k) => t.includes(stripDiacritics(k)));
+}
+
+/* ===========================================================================  
+   YouTube search (TOP1)
+===========================================================================*/
+async function searchYouTubeTop1(query) {
+  const q = (query || "").trim();
+  if (!q) return null;
+
+  try {
+    const r = await yts(q);
+    const v = r?.videos?.[0];
+    if (!v?.url) return null;
+
+    return {
+      type: "youtube",
+      url: v.url,
+      videoId: v.videoId,
+      title: v.title,
+      seconds: v.seconds ?? null,
+      author: v.author?.name ?? null,
+    };
+  } catch (e) {
+    console.error("YouTube search error:", e?.message || e);
+    return null;
+  }
+}
+
+/* ===========================================================================  
+   VISION ENDPOINT (giữ như cũ nếu bạn cần)
 ===========================================================================*/
 app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No image" });
-    // (Bạn giữ endpoint này như cũ nếu đang dùng. Mình không sửa logic ở đây.)
-    return res.status(200).json({ ok: true });
+    if (!req.file?.buffer) return res.status(400).json({ error: "No image" });
+
+    let meta = {};
+    try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
+
+    const b64 = req.file.buffer.toString("base64");
+    const dataUrl = `data:image/jpeg;base64,${b64}`;
+
+    const system = `
+Bạn là module "AvoidObstacle" cho robot đi trong nhà.
+Trả JSON hợp lệ, KHÔNG giải thích.
+`.trim();
+
+    const user = [
+      { type: "text", text: `Meta: ${JSON.stringify(meta).slice(0, 1200)}\nReturn JSON: {"best_sector":number,"confidence":number}` },
+      { type: "image_url", image_url: { url: dataUrl } },
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.VISION_MODEL || "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      max_tokens: 300,
+    });
+
+    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+    let plan = null;
+    try { plan = JSON.parse(raw); } catch { plan = null; }
+
+    return res.json(plan || { best_sector: 4, confidence: 0.2 });
   } catch (err) {
     console.error("/avoid_obstacle_vision error:", err);
     res.status(500).json({ error: err.message || "vision failed" });
@@ -435,30 +421,25 @@ app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res
 });
 
 /* ===========================================================================  
-   PI UPLOAD V2 — STT → (YouTube / iTunes / ChatGPT) → return audio_url OR play
+   PI_V2: STT -> (YouTube music OR Chat) -> return play/audio_url
 ===========================================================================*/
 app.post(
   "/pi_upload_audio_v2",
   uploadLimiter,
-  upload.fields([
-    { name: "audio", maxCount: 1 },
-    { name: "image", maxCount: 1 },
-  ]),
+  upload.fields([{ name: "audio", maxCount: 1 }, { name: "image", maxCount: 1 }]),
   async (req, res) => {
     try {
       const audioFile = req.files?.audio?.[0];
       const imageFile = req.files?.image?.[0] || null;
+      const userKey = getClientKey(req);
 
-      if (!audioFile?.buffer) {
-        return res.status(400).json({ error: "No audio uploaded" });
-      }
+      if (!audioFile?.buffer) return res.status(400).json({ error: "No audio uploaded" });
 
-      // meta (memory)
       let meta = {};
       try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
       const memoryArr = Array.isArray(meta.memory) ? meta.memory : [];
 
-      // save wav
+      // save WAV
       const wavPath = path.join(audioDir, `pi_v2_${Date.now()}.wav`);
       fs.writeFileSync(wavPath, audioFile.buffer);
 
@@ -481,83 +462,77 @@ app.post(
 
       // clap short-circuit
       if (isClapText(text)) {
-        console.log("👏 Detected CLAP by STT -> return label=clap");
+        console.log("👏 Detected CLAP by STT -> label=clap");
+        return res.json({ status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null, play: null, used_vision: false });
+      }
+
+      // label detect
+      let label = overrideLabelByText("unknown", text);
+
+      // ✅ nếu user chỉ nói tên bài hát (không nói “mở nhạc”) vẫn coi là nhạc
+      if (label !== "nhac" && looksLikeSongTitleOnly(text)) {
+        // bạn có thể siết chặt rule hơn nếu muốn
+        label = "nhac";
+      }
+
+      // STOP media command
+      if (label === "stop") {
+        const replyText = "Dạ ok anh, em tắt nhạc/video nha.";
         return res.json({
           status: "ok",
           transcript: text,
-          label: "clap",
-          reply_text: "",
-          audio_url: null,
-          play: null,
+          label: "stop",
+          reply_text: replyText,
+          audio_url: await textToSpeechMp3(replyText, "stop"),
+          play: { type: "stop" },
           used_vision: false,
         });
       }
 
-      // base label
-      let label = overrideLabelByText("unknown", text);
-
-      // 1) YOUTUBE PLAY (highest priority if user requests)
-      if (wantsYouTube(text)) {
+      // MUSIC -> YouTube play
+      if (label === "nhac") {
         const q = extractSongQuery(text) || text;
-        const yt = await searchYouTubeFirstUrl(q);
+        const play = await searchYouTubeTop1(q);
 
-        if (yt?.url) {
-          const replyText = `Dạ ok anh, em mở YouTube "${yt.title || q}" nha.`;
+        if (play?.url) {
+          const replyText = `Dạ, em mở YouTube: "${play.title}" nha.`;
+
+          // (optional) notify mqtt
+          mqttClient.publish("robot/music", JSON.stringify({ play, text: replyText, label: "nhac", user: userKey }), { qos: 1 });
+
           return res.json({
             status: "ok",
             transcript: text,
             label: "nhac",
             reply_text: replyText,
             audio_url: null,
-            play: {
-              type: "youtube",
-              playerUrl: yt.url,
-              title: yt.title || "",
-              duration_sec: yt.duration_sec || null,
-              query: q,
-            },
+            play,
             used_vision: false,
-            itunes_country: ITUNES_COUNTRY,
-          });
-        } else {
-          // fallback: speak
-          const replyText = "Em không tìm thấy video YouTube phù hợp. Anh nói lại tên bài giúp em nha.";
-          const audioUrl = await textToSpeechMp3(replyText, "pi_v2");
-          return res.json({
-            status: "ok",
-            transcript: text,
-            label: "nhac",
-            reply_text: replyText,
-            audio_url: audioUrl,
-            play: null,
-            used_vision: false,
-            itunes_country: ITUNES_COUNTRY,
           });
         }
+
+        const failText = "Em không tìm thấy bài phù hợp trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
+        return res.json({
+          status: "ok",
+          transcript: text,
+          label: "nhac",
+          reply_text: failText,
+          audio_url: await textToSpeechMp3(failText, "yt_fail"),
+          play: null,
+          used_vision: false,
+        });
       }
 
-      // 2) MUSIC iTunes (limit=1 old stable)
-      let replyText = "";
-      let playbackUrl = null;
-      let play = null;
-
-      if (label === "nhac") {
-        const query = extractSongQuery(text) || text;
-        const m = await searchITunesOld(query);
-
-        if (m?.previewUrl) {
-          playbackUrl = await getMp3FromPreview(m.previewUrl);
-          replyText = `Dạ, em mở bài "${m.trackName}" của ${m.artistName} cho anh nhé.`;
-        } else {
-          replyText = "Em không tìm thấy bài hát phù hợp ở iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
-        }
-      }
-
-      // 3) GPT (only if not playing iTunes)
+      // CHAT / COMMANDS
       const hasImage = !!imageFile?.buffer;
       const useVision = hasImage && wantsVision(text);
 
-      if (!playbackUrl && label !== "nhac") {
+      let replyText = "";
+      if (["tien", "lui", "trai", "phai"].includes(label)) {
+        // movement commands -> publish
+        mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
+        replyText = "Dạ.";
+      } else {
         const memoryText = memoryArr
           .slice(-12)
           .map((m, i) => {
@@ -571,29 +546,24 @@ app.post(
 Bạn là dog robot của Matthew. Trả lời ngắn gọn, dễ hiểu, thân thiện.
 
 QUY TẮC KIẾN THỨC:
-- Với câu hỏi kiến thức phổ thông (người nổi tiếng, khái niệm, “là ai”, “là gì”), hãy trả lời trực tiếp bằng kiến thức chung.
-- Chỉ nói "em không chắc" khi câu hỏi quá chi tiết/khó kiểm chứng.
+- Với câu hỏi kiến thức phổ thông, trả lời trực tiếp bằng kiến thức chung.
+- Chỉ nói "em không chắc" khi quá chi tiết/khó kiểm chứng.
 
 QUY TẮC ẢNH:
-- CHỈ mô tả hình khi user hỏi "nhìn/xem/xung quanh/trong ảnh".
-- Nếu user KHÔNG hỏi về hình thì bỏ qua ảnh.
+- CHỈ mô tả ảnh khi user hỏi kiểu "nhìn/xem/trong ảnh".
 `.trim();
 
         const messages = [{ role: "system", content: system }];
 
         if (memoryText) {
-          messages.push({
-            role: "system",
-            content: `Robot memory (recent):\n${memoryText}`.slice(0, 6000),
-          });
+          messages.push({ role: "system", content: `Robot memory (recent):\n${memoryText}`.slice(0, 6000) });
         }
 
         if (useVision) {
           const b64 = imageFile.buffer.toString("base64");
           const dataUrl = `data:image/jpeg;base64,${b64}`;
-
           const userContent = [
-            { type: "text", text: `Người dùng nói: "${text}". Vì user hỏi về hình nên mô tả hình đúng yêu cầu.` },
+            { type: "text", text: `Người dùng nói: "${text}". Vì user hỏi về hình nên mới mô tả hình.` },
             { type: "image_url", image_url: { url: dataUrl } },
           ];
 
@@ -617,31 +587,18 @@ QUY TẮC ẢNH:
         }
       }
 
-      // 4) If still no playbackUrl => TTS
-      if (!playbackUrl) {
-        playbackUrl = await textToSpeechMp3(replyText, "pi_v2");
-      }
+      const audio_url = await textToSpeechMp3(replyText, "pi_v2");
 
-      // 5) publish MQTT (optional)
-      if (["tien", "lui", "trai", "phai"].includes(label)) {
-        mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
-      } else {
-        mqttClient.publish(
-          "robot/music",
-          JSON.stringify({ audio_url: playbackUrl, text: replyText, label }),
-          { qos: 1 }
-        );
-      }
+      mqttClient.publish("robot/music", JSON.stringify({ audio_url, text: replyText, label }), { qos: 1 });
 
       return res.json({
         status: "ok",
         transcript: text,
         label,
         reply_text: replyText,
-        audio_url: playbackUrl, // IMPORTANT for Pi client
-        play,                  // null (unless youtube branch above)
+        audio_url,
+        play: null,
         used_vision: !!useVision,
-        itunes_country: ITUNES_COUNTRY,
       });
     } catch (err) {
       console.error("pi_upload_audio_v2 error:", err);
@@ -651,17 +608,123 @@ QUY TẮC ẢNH:
 );
 
 /* ===========================================================================  
-   SIMPLE ROOT CHECK  
+   web upload_audio (WebM->WAV) - optional
 ===========================================================================*/
-app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀");
+app.post("/upload_audio", uploadLimiter, upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file?.buffer) return res.status(400).json({ error: "No audio uploaded" });
+
+    const inputFile = path.join(audioDir, `input_${Date.now()}.webm`);
+    fs.writeFileSync(inputFile, req.file.buffer);
+
+    if (req.file.buffer.length < 2000) {
+      try { fs.unlinkSync(inputFile); } catch { }
+      return res.json({ status: "ok", transcript: "", label: "unknown", audio_url: null, play: null });
+    }
+
+    const wavFile = inputFile.replace(".webm", ".wav");
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputFile)
+        .inputOptions("-fflags +genpts")
+        .outputOptions("-vn")
+        .audioCodec("pcm_s16le")
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .on("error", reject)
+        .on("end", resolve)
+        .save(wavFile);
+    });
+
+    let text = "";
+    try {
+      const tr = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavFile),
+        model: "gpt-4o-mini-transcribe",
+      });
+      text = (tr.text || "").trim();
+    } catch (err) {
+      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
+      return res.status(500).json({ error: "STT failed" });
+    } finally {
+      try { fs.unlinkSync(inputFile); fs.unlinkSync(wavFile); } catch { }
+    }
+
+    let label = overrideLabelByText("unknown", text);
+
+    if (label === "nhac" || looksLikeSongTitleOnly(text)) {
+      const q = extractSongQuery(text) || text;
+      const play = await searchYouTubeTop1(q);
+      if (play?.url) {
+        return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: `Mở YouTube: ${play.title}`, audio_url: null, play });
+      }
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "Bạn là trợ lý của robot, trả lời ngắn gọn, dễ hiểu." },
+        { role: "user", content: text },
+      ],
+      temperature: 0.25,
+      max_tokens: 260,
+    });
+
+    const replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+    const audio_url = await textToSpeechMp3(replyText, "web");
+    return res.json({ status: "ok", transcript: text, label, reply_text: replyText, audio_url, play: null });
+  } catch (err) {
+    console.error("upload_audio error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /* ===========================================================================  
-   START SERVER  
+   CAMERA ROTATE + SCAN endpoints (giữ)
 ===========================================================================*/
+app.get("/camera_rotate", (req, res) => {
+  try {
+    const angle = parseInt(req.query.angle || "0", 10);
+    const direction = req.query.direction || "abs";
+
+    if (isNaN(angle) || angle < 0 || angle > 180) {
+      return res.status(400).json({ error: "Angle must be 0–180" });
+    }
+
+    const payload = { angle, direction, time: Date.now() };
+    mqttClient.publish("/robot/camera_rotate", JSON.stringify(payload), { qos: 1 });
+    console.log("📡 Sent /robot/camera_rotate →", payload);
+
+    res.json({ status: "ok", payload });
+  } catch (e) {
+    console.error("/camera_rotate error:", e);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+function triggerScanEndpoint(pathUrl, payload) {
+  return (req, res) => {
+    try {
+      const msg = { ...payload, time: Date.now() };
+      mqttClient.publish(pathUrl, JSON.stringify(msg), { qos: 1 });
+      console.log(`📡 Triggered scan → ${pathUrl}`);
+      res.json({ status: "ok", topic: pathUrl, payload: msg });
+    } catch (e) {
+      res.status(500).json({ error: "Trigger failed" });
+    }
+  };
+}
+
+app.get("/trigger_scan", triggerScanEndpoint("robot/scanning360", { action: "start_scan" }));
+app.get("/trigger_scan180", triggerScanEndpoint("robot/scanning180", { action: "scan_180" }));
+app.get("/trigger_scan90", triggerScanEndpoint("robot/scanning90", { action: "scan_90" }));
+app.get("/trigger_scan45", triggerScanEndpoint("robot/scanning45", { action: "scan_45" }));
+app.get("/trigger_scan30", triggerScanEndpoint("robot/scanning30", { action: "scan_30" }));
+
+app.get("/get_scanningstatus", (req, res) => res.json({ status: scanStatus }));
+
+app.get("/", (req, res) => res.send("Matthew Robot server is running 🚀"));
+
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`🎵 iTunes country=${ITUNES_COUNTRY} lang=${ITUNES_LANG || "(none)"}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
 });
