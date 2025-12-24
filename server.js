@@ -2,9 +2,9 @@
    Matthew Robot — Node.js Server (Chatbot + YouTube + Auto Navigation)
    - STT + ChatGPT -> TTS (Eleven WAV server -> MP3, fallback OpenAI TTS)
    - MUSIC: YouTube search (yt-search) -> yt-dlp extract mp3 -> return audio_url (NO VIDEO)
-   - Vision only when user asks
+   - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
+   - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
-   - NO iTunes code
 ===========================================================================*/
 
 import express from "express";
@@ -112,7 +112,6 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
 
 /* ===========================================================================  
    yt-dlp (binary) -> mp3
-   NOTE: This expects yt-dlp is installed in Docker (pip install yt-dlp).
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
@@ -269,7 +268,11 @@ const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
   "https://eleven-tts-wav-server-matthewrobotvoice.up.railway.app/convertvoice";
 
+// global timeout (for non-PI usage)
 const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
+
+// ✅ PI endpoint timeout nhỏ hơn để tránh 502
+const VOICE_TIMEOUT_PI_MS = Number(process.env.VOICE_TIMEOUT_PI_MS || 12000);
 
 const DEFAULT_VOICE_PAYLOAD = {
   voice_settings: {
@@ -296,13 +299,13 @@ async function openaiTtsToMp3(replyText, prefix = "tts") {
   return `${getPublicHost()}/audio/${filename}`;
 }
 
-async function voiceServerToMp3(replyText, prefix = "eleven") {
+async function voiceServerToMp3WithTimeout(replyText, prefix = "eleven", timeoutMs = VOICE_TIMEOUT_MS) {
   const ts = Date.now();
   const wavTmp = path.join(audioDir, `${prefix}_${ts}.wav`);
   const mp3Out = path.join(audioDir, `${prefix}_${ts}.mp3`);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VOICE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const resp = await fetch(VOICE_SERVER_URL, {
@@ -348,9 +351,22 @@ async function textToSpeechMp3(replyText, prefix = "reply") {
   if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
 
   try {
-    return await voiceServerToMp3(safeText, `${prefix}_eleven`);
+    return await voiceServerToMp3WithTimeout(safeText, `${prefix}_eleven`, VOICE_TIMEOUT_MS);
   } catch (e) {
     console.error("⚠️ voiceServerToMp3 failed -> fallback OpenAI:", e?.message || e);
+    return await openaiTtsToMp3(safeText, `${prefix}_openai`);
+  }
+}
+
+// ✅ PI endpoint: bắt buộc attempt voice server trước, nhưng timeout nhỏ hơn
+async function textToSpeechMp3Pi(replyText, prefix = "pi_v2") {
+  const safeText = (replyText || "").trim();
+  if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
+
+  try {
+    return await voiceServerToMp3WithTimeout(safeText, `${prefix}_eleven`, VOICE_TIMEOUT_PI_MS);
+  } catch (e) {
+    console.error("⚠️ PI voice server timeout/fail -> fallback OpenAI:", e?.message || e);
     return await openaiTtsToMp3(safeText, `${prefix}_openai`);
   }
 }
@@ -445,7 +461,6 @@ function looksLikeMusicQuery(text = "") {
   if (!raw) return false;
 
   const t = stripDiacritics(raw.toLowerCase());
-
   const banned = ["xoay", "quay", "re", "tien", "lui", "trai", "phai", "dung", "stop", "di"];
   if (banned.some(k => t.includes(k))) return false;
 
@@ -535,7 +550,7 @@ function isClapText(text = "") {
 }
 
 /* ===========================================================================  
-   VISION trigger
+   VISION trigger (used only in /avoid_obstacle_vision)
 ===========================================================================*/
 function wantsVision(text = "") {
   const t = stripDiacritics((text || "").toLowerCase());
@@ -547,7 +562,7 @@ function wantsVision(text = "") {
 }
 
 /* ===========================================================================  
-   VISION ENDPOINT (keep your AvoidObstacle vision)
+   VISION ENDPOINT (AvoidObstacle vision)
 ===========================================================================*/
 app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res) => {
   try {
@@ -657,7 +672,7 @@ Return JSON schema exactly:
 });
 
 /* ===========================================================================  
-   UPLOAD_AUDIO — PI v2 (WAV) + optional image
+   UPLOAD_AUDIO — PI v2 (WAV) + optional image (ignored), TEXT ONLY
 ===========================================================================*/
 app.post(
   "/pi_upload_audio_v2",
@@ -665,8 +680,13 @@ app.post(
   upload.fields([{ name: "audio", maxCount: 1 }, { name: "image", maxCount: 1 }]),
   async (req, res) => {
     try {
+      const t0 = Date.now();
+      const ms = () => Date.now() - t0;
+
       const audioFile = req.files?.audio?.[0];
-      const imageFile = req.files?.image?.[0] || null;
+      // image is optional and IGNORED for this endpoint:
+      // const imageFile = req.files?.image?.[0] || null;
+
       const userKey = getClientKey(req);
 
       if (!audioFile?.buffer) return res.status(400).json({ error: "No audio uploaded" });
@@ -687,11 +707,11 @@ app.post(
           model: "gpt-4o-mini-transcribe",
         });
         text = (tr.text || "").trim();
-        console.log("🎤 PI_V2 STT:", text);
+        console.log("🎤 PI_V2 STT:", text, `(${ms()}ms)`);
       } catch (e) {
-        console.error("PI_V2 STT error:", e);
+        console.error("PI_V2 STT error:", e?.message || e);
         try { fs.unlinkSync(wavPath); } catch { }
-        return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null, play: null });
+        return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null, play: null, used_vision: false });
       } finally {
         try { fs.unlinkSync(wavPath); } catch { }
       }
@@ -713,7 +733,7 @@ app.post(
       // stop playback intent
       if (detectStopPlayback(text)) {
         const replyText = "Dạ, em tắt nhạc nha.";
-        const audio_url = await textToSpeechMp3(replyText, "stop");
+        const audio_url = await textToSpeechMp3Pi(replyText, "stop");
         return res.json({
           status: "ok",
           transcript: text,
@@ -735,7 +755,7 @@ app.post(
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
         const top = await searchYouTubeTop1(q);
-        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url });
+        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url }, `(${ms()}ms)`);
 
         if (top?.url) {
           const replyText = `Dạ, em mở "${top.title}" nha.`;
@@ -762,7 +782,7 @@ app.post(
         }
 
         const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
-        const audio_url = await textToSpeechMp3(replyText, "yt_fail");
+        const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
         return res.json({
           status: "ok",
           transcript: text,
@@ -791,11 +811,8 @@ app.post(
       }
 
       // ===========================
-      // GPT (chat / question), vision only when asked
+      // GPT (chat / question) — TEXT ONLY (no vision)
       // ===========================
-      const hasImage = !!imageFile?.buffer;
-      const useVision = hasImage && wantsVision(text);
-
       const memoryText = (memoryArr || [])
         .slice(-12)
         .map((m, i) => {
@@ -807,14 +824,7 @@ app.post(
 
       const system = `
 Bạn là dog robot của Matthew. Trả lời ngắn gọn, dễ hiểu, thân thiện.
-
-QUY TẮC KIẾN THỨC:
-- Với câu hỏi kiến thức phổ thông (người nổi tiếng, khái niệm, “là ai”, “là gì”), hãy trả lời trực tiếp bằng kiến thức chung.
-- Chỉ nói "em không chắc" khi câu hỏi quá chi tiết/khó kiểm chứng.
-
-QUY TẮC ẢNH:
-- CHỈ mô tả hình/khung cảnh khi người dùng có hỏi kiểu "nhìn/xem/xung quanh/trong ảnh".
-- Nếu user KHÔNG hỏi về hình thì bỏ qua ảnh, trả lời theo câu nói.
+Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của người dùng.
 `.trim();
 
       const messages = [{ role: "system", content: system }];
@@ -825,42 +835,25 @@ QUY TẮC ẢNH:
         });
       }
 
-      let replyText = "";
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [...messages, { role: "user", content: text }],
+        temperature: 0.25,
+        max_tokens: 260,
+      });
 
-      if (useVision) {
-        const b64 = imageFile.buffer.toString("base64");
-        const dataUrl = `data:image/jpeg;base64,${b64}`;
-        const userContent = [
-          { type: "text", text: `Người dùng nói: "${text}". Vì user đang hỏi về hình nên mới mô tả hình.` },
-          { type: "image_url", image_url: { url: dataUrl } },
-        ];
+      const replyText =
+        completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
 
-        const completion = await openai.chat.completions.create({
-          model: process.env.VISION_MODEL || "gpt-4.1-mini",
-          messages: [...messages, { role: "user", content: userContent }],
-          temperature: 0.25,
-          max_tokens: 420,
-        });
-
-        replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa thấy rõ lắm.";
-      } else {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          messages: [...messages, { role: "user", content: text }],
-          temperature: 0.25,
-          max_tokens: 260,
-        });
-
-        replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
-      }
-
-      const audio_url = await textToSpeechMp3(replyText, "pi_v2");
+      const audio_url = await textToSpeechMp3Pi(replyText, "pi_v2");
 
       mqttClient.publish(
         "robot/music",
         JSON.stringify({ audio_url, text: replyText, label, user: userKey }),
         { qos: 1 }
       );
+
+      console.log("✅ PI_V2 done", `(${ms()}ms)`);
 
       return res.json({
         status: "ok",
@@ -869,7 +862,7 @@ QUY TẮC ẢNH:
         reply_text: replyText,
         audio_url,
         play: null,
-        used_vision: !!useVision,
+        used_vision: false,
       });
     } catch (err) {
       console.error("pi_upload_audio_v2 error:", err);
