@@ -4,11 +4,11 @@
    - MUSIC:
        (A) Search: YouTube Data API v3 (if YOUTUBE_API_KEY set) with videoDuration=medium
            fallback to yt-search (scrape) and locally filter duration
-       (B) Download: yt-dlp download ONLY first MAX_MUSIC_SECONDS (540s) -> mp3 (fast, avoid long clip full download)
-           fallback to old method (download full then trim) if section download fails
-   - Pre-voice: "Ây da, bài hát "ten bài hát" của huynh đây rồi, nghe vui nha"
-   - Merge pre-voice + music segment => final mp3 => return audio_url
-   - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
+       (B) Download: yt-dlp download ONLY first MAX_MUSIC_SECONDS via --download-sections
+           ✅ NEW robust: try multiple youtube player clients (android/ios/mweb/tv)
+           ✅ Reduce SABR/PO token issues + 502/503 + DNS flakiness on Railway
+   - Pre-voice + music segment => merge => return audio_url (NO VIDEO)
+   - PI endpoint: TEXT ONLY (image optional, ignored)
    - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
 =========================================================================== */
@@ -35,6 +35,8 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ✅ Prefer IPv4 first (giảm lỗi DNS/IPv6 trên Railway)
 dns.setDefaultResultOrder("ipv4first");
+// ✅ Force stable public DNS (giảm “Failed to resolve hostname ... googlevideo.com”)
+dns.setServers(["1.1.1.1", "8.8.8.8"]);
 
 const uploadVision = multer({ storage: multer.memoryStorage() });
 const upload = multer({ storage: multer.memoryStorage() });
@@ -51,16 +53,15 @@ const audioDir = path.join(publicDir, "audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
 /* ===========================================================================  
-   CONFIG (defaults hard-coded as you requested)
+   CONFIG (defaults hard-coded)
 ===========================================================================*/
-// ✅ hard default constants (không cần set env trên Railway)
 const MAX_MUSIC_SECONDS = 540;                // 9 minutes
-const YT_VIDEO_DURATION = "medium";           // short|medium|long|any  (YouTube Data API)
+const YT_VIDEO_DURATION = "medium";           // short|medium|long|any
 const MAX_ACCEPTABLE_VIDEO_SECONDS = 900;     // 15 minutes (lọc clip dài)
 
-// still allow env for timeouts if you want; if not set -> defaults below
+// timeouts
 const MUSIC_FFMPEG_TIMEOUT_MS = Number(process.env.MUSIC_FFMPEG_TIMEOUT_MS || 240000); // 4 min
-const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 180000); // 3 min (download)
+const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 300000);  // ✅ 5 min (more robust)
 const MUSIC_DOWNLOAD_RETRY = Number(process.env.MUSIC_DOWNLOAD_RETRY || 2);
 
 /* ===========================================================================  
@@ -147,24 +148,69 @@ function safeRmdir(p) {
 }
 
 /* ===========================================================================  
-   yt-dlp + ffmpeg
-   - NEW: download ONLY first MAX_MUSIC_SECONDS via external downloader (ffmpeg -ss 0 -t N)
+   yt-dlp helpers
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
-async function checkYtdlpReady() {
+// Optional cookies support (to bypass PO token / visitor_data issues on datacenter IP)
+// - Set env: YTDLP_COOKIES_B64 = base64(cookies.txt)
+// - Or: YTDLP_COOKIES_PATH = path to cookies.txt on server
+const YTDLP_COOKIES_PATH_ENV = process.env.YTDLP_COOKIES_PATH || "";
+const YTDLP_COOKIES_B64 = process.env.YTDLP_COOKIES_B64 || "";
+const YTDLP_COOKIES_TMP = "/tmp/ytdlp_cookies.txt";
+
+function ensureCookiesFileIfAny() {
   try {
-    const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
-    console.log("✅ yt-dlp ready:", out.trim());
-    return true;
-  } catch (e) {
-    console.error("❌ yt-dlp not found/failed:", e?.message || e);
-    return false;
+    if (YTDLP_COOKIES_PATH_ENV && fs.existsSync(YTDLP_COOKIES_PATH_ENV)) {
+      return YTDLP_COOKIES_PATH_ENV;
+    }
+    if (YTDLP_COOKIES_B64) {
+      const buf = Buffer.from(YTDLP_COOKIES_B64, "base64");
+      if (buf.length > 1000) {
+        fs.writeFileSync(YTDLP_COOKIES_TMP, buf);
+        return YTDLP_COOKIES_TMP;
+      }
+    }
+  } catch { }
+  return "";
+}
+
+const YTDLP_CLIENT_PROFILES = [
+  { name: "android", args: ["--extractor-args", "youtube:player_client=android"] },
+  { name: "ios", args: ["--extractor-args", "youtube:player_client=ios"] },
+  { name: "mweb", args: ["--extractor-args", "youtube:player_client=mweb"] },
+  { name: "tv", args: ["--extractor-args", "youtube:player_client=tv"] },
+];
+
+function ytdlpBaseArgs() {
+  const cookiesFile = ensureCookiesFileIfAny();
+  const base = [
+    "--no-playlist",
+    "--force-ipv4",
+
+    "--retries", "20",
+    "--fragment-retries", "20",
+    "--retry-sleep", "1:linear",
+    "--socket-timeout", "15",
+
+    // ✅ reduce rate-limit/502 on Railway
+    "--concurrent-fragments", "1",
+    "--throttled-rate", "50K",
+
+    // ✅ allow postprocess using ffmpeg-static
+    "--ffmpeg-location", ffmpegPath,
+
+    "--no-check-certificate",
+  ];
+
+  if (cookiesFile) {
+    base.push("--cookies", cookiesFile);
   }
+  return base;
 }
 
 function findDownloadedFile(baseNoExt) {
-  const exts = ["m4a", "webm", "opus", "aac", "mp4", "mkv", "wav", "flac", "mp3"];
+  const exts = ["mp3", "m4a", "webm", "opus", "aac", "mp4", "mkv", "wav", "flac"];
   for (const ext of exts) {
     const p = `${baseNoExt}.${ext}`;
     if (fs.existsSync(p) && fs.statSync(p).size > 50_000) return p;
@@ -182,7 +228,18 @@ function findDownloadedFile(baseNoExt) {
   return null;
 }
 
-// (old) Download full audio to local file (NO streaming)
+async function checkYtdlpReady() {
+  try {
+    const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
+    console.log("✅ yt-dlp ready:", out.trim());
+    return true;
+  } catch (e) {
+    console.error("❌ yt-dlp not found/failed:", e?.message || e);
+    return false;
+  }
+}
+
+// (fallback) Download full audio
 async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
   if (!youtubeUrl) throw new Error("Missing youtubeUrl");
   fs.mkdirSync(outDir, { recursive: true });
@@ -190,14 +247,11 @@ async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
   const base = path.join(outDir, `ytdlp_${Date.now()}`);
   const template = `${base}.%(ext)s`;
 
+  // Prefer android first even in fallback
   const args = [
-    "--no-playlist",
-    "--force-ipv4",
-    "--retries", "10",
-    "--fragment-retries", "10",
-    "--socket-timeout", "10",
-    "--concurrent-fragments", "2",
-    "-f", "bestaudio/best",
+    ...ytdlpBaseArgs(),
+    "--extractor-args", "youtube:player_client=android",
+    "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
     "-o", template,
     youtubeUrl,
   ];
@@ -209,7 +263,7 @@ async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
   return downloaded;
 }
 
-// (old) Local trim+convert to mp3
+// (fallback) Local trim+convert to mp3
 async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SECONDS) {
   if (!inputFile || !fs.existsSync(inputFile)) throw new Error("Input file missing");
   fs.mkdirSync(path.dirname(outMp3), { recursive: true });
@@ -235,59 +289,66 @@ async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SE
   return outMp3;
 }
 
-// ✅ NEW: Download ONLY first N seconds -> MP3 (fast, avoids long-video full download)
+// ✅ NEW: robust clip downloader using --download-sections and multi-client
 async function ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, seconds = MAX_MUSIC_SECONDS) {
   if (!youtubeUrl) throw new Error("Missing youtubeUrl");
   fs.mkdirSync(outDir, { recursive: true });
 
   const base = path.join(outDir, `ytclip_${Date.now()}`);
   const template = `${base}.%(ext)s`;
-
   const sec = Math.max(1, Math.floor(Number(seconds) || MAX_MUSIC_SECONDS));
 
-  const args = [
-    "--no-playlist",
-    "--force-ipv4",
-    "--retries", "10",
-    "--fragment-retries", "10",
-    "--socket-timeout", "10",
-    "--concurrent-fragments", "2",
+  const format = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio";
 
-    // Use ffmpeg-static to only pull first N seconds
-    "--ffmpeg-location", ffmpegPath,
-    "--external-downloader", ffmpegPath,
-    "--external-downloader-args", `ffmpeg_i:-ss 0 -t ${sec}`,
+  let lastErr = null;
 
-    "-f", "bestaudio/best",
-    "-x",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
-    "-o", template,
-    youtubeUrl,
-  ];
+  for (const prof of YTDLP_CLIENT_PROFILES) {
+    const args = [
+      ...ytdlpBaseArgs(),
+      ...prof.args,
 
-  await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
+      // ✅ only first N seconds
+      "--download-sections", `*0-${sec}`,
 
-  const downloaded = findDownloadedFile(base);
-  if (!downloaded || !downloaded.endsWith(".mp3")) {
-    throw new Error("yt-dlp section download finished but mp3 not found");
+      "-f", format,
+      "-x",
+      "--audio-format", "mp3",
+      "--audio-quality", "5",
+      "-o", template,
+      youtubeUrl,
+    ];
+
+    try {
+      console.log(`🎵 [yt-dlp] try client=${prof.name}`);
+      await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
+
+      const downloaded = findDownloadedFile(base);
+      if (!downloaded || !downloaded.endsWith(".mp3")) {
+        throw new Error("yt-dlp finished but mp3 not found");
+      }
+      if (!fs.existsSync(downloaded) || fs.statSync(downloaded).size < 30_000) {
+        throw new Error("downloaded mp3 too small / invalid");
+      }
+      return downloaded;
+    } catch (e) {
+      lastErr = e;
+      console.error(`⚠️ [yt-dlp] client=${prof.name} failed:`, e?.message || e);
+      await sleep(900);
+    }
   }
-  if (!fs.existsSync(downloaded) || fs.statSync(downloaded).size < 30_000) {
-    throw new Error("downloaded mp3 too small / invalid");
-  }
 
-  return downloaded;
+  throw lastErr || new Error("yt-dlp failed on all client profiles");
 }
 
 async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
   if (!youtubeUrl) throw new Error("Missing url");
 
-  // ✅ prefer fast section download (no full clip download)
+  // ✅ prefer section clip (fast + robust)
   try {
     const mp3 = await ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, MAX_MUSIC_SECONDS);
     return mp3;
   } catch (e) {
-    console.error("[MUSIC] section download failed -> fallback full download+trim:", e?.message || e);
+    console.error("[MUSIC] section clip failed -> fallback full download+trim:", e?.message || e);
   }
 
   // fallback to old method
@@ -310,7 +371,7 @@ async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
       lastErr = err;
       console.error(`[MUSIC] fallback attempt ${attempt} failed:`, err?.message || err);
       try { if (downloaded) safeUnlink(downloaded); } catch { }
-      await sleep(500 * attempt);
+      await sleep(600 * attempt);
     }
   }
 
@@ -365,6 +426,7 @@ const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
 const mqttClient = mqtt.connect(mqttUrl, {
   username: MQTT_USER,
   password: MQTT_PASS,
+  rejectUnauthorized: false,
 });
 
 let scanStatus = "idle";
@@ -457,6 +519,11 @@ function getPublicHost() {
   const r = process.env.RAILWAY_STATIC_URL;
   if (r) return `https://${r}`;
   return `http://localhost:${PORT}`;
+}
+
+function filePathToPublicUrl(filePath) {
+  const filename = path.basename(filePath);
+  return `${getPublicHost()}/audio/${filename}`;
 }
 
 /* ===========================================================================  
@@ -555,11 +622,6 @@ async function textToSpeechMp3FilePi(replyText, prefix = "pi_v2") {
     console.error("⚠️ PI voice server timeout/fail -> fallback OpenAI:", e?.message || e);
     return await openaiTtsToMp3File(safeText, `${prefix}_openai`);
   }
-}
-
-function filePathToPublicUrl(filePath) {
-  const filename = path.basename(filePath);
-  return `${getPublicHost()}/audio/${filename}`;
 }
 
 /* ===========================================================================  
@@ -686,8 +748,6 @@ function detectStopPlayback(text = "") {
 
 /* ===========================================================================  
    YouTube Search
-   - Prefer YouTube Data API v3 if YOUTUBE_API_KEY exists (duration=medium)
-   - Fallback to yt-search and filter seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
 ===========================================================================*/
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
@@ -712,12 +772,12 @@ async function ytApiSearchCandidates(query, { videoDuration = YT_VIDEO_DURATION,
       q: query,
       type: "video",
       maxResults: String(maxResults),
-      videoDuration: videoDuration, // ✅ duration filter
+      videoDuration,
       key: YOUTUBE_API_KEY,
       safeSearch: "none",
       regionCode: "VN",
       relevanceLanguage: "vi",
-      videoCategoryId: "10", // Music category (optional)
+      videoCategoryId: "10",
     });
 
     const url = `https://www.googleapis.com/youtube/v3/search?${params.toString()}`;
@@ -790,7 +850,6 @@ async function searchYouTubeTop1(query) {
       const ids = cands.map((c) => c.videoId);
       const details = await ytApiFetchDurations(ids);
 
-      // Prefer <= MAX_ACCEPTABLE_VIDEO_SECONDS (e.g., 15m)
       const ok = (details || []).filter(
         (d) => typeof d.seconds === "number" && d.seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
       );
@@ -1078,11 +1137,6 @@ app.post(
           max_accept_s: MAX_ACCEPTABLE_VIDEO_SECONDS,
         }, `(${ms()}ms)`);
 
-        // extra hard guard: if we somehow got a super long clip, still proceed (download first 9m) or reject
-        if (top?.seconds && top.seconds > 3600) {
-          console.log("⚠️ Very long video detected (seconds>3600) but we still can clip first 9 min.");
-        }
-
         if (top?.url) {
           const songTitle = (top.title || "").trim() || "bài này";
           const preVoiceText = `Ây da, bài hát "${songTitle}" của huynh đây rồi, nghe vui nha`;
@@ -1090,7 +1144,7 @@ app.post(
           // 1) pre-voice
           const preVoicePath = await textToSpeechMp3FilePi(preVoiceText, "prevoice");
 
-          // 2) download first 9 minutes only (FAST)
+          // 2) download first 9 minutes only (robust multi-client)
           const song9mPath = await extractFirst9MinMp3FromYoutube(top.url, audioDir);
 
           // 3) concat
@@ -1215,7 +1269,14 @@ Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của ngư
 app.get("/debug_ytdlp", async (req, res) => {
   try {
     const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
-    return res.json({ ok: true, ytdlp: out.trim(), ffmpeg_static: !!ffmpegPath });
+    return res.json({
+      ok: true,
+      ytdlp: out.trim(),
+      ffmpeg_static: !!ffmpegPath,
+      cookies: !!ensureCookiesFileIfAny(),
+      clients: YTDLP_CLIENT_PROFILES.map((x) => x.name),
+      ytdlp_timeout_ms: MUSIC_YTDLP_TIMEOUT_MS,
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
@@ -1291,7 +1352,9 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube duration filter + download ONLY first 9 minutes + Pre-Voice + Merge)");
+  res.send(
+    "Matthew Robot server is running 🚀 (Robust yt-dlp multi-client + download-sections + IPv4 DNS fix)"
+  );
 });
 
 /* ===========================================================================  
@@ -1306,5 +1369,6 @@ app.listen(PORT, async () => {
   console.log(`🎵 yt-dlp timeout: ${MUSIC_YTDLP_TIMEOUT_MS} ms`);
   console.log(`🎵 ffmpeg timeout: ${MUSIC_FFMPEG_TIMEOUT_MS} ms`);
   console.log(`🎵 YouTube Data API enabled: ${!!YOUTUBE_API_KEY}`);
+  console.log(`🎵 yt-dlp cookies enabled: ${!!ensureCookiesFileIfAny()}`);
   await checkYtdlpReady();
 });
