@@ -1,13 +1,17 @@
 /* ===========================================================================
    Matthew Robot — Node.js Server (Chatbot + YouTube + Auto Navigation)
    - STT + ChatGPT -> TTS (Eleven WAV server -> MP3, fallback OpenAI TTS)
-   - MUSIC: YouTube search (yt-search) -> DOWNLOAD LOCAL -> TRIM FIRST 9 MIN -> MP3
+   - MUSIC:
+       (A) Search: YouTube Data API v3 (if YOUTUBE_API_KEY set) with videoDuration=medium
+           fallback to yt-search (scrape) and locally filter duration
+       (B) Download: yt-dlp download ONLY first MAX_MUSIC_SECONDS (540s) -> mp3 (fast, avoid long clip full download)
+           fallback to old method (download full then trim) if section download fails
    - Pre-voice: "Ây da, bài hát "ten bài hát" của huynh đây rồi, nghe vui nha"
    - Merge pre-voice + music segment => final mp3 => return audio_url
    - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
    - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
-===========================================================================*/
+=========================================================================== */
 
 import express from "express";
 import fs from "fs";
@@ -47,9 +51,14 @@ const audioDir = path.join(publicDir, "audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
 /* ===========================================================================  
-   CONFIG
+   CONFIG (defaults hard-coded as you requested)
 ===========================================================================*/
-const MAX_MUSIC_SECONDS = Number(process.env.MAX_MUSIC_SECONDS || 540); // 9 minutes
+// ✅ hard default constants (không cần set env trên Railway)
+const MAX_MUSIC_SECONDS = 540;                // 9 minutes
+const YT_VIDEO_DURATION = "medium";           // short|medium|long|any  (YouTube Data API)
+const MAX_ACCEPTABLE_VIDEO_SECONDS = 900;     // 15 minutes (lọc clip dài)
+
+// still allow env for timeouts if you want; if not set -> defaults below
 const MUSIC_FFMPEG_TIMEOUT_MS = Number(process.env.MUSIC_FFMPEG_TIMEOUT_MS || 240000); // 4 min
 const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 180000); // 3 min (download)
 const MUSIC_DOWNLOAD_RETRY = Number(process.env.MUSIC_DOWNLOAD_RETRY || 2);
@@ -138,7 +147,8 @@ function safeRmdir(p) {
 }
 
 /* ===========================================================================  
-   yt-dlp + ffmpeg (DOWNLOAD LOCAL FIRST, then TRIM/CONVERT LOCAL)
+   yt-dlp + ffmpeg
+   - NEW: download ONLY first MAX_MUSIC_SECONDS via external downloader (ffmpeg -ss 0 -t N)
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
@@ -154,13 +164,11 @@ async function checkYtdlpReady() {
 }
 
 function findDownloadedFile(baseNoExt) {
-  // yt-dlp output can be .m4a .webm .opus ...
   const exts = ["m4a", "webm", "opus", "aac", "mp4", "mkv", "wav", "flac", "mp3"];
   for (const ext of exts) {
     const p = `${baseNoExt}.${ext}`;
     if (fs.existsSync(p) && fs.statSync(p).size > 50_000) return p;
   }
-  // fallback: scan folder by prefix
   const dir = path.dirname(baseNoExt);
   const prefix = path.basename(baseNoExt) + ".";
   try {
@@ -174,7 +182,7 @@ function findDownloadedFile(baseNoExt) {
   return null;
 }
 
-// ✅ Download full audio to local file (NO streaming)
+// (old) Download full audio to local file (NO streaming)
 async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
   if (!youtubeUrl) throw new Error("Missing youtubeUrl");
   fs.mkdirSync(outDir, { recursive: true });
@@ -201,7 +209,7 @@ async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
   return downloaded;
 }
 
-// ✅ Local trim+convert to mp3 (cục bộ)
+// (old) Local trim+convert to mp3
 async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SECONDS) {
   if (!inputFile || !fs.existsSync(inputFile)) throw new Error("Input file missing");
   fs.mkdirSync(path.dirname(outMp3), { recursive: true });
@@ -227,12 +235,63 @@ async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SE
   return outMp3;
 }
 
+// ✅ NEW: Download ONLY first N seconds -> MP3 (fast, avoids long-video full download)
+async function ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, seconds = MAX_MUSIC_SECONDS) {
+  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const base = path.join(outDir, `ytclip_${Date.now()}`);
+  const template = `${base}.%(ext)s`;
+
+  const sec = Math.max(1, Math.floor(Number(seconds) || MAX_MUSIC_SECONDS));
+
+  const args = [
+    "--no-playlist",
+    "--force-ipv4",
+    "--retries", "10",
+    "--fragment-retries", "10",
+    "--socket-timeout", "10",
+    "--concurrent-fragments", "2",
+
+    // Use ffmpeg-static to only pull first N seconds
+    "--ffmpeg-location", ffmpegPath,
+    "--external-downloader", ffmpegPath,
+    "--external-downloader-args", `ffmpeg_i:-ss 0 -t ${sec}`,
+
+    "-f", "bestaudio/best",
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "-o", template,
+    youtubeUrl,
+  ];
+
+  await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
+
+  const downloaded = findDownloadedFile(base);
+  if (!downloaded || !downloaded.endsWith(".mp3")) {
+    throw new Error("yt-dlp section download finished but mp3 not found");
+  }
+  if (!fs.existsSync(downloaded) || fs.statSync(downloaded).size < 30_000) {
+    throw new Error("downloaded mp3 too small / invalid");
+  }
+
+  return downloaded;
+}
+
 async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
   if (!youtubeUrl) throw new Error("Missing url");
 
-  // temp workdir để chứa file tải về (không lưu bẩn vào public/audio)
-  const tmpWork = fs.mkdtempSync(path.join(os.tmpdir(), "yt_work_"));
+  // ✅ prefer fast section download (no full clip download)
+  try {
+    const mp3 = await ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, MAX_MUSIC_SECONDS);
+    return mp3;
+  } catch (e) {
+    console.error("[MUSIC] section download failed -> fallback full download+trim:", e?.message || e);
+  }
 
+  // fallback to old method
+  const tmpWork = fs.mkdtempSync(path.join(os.tmpdir(), "yt_work_"));
   const ts = Date.now();
   const outMp3 = path.join(outDir, `yt9m_${ts}.mp3`);
 
@@ -241,20 +300,15 @@ async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
   for (let attempt = 1; attempt <= Math.max(1, MUSIC_DOWNLOAD_RETRY + 1); attempt++) {
     let downloaded = null;
     try {
-      // 1) download local
       downloaded = await ytdlpDownloadBestAudio(youtubeUrl, tmpWork);
-
-      // 2) trim + convert local to mp3 (first 9 minutes)
       await ffmpegTrimToMp3Local(downloaded, outMp3, MAX_MUSIC_SECONDS);
 
-      // cleanup downloaded
       safeUnlink(downloaded);
       safeRmdir(tmpWork);
       return outMp3;
-    } catch (e) {
-      lastErr = e;
-      console.error(`[MUSIC] attempt ${attempt} failed:`, e?.message || e);
-      // cleanup attempt
+    } catch (err) {
+      lastErr = err;
+      console.error(`[MUSIC] fallback attempt ${attempt} failed:`, err?.message || err);
       try { if (downloaded) safeUnlink(downloaded); } catch { }
       await sleep(500 * attempt);
     }
@@ -631,15 +685,139 @@ function detectStopPlayback(text = "") {
 }
 
 /* ===========================================================================  
-   YouTube search (yt-search) -> TOP 1
+   YouTube Search
+   - Prefer YouTube Data API v3 if YOUTUBE_API_KEY exists (duration=medium)
+   - Fallback to yt-search and filter seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
 ===========================================================================*/
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
+
+function parseIsoDurationToSeconds(iso = "") {
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (!m) return null;
+  const h = Number(m[1] || 0);
+  const min = Number(m[2] || 0);
+  const s = Number(m[3] || 0);
+  return h * 3600 + min * 60 + s;
+}
+
+async function ytApiSearchCandidates(query, { videoDuration = YT_VIDEO_DURATION, maxResults = 8 } = {}) {
+  if (!YOUTUBE_API_KEY) return null;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const params = new URLSearchParams({
+      part: "snippet",
+      q: query,
+      type: "video",
+      maxResults: String(maxResults),
+      videoDuration: videoDuration, // ✅ duration filter
+      key: YOUTUBE_API_KEY,
+      safeSearch: "none",
+      regionCode: "VN",
+      relevanceLanguage: "vi",
+      videoCategoryId: "10", // Music category (optional)
+    });
+
+    const url = `https://www.googleapis.com/youtube/v3/search?${params.toString()}`;
+    const resp = await fetch(url, { signal: controller.signal });
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      throw new Error(`YT_API search error ${resp.status}: ${JSON.stringify(data).slice(0, 200)}`);
+    }
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    return items
+      .map((it) => ({
+        videoId: it?.id?.videoId || "",
+        title: it?.snippet?.title || "",
+        channelTitle: it?.snippet?.channelTitle || "",
+      }))
+      .filter((x) => x.videoId);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function ytApiFetchDurations(videoIds = []) {
+  if (!YOUTUBE_API_KEY) return null;
+  if (!videoIds.length) return [];
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const params = new URLSearchParams({
+      part: "contentDetails,snippet",
+      id: videoIds.join(","),
+      key: YOUTUBE_API_KEY,
+    });
+
+    const url = `https://www.googleapis.com/youtube/v3/videos?${params.toString()}`;
+    const resp = await fetch(url, { signal: controller.signal });
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      throw new Error(`YT_API videos error ${resp.status}: ${JSON.stringify(data).slice(0, 200)}`);
+    }
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    return items.map((it) => {
+      const iso = it?.contentDetails?.duration || "";
+      const seconds = parseIsoDurationToSeconds(iso);
+      return {
+        videoId: it?.id || "",
+        title: it?.snippet?.title || "",
+        channelTitle: it?.snippet?.channelTitle || "",
+        seconds: typeof seconds === "number" ? seconds : null,
+      };
+    });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function searchYouTubeTop1(query) {
   const q = (query || "").trim();
   if (!q) return null;
 
+  // 1) Prefer YouTube Data API
+  try {
+    const cands = await ytApiSearchCandidates(q, { videoDuration: YT_VIDEO_DURATION, maxResults: 8 });
+    if (cands && cands.length) {
+      const ids = cands.map((c) => c.videoId);
+      const details = await ytApiFetchDurations(ids);
+
+      // Prefer <= MAX_ACCEPTABLE_VIDEO_SECONDS (e.g., 15m)
+      const ok = (details || []).filter(
+        (d) => typeof d.seconds === "number" && d.seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
+      );
+      const pick = ok[0] || (details || [])[0];
+
+      if (pick?.videoId) {
+        return {
+          url: `https://www.youtube.com/watch?v=${pick.videoId}`,
+          title: pick.title || "",
+          seconds: typeof pick.seconds === "number" ? pick.seconds : null,
+          author: pick.channelTitle || "",
+        };
+      }
+    }
+  } catch (e) {
+    console.error("YT_API search failed -> fallback yt-search:", e?.message || e);
+  }
+
+  // 2) Fallback: yt-search + local duration filter
   try {
     const r = await yts(q);
-    const v = (r?.videos || [])[0];
+    const vids = (r?.videos || []).filter((v) => !!v?.url);
+
+    const ok = vids.filter(
+      (v) => typeof v.seconds === "number" && v.seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
+    );
+    const v = ok[0] || vids[0];
     if (!v?.url) return null;
 
     return {
@@ -829,7 +1007,6 @@ app.post(
       try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
       const memoryArr = Array.isArray(meta.memory) ? meta.memory : [];
 
-      // save WAV temp
       const wavPath = path.join(audioDir, `pi_v2_${Date.now()}.wav`);
       fs.writeFileSync(wavPath, audioFile.buffer);
 
@@ -885,28 +1062,41 @@ app.post(
       if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC (DOWNLOAD -> LOCAL TRIM -> MP3) + PRE-VOICE + MERGE
+      // MUSIC
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
         const top = await searchYouTubeTop1(q);
-        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url }, `(${ms()}ms)`);
+
+        console.log("🎵 MUSIC:", {
+          stt: text,
+          q,
+          found: !!top?.url,
+          url: top?.url,
+          seconds: top?.seconds ?? null,
+          duration_filter: YT_VIDEO_DURATION,
+          max_accept_s: MAX_ACCEPTABLE_VIDEO_SECONDS,
+        }, `(${ms()}ms)`);
+
+        // extra hard guard: if we somehow got a super long clip, still proceed (download first 9m) or reject
+        if (top?.seconds && top.seconds > 3600) {
+          console.log("⚠️ Very long video detected (seconds>3600) but we still can clip first 9 min.");
+        }
 
         if (top?.url) {
           const songTitle = (top.title || "").trim() || "bài này";
           const preVoiceText = `Ây da, bài hát "${songTitle}" của huynh đây rồi, nghe vui nha`;
 
-          // 1) generate pre-voice mp3
+          // 1) pre-voice
           const preVoicePath = await textToSpeechMp3FilePi(preVoiceText, "prevoice");
 
-          // 2) download local + trim 9 minutes (LOCAL)
+          // 2) download first 9 minutes only (FAST)
           const song9mPath = await extractFirst9MinMp3FromYoutube(top.url, audioDir);
 
-          // 3) concat => final mp3
+          // 3) concat
           const finalPath = await concatTwoMp3(preVoicePath, song9mPath, audioDir, "music_final");
           const audio_url = filePathToPublicUrl(finalPath);
 
-          // cleanup intermediate to save disk
           safeUnlink(preVoicePath);
           safeUnlink(song9mPath);
 
@@ -1101,7 +1291,7 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube DOWNLOAD -> LOCAL TRIM 9 MIN + Pre-Voice + Merge)");
+  res.send("Matthew Robot server is running 🚀 (YouTube duration filter + download ONLY first 9 minutes + Pre-Voice + Merge)");
 });
 
 /* ===========================================================================  
@@ -1111,7 +1301,10 @@ app.listen(PORT, async () => {
   console.log(`🚀 Server listening on port ${PORT}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
   console.log(`🎵 MAX_MUSIC_SECONDS: ${MAX_MUSIC_SECONDS}`);
+  console.log(`🎵 YT_VIDEO_DURATION: ${YT_VIDEO_DURATION}`);
+  console.log(`🎵 MAX_ACCEPTABLE_VIDEO_SECONDS: ${MAX_ACCEPTABLE_VIDEO_SECONDS}`);
   console.log(`🎵 yt-dlp timeout: ${MUSIC_YTDLP_TIMEOUT_MS} ms`);
   console.log(`🎵 ffmpeg timeout: ${MUSIC_FFMPEG_TIMEOUT_MS} ms`);
+  console.log(`🎵 YouTube Data API enabled: ${!!YOUTUBE_API_KEY}`);
   await checkYtdlpReady();
 });
