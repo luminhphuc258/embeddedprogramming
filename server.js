@@ -1,20 +1,18 @@
 /* ===========================================================================
-   Matthew Robot — Node.js Server (Chatbot + YouTube + Auto Navigation)
+   Matthew Robot — Node.js Server (Chatbot + YouTube STREAM + Auto Navigation)
    - STT + ChatGPT -> TTS (Eleven WAV server -> MP3, fallback OpenAI TTS)
    - MUSIC:
-       (A) Search: YouTube Data API v3 (if YOUTUBE_API_KEY set) with videoDuration=medium
-           fallback to yt-search (scrape) and locally filter duration
-       (B) Download: yt-dlp download ONLY first MAX_MUSIC_SECONDS -> mp3
-           fallback to full download+trim if needed
-   - Vision only when user asks (kept only for /avoid_obstacle_vision endpoint)
+       Search YouTube (Data API if key else yt-search)
+       Then yt-dlp -g => get DIRECT AUDIO STREAM URL (NO DOWNLOAD, NO FFMPEG)
+   - Vision endpoint kept (/avoid_obstacle_vision)
    - Label override + scan endpoints + camera rotate
 =========================================================================== */
 
 import express from "express";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import dns from "dns";
+import os from "os";
 import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
@@ -48,15 +46,13 @@ const audioDir = path.join(publicDir, "audio");
 fs.mkdirSync(audioDir, { recursive: true });
 
 /* ===========================================================================
-   CONFIG (defaults hard-coded)
+   CONFIG
 =========================================================================== */
-const MAX_MUSIC_SECONDS = 540;                // 9 minutes
 const YT_VIDEO_DURATION = "medium";           // short|medium|long|any  (YouTube Data API)
-const MAX_ACCEPTABLE_VIDEO_SECONDS = 900;     // 15 minutes (lọc clip dài)
-
-const MUSIC_FFMPEG_TIMEOUT_MS = Number(process.env.MUSIC_FFMPEG_TIMEOUT_MS || 240000); // 4 min
-const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 220000);  // 3.6 min
-const MUSIC_DOWNLOAD_RETRY = Number(process.env.MUSIC_DOWNLOAD_RETRY || 2);
+const MAX_ACCEPTABLE_VIDEO_SECONDS = 900;     // 15 minutes filter
+const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 20000); // stream url must be fast
+const MUSIC_STREAM_RETRY = Number(process.env.MUSIC_STREAM_RETRY || 2);
 
 /* ===========================================================================
    CORS
@@ -137,26 +133,9 @@ function safeUnlink(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch { }
 }
 
-function safeRmdir(p) {
-  try { if (p && fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch { }
-}
-
 /* ===========================================================================
-   yt-dlp + ffmpeg
-   - FIX: retry-sleep syntax (KHÔNG dùng "1:linear", phải "http:linear=1::2"...)
-   - Try multiple youtube player clients (android/ios/mweb/web/tv)
-   - Optional: YT_VISITOR_DATA / YT_PO_TOKEN / YT_COOKIES_PATH
+   yt-dlp STREAM URL (NO DOWNLOAD)
 =========================================================================== */
-const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-
-// OPTIONAL (khi YouTube yêu cầu)
-const YT_VISITOR_DATA = (process.env.YT_VISITOR_DATA || "").trim();
-const YT_PO_TOKEN = (process.env.YT_PO_TOKEN || "").trim();
-const YT_COOKIES_PATH = (process.env.YT_COOKIES_PATH || "").trim();
-
-// Thử các client để né SABR / 502 / missing url
-const YT_CLIENT_TRY_ORDER = ["android", "ios", "mweb", "web", "tv"];
-
 async function checkYtdlpReady() {
   try {
     const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
@@ -168,260 +147,50 @@ async function checkYtdlpReady() {
   }
 }
 
-function findDownloadedFile(baseNoExt) {
-  const exts = ["m4a", "webm", "opus", "aac", "mp4", "mkv", "wav", "flac", "mp3"];
-  for (const ext of exts) {
-    const p = `${baseNoExt}.${ext}`;
-    if (fs.existsSync(p) && fs.statSync(p).size > 50_000) return p;
-  }
-  const dir = path.dirname(baseNoExt);
-  const prefix = path.basename(baseNoExt) + ".";
-  try {
-    const files = fs.readdirSync(dir);
-    const hit = files.find((f) => f.startsWith(prefix));
-    if (hit) {
-      const full = path.join(dir, hit);
-      if (fs.existsSync(full) && fs.statSync(full).size > 50_000) return full;
-    }
-  } catch { }
-  return null;
-}
+// Lấy direct audio URL (ưu tiên m4a nếu có; nếu không thì bestaudio)
+async function ytdlpGetAudioStreamUrl(youtubeUrl) {
+  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
 
-function buildExtractorArgsForClient(client) {
-  // youtube extractor args: player_client=...
-  // optional visitor_data / po_token (khi yt-dlp warn Missing required Visitor Data)
-  const parts = [`player_client=${client}`];
-  if (YT_VISITOR_DATA) parts.push(`visitor_data=${YT_VISITOR_DATA}`);
-  if (YT_PO_TOKEN) parts.push(`po_token=${YT_PO_TOKEN}`);
-  return `youtube:${parts.join(";")}`;
-}
-
-function buildCommonYtdlpArgs() {
+  // NOTE: -g trả URL trực tiếp (thường googlevideo), sẽ hết hạn theo thời gian
   const args = [
     "--no-playlist",
     "--force-ipv4",
-
-    // retries
-    "--retries", "10",
-    "--fragment-retries", "10",
-    "--extractor-retries", "10",
-
-    // ✅ FIX retry-sleep syntax (đúng chuẩn yt-dlp)
-    // EXPR dạng linear=START[:END[:STEP=1]] hoặc exp=START[:END[:BASE=2]]
-    // Ví dụ official: --retry-sleep linear=1::2 --retry-sleep fragment:exp=1:20
-    "--retry-sleep", "http:linear=1::2",
-    "--retry-sleep", "fragment:linear=1::2",
-    "--retry-sleep", "extractor:linear=1::2",
-    "--retry-sleep", "file_access:linear=1::2",
-
-    // timeouts
-    "--socket-timeout", "15",
-
-    // tránh bị chặn nhanh (nhẹ thôi)
-    "--sleep-requests", "1",
-
-    // header nhẹ (giảm 502 ở vài môi trường)
-    "--add-header", "Accept-Language:vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    "--retries", "5",
+    "--socket-timeout", "10",
+    "--geo-bypass",
+    "--geo-bypass-country", "VN",
+    "-f", "bestaudio[ext=m4a]/bestaudio/best",
+    "-g",
+    youtubeUrl,
   ];
 
-  // cookies nếu có
-  if (YT_COOKIES_PATH && fs.existsSync(YT_COOKIES_PATH)) {
-    args.push("--cookies", YT_COOKIES_PATH);
-  }
+  const { out } = await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
+  const lines = out.split("\n").map((s) => s.trim()).filter(Boolean);
+  const url = lines[0];
 
-  return args;
+  if (!url || !url.startsWith("http")) {
+    throw new Error("yt-dlp -g returned empty/invalid url");
+  }
+  return url;
 }
 
-// (old) Download full audio to local file (NO streaming)
-async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
-  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
-  fs.mkdirSync(outDir, { recursive: true });
-
-  const base = path.join(outDir, `ytdlp_${Date.now()}`);
-  const template = `${base}.%(ext)s`;
-
+// retry wrapper
+async function getStreamUrlWithRetry(youtubeUrl) {
   let lastErr = null;
-
-  for (const client of YT_CLIENT_TRY_ORDER) {
+  for (let i = 0; i < Math.max(1, MUSIC_STREAM_RETRY + 1); i++) {
     try {
-      console.log(`🎵 [yt-dlp] full download try client=${client}`);
-      const args = [
-        ...buildCommonYtdlpArgs(),
-        "--extractor-args", buildExtractorArgsForClient(client),
-
-        // prefer m4a if possible (hay ổn hơn webm ở vài case)
-        "-f", "bestaudio[ext=m4a]/bestaudio/best",
-        "-o", template,
-        youtubeUrl,
-      ];
-
-      await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
-
-      const downloaded = findDownloadedFile(base);
-      if (!downloaded) throw new Error("yt-dlp download finished but file not found");
-      return downloaded;
+      return await ytdlpGetAudioStreamUrl(youtubeUrl);
     } catch (e) {
       lastErr = e;
-      console.error(`⚠️ [yt-dlp] client=${client} failed:`, e?.message || e);
-      await sleep(600);
+      console.error(`[MUSIC] stream url attempt ${i + 1} failed:`, e?.message || e);
+      await sleep(400 * (i + 1));
     }
   }
-
-  throw lastErr || new Error("yt-dlp full download failed all clients");
-}
-
-// (old) Local trim+convert to mp3
-async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SECONDS) {
-  if (!inputFile || !fs.existsSync(inputFile)) throw new Error("Input file missing");
-  fs.mkdirSync(path.dirname(outMp3), { recursive: true });
-
-  const args = [
-    "-y",
-    "-hide_banner",
-    "-loglevel", "error",
-    "-i", inputFile,
-    "-t", String(Math.max(1, Math.floor(maxSeconds))),
-    "-vn",
-    "-ac", "2",
-    "-ar", "44100",
-    "-b:a", "192k",
-    outMp3,
-  ];
-
-  await run(ffmpegPath, args, { timeoutMs: MUSIC_FFMPEG_TIMEOUT_MS });
-
-  if (!fs.existsSync(outMp3) || fs.statSync(outMp3).size < 20_000) {
-    throw new Error("ffmpeg output too small / missing");
-  }
-  return outMp3;
-}
-
-// ✅ NEW: Download ONLY first N seconds -> MP3 (fast)
-async function ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, seconds = MAX_MUSIC_SECONDS) {
-  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
-  fs.mkdirSync(outDir, { recursive: true });
-
-  const base = path.join(outDir, `ytclip_${Date.now()}`);
-  const template = `${base}.%(ext)s`;
-
-  const sec = Math.max(1, Math.floor(Number(seconds) || MAX_MUSIC_SECONDS));
-
-  let lastErr = null;
-
-  for (const client of YT_CLIENT_TRY_ORDER) {
-    try {
-      console.log(`🎵 [yt-dlp] section clip try client=${client}`);
-
-      const args = [
-        ...buildCommonYtdlpArgs(),
-        "--extractor-args", buildExtractorArgsForClient(client),
-
-        // Use ffmpeg-static to only pull first N seconds
-        "--ffmpeg-location", ffmpegPath,
-        "--external-downloader", ffmpegPath,
-        "--external-downloader-args", `ffmpeg_i:-ss 0 -t ${sec}`,
-
-        // format
-        "-f", "bestaudio[ext=m4a]/bestaudio/best",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "-o", template,
-        youtubeUrl,
-      ];
-
-      await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
-
-      const downloaded = findDownloadedFile(base);
-      if (!downloaded || !downloaded.endsWith(".mp3")) {
-        throw new Error("yt-dlp section download finished but mp3 not found");
-      }
-      if (!fs.existsSync(downloaded) || fs.statSync(downloaded).size < 30_000) {
-        throw new Error("downloaded mp3 too small / invalid");
-      }
-
-      return downloaded;
-    } catch (e) {
-      lastErr = e;
-      console.error(`⚠️ [yt-dlp] client=${client} failed:`, e?.message || e);
-      await sleep(700);
-    }
-  }
-
-  throw lastErr || new Error("yt-dlp section clip failed all clients");
-}
-
-async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
-  if (!youtubeUrl) throw new Error("Missing url");
-
-  // ✅ prefer fast section download
-  try {
-    const mp3 = await ytdlpDownloadFirstNSecondsMp3(youtubeUrl, outDir, MAX_MUSIC_SECONDS);
-    return mp3;
-  } catch (e) {
-    console.error("[MUSIC] section clip failed -> fallback full download+trim:", e?.message || e);
-  }
-
-  // fallback to old method
-  const tmpWork = fs.mkdtempSync(path.join(os.tmpdir(), "yt_work_"));
-  const ts = Date.now();
-  const outMp3 = path.join(outDir, `yt9m_${ts}.mp3`);
-
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= Math.max(1, MUSIC_DOWNLOAD_RETRY + 1); attempt++) {
-    let downloaded = null;
-    try {
-      downloaded = await ytdlpDownloadBestAudio(youtubeUrl, tmpWork);
-      await ffmpegTrimToMp3Local(downloaded, outMp3, MAX_MUSIC_SECONDS);
-
-      safeUnlink(downloaded);
-      safeRmdir(tmpWork);
-      return outMp3;
-    } catch (err) {
-      lastErr = err;
-      console.error(`[MUSIC] fallback attempt ${attempt} failed:`, err?.message || err);
-      try { if (downloaded) safeUnlink(downloaded); } catch { }
-      await sleep(800 * attempt);
-    }
-  }
-
-  safeRmdir(tmpWork);
-  throw lastErr || new Error("Failed to extract music");
+  throw lastErr || new Error("Failed to get stream url");
 }
 
 /* ===========================================================================
-   CONCAT: pre-voice mp3 + song mp3 => final mp3
-=========================================================================== */
-async function concatTwoMp3(ttsPath, songPath, outDir, prefix = "mix") {
-  fs.mkdirSync(outDir, { recursive: true });
-  const ts = Date.now();
-  const outPath = path.join(outDir, `${prefix}_${ts}.mp3`);
-
-  const args = [
-    "-y",
-    "-hide_banner",
-    "-loglevel", "error",
-    "-i", ttsPath,
-    "-i", songPath,
-    "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[outa]",
-    "-map", "[outa]",
-    "-ac", "2",
-    "-ar", "44100",
-    "-b:a", "192k",
-    outPath,
-  ];
-
-  await run(ffmpegPath, args, { timeoutMs: 240000 });
-
-  if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 50_000) {
-    throw new Error("concat output missing/too small");
-  }
-  return outPath;
-}
-
-/* ===========================================================================
-   STATIC
+   STATIC (for TTS mp3 only)
 =========================================================================== */
 app.use("/audio", express.static(audioDir));
 
@@ -487,29 +256,13 @@ mqttClient.on("message", (topic, message) => {
       console.log("==> Detect gesture stop");
       return;
     }
-    if (topic === "robot/gesture/standup") {
-      console.log("==> Detect gesture stand up");
-      return;
-    }
-    if (topic === "robot/gesture/sit") {
-      console.log("==> Detect gesture sitdown");
-      return;
-    }
-    if (topic === "robot/gesture/moveleft") {
-      console.log("==> Detect gesture turn left");
-      return;
-    }
-    if (topic === "robot/moveright") {
-      console.log("==> Detect gesture turn right");
-      return;
-    }
   } catch (err) {
     console.error("MQTT message error", err);
   }
 });
 
 /* ===========================================================================
-   HELPERS — normalize / routing
+   HELPERS
 =========================================================================== */
 function stripDiacritics(s = "") {
   return s
@@ -531,8 +284,13 @@ function getPublicHost() {
   return `http://localhost:${PORT}`;
 }
 
+function filePathToPublicUrl(filePath) {
+  const filename = path.basename(filePath);
+  return `${getPublicHost()}/audio/${filename}`;
+}
+
 /* ===========================================================================
-   VOICE (Eleven proxy server -> WAV -> MP3) + fallback OpenAI
+   VOICE (Eleven WAV->MP3) + fallback OpenAI
 =========================================================================== */
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
@@ -629,11 +387,6 @@ async function textToSpeechMp3FilePi(replyText, prefix = "pi_v2") {
   }
 }
 
-function filePathToPublicUrl(filePath) {
-  const filename = path.basename(filePath);
-  return `${getPublicHost()}/audio/${filename}`;
-}
-
 /* ===========================================================================
    MUSIC QUERY CLEANING
 =========================================================================== */
@@ -705,8 +458,7 @@ function looksLikeSongTitleOnly(userText = "") {
   if (t.length > 70) return false;
   if (isQuestionLike(t)) return false;
 
-  const hasWord = /[a-zA-Z0-9À-ỹ]/.test(t);
-  return hasWord;
+  return /[a-zA-Z0-9À-ỹ]/.test(t);
 }
 
 function containsMusicIntent(text = "") {
@@ -757,7 +509,7 @@ function detectStopPlayback(text = "") {
 }
 
 /* ===========================================================================
-   YouTube Search (Data API v3 preferred)
+   YouTube Search
 =========================================================================== */
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
@@ -794,9 +546,7 @@ async function ytApiSearchCandidates(query, { videoDuration = YT_VIDEO_DURATION,
     const resp = await fetch(url, { signal: controller.signal });
     const data = await resp.json().catch(() => ({}));
 
-    if (!resp.ok) {
-      throw new Error(`YT_API search error ${resp.status}: ${JSON.stringify(data).slice(0, 200)}`);
-    }
+    if (!resp.ok) throw new Error(`YT_API search error ${resp.status}`);
 
     const items = Array.isArray(data.items) ? data.items : [];
     return items
@@ -829,9 +579,7 @@ async function ytApiFetchDurations(videoIds = []) {
     const resp = await fetch(url, { signal: controller.signal });
     const data = await resp.json().catch(() => ({}));
 
-    if (!resp.ok) {
-      throw new Error(`YT_API videos error ${resp.status}: ${JSON.stringify(data).slice(0, 200)}`);
-    }
+    if (!resp.ok) throw new Error(`YT_API videos error ${resp.status}`);
 
     const items = Array.isArray(data.items) ? data.items : [];
     return items.map((it) => {
@@ -853,6 +601,7 @@ async function searchYouTubeTop1(query) {
   const q = (query || "").trim();
   if (!q) return null;
 
+  // 1) Prefer API
   try {
     const cands = await ytApiSearchCandidates(q, { videoDuration: YT_VIDEO_DURATION, maxResults: 8 });
     if (cands && cands.length) {
@@ -877,13 +626,11 @@ async function searchYouTubeTop1(query) {
     console.error("YT_API search failed -> fallback yt-search:", e?.message || e);
   }
 
+  // 2) Fallback scrape
   try {
     const r = await yts(q);
     const vids = (r?.videos || []).filter((v) => !!v?.url);
-
-    const ok = vids.filter(
-      (v) => typeof v.seconds === "number" && v.seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS
-    );
+    const ok = vids.filter((v) => typeof v.seconds === "number" && v.seconds <= MAX_ACCEPTABLE_VIDEO_SECONDS);
     const v = ok[0] || vids[0];
     if (!v?.url) return null;
 
@@ -932,19 +679,7 @@ function isClapText(text = "") {
 }
 
 /* ===========================================================================
-   VISION trigger (used only in /avoid_obstacle_vision)
-=========================================================================== */
-function wantsVision(text = "") {
-  const t = stripDiacritics((text || "").toLowerCase());
-  const triggers = [
-    "nhin", "xem", "xung quanh", "truoc mat", "o day co gi", "co gi", "mo ta",
-    "trong anh", "anh nay", "tam anh", "camera", "day la gi", "cai gi", "vat gi", "giai thich hinh"
-  ];
-  return triggers.some((k) => t.includes(stripDiacritics(k)));
-}
-
-/* ===========================================================================
-   VISION ENDPOINT (AvoidObstacle vision)
+   VISION ENDPOINT
 =========================================================================== */
 app.post("/avoid_obstacle_vision", uploadVision.single("image"), async (req, res) => {
   try {
@@ -1054,7 +789,7 @@ Return JSON schema exactly:
 });
 
 /* ===========================================================================
-   UPLOAD_AUDIO — PI v2 (WAV) + optional image (ignored), TEXT ONLY
+   UPLOAD_AUDIO — PI v2
 =========================================================================== */
 app.post(
   "/pi_upload_audio_v2",
@@ -1094,7 +829,7 @@ app.post(
         safeUnlink(wavPath);
       }
 
-      // clap short-circuit -> client bark
+      // clap
       if (isClapText(text)) {
         console.log("👏 Detected CLAP by STT -> return label=clap");
         return res.json({
@@ -1108,17 +843,17 @@ app.post(
         });
       }
 
-      // stop playback intent
+      // stop playback
       if (detectStopPlayback(text)) {
         const replyText = "Dạ, em tắt nhạc nha.";
         const ttsPath = await textToSpeechMp3FilePi(replyText, "stop");
-        const audio_url = filePathToPublicUrl(ttsPath);
+        const tts_url = filePathToPublicUrl(ttsPath);
         return res.json({
           status: "ok",
           transcript: text,
           label: "stop_playback",
           reply_text: replyText,
-          audio_url,
+          audio_url: tts_url,   // giữ tương thích: client play mp3 này nếu muốn
           play: null,
           used_vision: false,
         });
@@ -1129,7 +864,7 @@ app.post(
       if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC
+      // MUSIC STREAM
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
@@ -1138,7 +873,7 @@ app.post(
         console.log("🎵 MUSIC:", {
           stt: text,
           q,
-          found: true,
+          found: !!top?.url,
           url: top?.url,
           seconds: top?.seconds ?? null,
           duration_filter: YT_VIDEO_DURATION,
@@ -1146,25 +881,30 @@ app.post(
         }, `(${ms()}ms)`);
 
         if (top?.url) {
+          const streamUrl = await getStreamUrlWithRetry(top.url);
           const songTitle = (top.title || "").trim() || "bài này";
-          const preVoiceText = `Ây da, bài hát "${songTitle}" của huynh đây rồi, nghe vui nha`;
+          const replyText = `Đây rồi: "${songTitle}".`;
 
-          // 1) pre-voice
-          const preVoicePath = await textToSpeechMp3FilePi(preVoiceText, "prevoice");
+          // (optional) tạo TTS mp3 để robot đọc, nhưng KHÔNG merge
+          let tts_url = null;
+          try {
+            const ttsPath = await textToSpeechMp3FilePi(replyText, "music_tts");
+            tts_url = filePathToPublicUrl(ttsPath);
+          } catch (e) {
+            console.error("⚠️ music tts fail:", e?.message || e);
+          }
 
-          // 2) download first 9 minutes only (FAST)
-          const song9mPath = await extractFirst9MinMp3FromYoutube(top.url, audioDir);
-
-          // 3) concat
-          const finalPath = await concatTwoMp3(preVoicePath, song9mPath, audioDir, "music_final");
-          const audio_url = filePathToPublicUrl(finalPath);
-
-          safeUnlink(preVoicePath);
-          safeUnlink(song9mPath);
-
+          // publish MQTT: gửi streamUrl (quan trọng)
           mqttClient.publish(
             "robot/music",
-            JSON.stringify({ label: "nhac", text: preVoiceText, audio_url, user: userKey, title: songTitle }),
+            JSON.stringify({
+              label: "nhac",
+              title: songTitle,
+              stream_url: streamUrl, // ✅ direct stream
+              tts_url,               // optional
+              user: userKey,
+              time: Date.now(),
+            }),
             { qos: 1 }
           );
 
@@ -1172,9 +912,9 @@ app.post(
             status: "ok",
             transcript: text,
             label: "nhac",
-            reply_text: preVoiceText,
-            audio_url,
-            play: null,
+            reply_text: replyText,
+            audio_url: streamUrl, // ✅ bạn nói chỉ cần audio ok => trả stream luôn
+            play: { type: "stream", url: streamUrl, title: songTitle, tts_url },
             used_vision: false,
           });
         }
@@ -1193,9 +933,7 @@ app.post(
         });
       }
 
-      // ===========================
-      // MOVEMENT labels -> MQTT
-      // ===========================
+      // movement -> MQTT
       if (["tien", "lui", "trai", "phai"].includes(label)) {
         mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
         return res.json({
@@ -1209,9 +947,7 @@ app.post(
         });
       }
 
-      // ===========================
-      // GPT (chat / question) — TEXT ONLY (no vision)
-      // ===========================
+      // GPT chat (no vision)
       const memoryText = (memoryArr || [])
         .slice(-12)
         .map((m, i) => {
@@ -1272,40 +1008,30 @@ Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của ngư
 );
 
 /* ===========================================================================
-   Debug: test yt-dlp
+   Debug endpoints
 =========================================================================== */
 app.get("/debug_ytdlp", async (req, res) => {
   try {
     const { out } = await run(YTDLP_BIN, ["--version"], { timeoutMs: 15000 });
-    return res.json({
-      ok: true,
-      ytdlp: out.trim(),
-      ffmpeg_static: !!ffmpegPath,
-      visitor_data_set: !!YT_VISITOR_DATA,
-      po_token_set: !!YT_PO_TOKEN,
-      cookies_path: YT_COOKIES_PATH && fs.existsSync(YT_COOKIES_PATH) ? YT_COOKIES_PATH : null,
-    });
+    return res.json({ ok: true, ytdlp: out.trim() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-app.get("/test_ytdlp", async (req, res) => {
+app.get("/test_stream", async (req, res) => {
   try {
     const url = (req.query.url || "").toString().trim();
     if (!url) return res.status(400).json({ error: "Missing ?url=" });
-
-    const mp3Path = await extractFirst9MinMp3FromYoutube(url, audioDir);
-    const audio_url = filePathToPublicUrl(mp3Path);
-
-    res.json({ ok: true, filename: path.basename(mp3Path), audio_url, max_seconds: MAX_MUSIC_SECONDS });
+    const stream_url = await getStreamUrlWithRetry(url);
+    res.json({ ok: true, stream_url });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
 /* ===========================================================================
-   CAMERA ROTATE ENDPOINT
+   CAMERA ROTATE
 =========================================================================== */
 app.get("/camera_rotate", (req, res) => {
   try {
@@ -1360,7 +1086,7 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 =========================================================================== */
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (yt-dlp retry-sleep fixed + multi client + optional visitor_data/po_token/cookies)");
+  res.send("Matthew Robot server is running 🚀 (YouTube STREAM mode: yt-dlp -g, no download)");
 });
 
 /* ===========================================================================
@@ -1369,14 +1095,8 @@ app.get("/", (req, res) => {
 app.listen(PORT, async () => {
   console.log(`🚀 Server listening on port ${PORT}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
-  console.log(`🎵 MAX_MUSIC_SECONDS: ${MAX_MUSIC_SECONDS}`);
-  console.log(`🎵 YT_VIDEO_DURATION: ${YT_VIDEO_DURATION}`);
-  console.log(`🎵 MAX_ACCEPTABLE_VIDEO_SECONDS: ${MAX_ACCEPTABLE_VIDEO_SECONDS}`);
-  console.log(`🎵 yt-dlp timeout: ${MUSIC_YTDLP_TIMEOUT_MS} ms`);
-  console.log(`🎵 ffmpeg timeout: ${MUSIC_FFMPEG_TIMEOUT_MS} ms`);
+  console.log(`🎵 YouTube stream mode: yt-dlp -g (no download)`);
+  console.log(`🎵 yt-dlp stream timeout: ${MUSIC_YTDLP_TIMEOUT_MS} ms`);
   console.log(`🎵 YouTube Data API enabled: ${!!YOUTUBE_API_KEY}`);
-  console.log(`🔐 YT_VISITOR_DATA set: ${!!YT_VISITOR_DATA}`);
-  console.log(`🔐 YT_PO_TOKEN set: ${!!YT_PO_TOKEN}`);
-  console.log(`🍪 YT_COOKIES_PATH exists: ${!!(YT_COOKIES_PATH && fs.existsSync(YT_COOKIES_PATH))}`);
   await checkYtdlpReady();
 });
