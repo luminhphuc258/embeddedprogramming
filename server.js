@@ -1,7 +1,7 @@
 /* ===========================================================================
    Matthew Robot — Node.js Server (Chatbot + YouTube + Auto Navigation)
    - STT + ChatGPT -> TTS (Eleven WAV server -> MP3, fallback OpenAI TTS)
-   - MUSIC: YouTube search (yt-search) -> ONLY FIRST 9 MINUTES -> MP3
+   - MUSIC: YouTube search (yt-search) -> DOWNLOAD LOCAL -> TRIM FIRST 9 MIN -> MP3
    - Pre-voice: "Ây da, bài hát "ten bài hát" của huynh đây rồi, nghe vui nha"
    - Merge pre-voice + music segment => final mp3 => return audio_url
    - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
@@ -12,6 +12,8 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import os from "os";
+import dns from "dns";
 import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
@@ -26,6 +28,9 @@ import { spawn } from "child_process";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+// ✅ Prefer IPv4 first (giảm lỗi DNS/IPv6 trên Railway)
+dns.setDefaultResultOrder("ipv4first");
 
 const uploadVision = multer({ storage: multer.memoryStorage() });
 const upload = multer({ storage: multer.memoryStorage() });
@@ -46,7 +51,8 @@ fs.mkdirSync(audioDir, { recursive: true });
 ===========================================================================*/
 const MAX_MUSIC_SECONDS = Number(process.env.MAX_MUSIC_SECONDS || 540); // 9 minutes
 const MUSIC_FFMPEG_TIMEOUT_MS = Number(process.env.MUSIC_FFMPEG_TIMEOUT_MS || 240000); // 4 min
-const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 30000); // 30s
+const MUSIC_YTDLP_TIMEOUT_MS = Number(process.env.MUSIC_YTDLP_TIMEOUT_MS || 180000); // 3 min (download)
+const MUSIC_DOWNLOAD_RETRY = Number(process.env.MUSIC_DOWNLOAD_RETRY || 2);
 
 /* ===========================================================================  
    CORS  
@@ -92,9 +98,9 @@ function uploadLimiter(req, res, next) {
 /* ===========================================================================  
    RUN helper (spawn)
 ===========================================================================*/
-function run(cmd, args, { timeoutMs = 180000 } = {}) {
+function run(cmd, args, { timeoutMs = 180000, cwd = undefined, env = undefined } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], cwd, env: env ?? process.env });
     let out = "";
     let err = "";
 
@@ -119,11 +125,20 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function safeUnlink(p) {
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch { }
+}
+
+function safeRmdir(p) {
+  try { if (p && fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch { }
+}
+
 /* ===========================================================================  
-   yt-dlp + ffmpeg (ONLY FIRST 9 MINUTES)
-   Strategy:
-   1) yt-dlp -g (get direct audio URL) quickly
-   2) ffmpeg stream that URL and cut -t 540 => mp3
+   yt-dlp + ffmpeg (DOWNLOAD LOCAL FIRST, then TRIM/CONVERT LOCAL)
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
@@ -138,66 +153,115 @@ async function checkYtdlpReady() {
   }
 }
 
-async function ytdlpGetDirectAudioUrl(youtubeUrl) {
-  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
-
-  // -f bestaudio : pick best audio format
-  // -g : print direct media URL(s)
-  // --no-playlist : avoid playlist
-  const args = ["--no-playlist", "-f", "bestaudio", "-g", youtubeUrl];
-
-  const { out } = await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
-
-  const lines = (out || "")
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  // yt-dlp -g sometimes prints multiple URLs; first one is enough for ffmpeg
-  const directUrl = lines[0];
-  if (!directUrl) throw new Error("yt-dlp returned empty direct URL");
-  return directUrl;
+function findDownloadedFile(baseNoExt) {
+  // yt-dlp output can be .m4a .webm .opus ...
+  const exts = ["m4a", "webm", "opus", "aac", "mp4", "mkv", "wav", "flac", "mp3"];
+  for (const ext of exts) {
+    const p = `${baseNoExt}.${ext}`;
+    if (fs.existsSync(p) && fs.statSync(p).size > 50_000) return p;
+  }
+  // fallback: scan folder by prefix
+  const dir = path.dirname(baseNoExt);
+  const prefix = path.basename(baseNoExt) + ".";
+  try {
+    const files = fs.readdirSync(dir);
+    const hit = files.find((f) => f.startsWith(prefix));
+    if (hit) {
+      const full = path.join(dir, hit);
+      if (fs.existsSync(full) && fs.statSync(full).size > 50_000) return full;
+    }
+  } catch { }
+  return null;
 }
 
-async function ffmpegCutMp3FromUrl(inputUrl, outPath, maxSeconds = MAX_MUSIC_SECONDS) {
-  if (!inputUrl) throw new Error("Missing inputUrl");
+// ✅ Download full audio to local file (NO streaming)
+async function ytdlpDownloadBestAudio(youtubeUrl, outDir) {
+  if (!youtubeUrl) throw new Error("Missing youtubeUrl");
+  fs.mkdirSync(outDir, { recursive: true });
 
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const base = path.join(outDir, `ytdlp_${Date.now()}`);
+  const template = `${base}.%(ext)s`;
 
-  // Use ffmpeg binary directly (more deterministic than fluent for network URLs)
+  const args = [
+    "--no-playlist",
+    "--force-ipv4",
+    "--retries", "10",
+    "--fragment-retries", "10",
+    "--socket-timeout", "10",
+    "--concurrent-fragments", "2",
+    "-f", "bestaudio/best",
+    "-o", template,
+    youtubeUrl,
+  ];
+
+  await run(YTDLP_BIN, args, { timeoutMs: MUSIC_YTDLP_TIMEOUT_MS });
+
+  const downloaded = findDownloadedFile(base);
+  if (!downloaded) throw new Error("yt-dlp download finished but file not found");
+  return downloaded;
+}
+
+// ✅ Local trim+convert to mp3 (cục bộ)
+async function ffmpegTrimToMp3Local(inputFile, outMp3, maxSeconds = MAX_MUSIC_SECONDS) {
+  if (!inputFile || !fs.existsSync(inputFile)) throw new Error("Input file missing");
+  fs.mkdirSync(path.dirname(outMp3), { recursive: true });
+
   const args = [
     "-y",
     "-hide_banner",
     "-loglevel", "error",
-    "-ss", "0",
-    "-t", String(maxSeconds),
-    "-i", inputUrl,
+    "-i", inputFile,
+    "-t", String(Math.max(1, Math.floor(maxSeconds))),
     "-vn",
     "-ac", "2",
     "-ar", "44100",
     "-b:a", "192k",
-    outPath,
+    outMp3,
   ];
 
   await run(ffmpegPath, args, { timeoutMs: MUSIC_FFMPEG_TIMEOUT_MS });
-  if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 20_000) {
+
+  if (!fs.existsSync(outMp3) || fs.statSync(outMp3).size < 20_000) {
     throw new Error("ffmpeg output too small / missing");
   }
-  return outPath;
+  return outMp3;
 }
 
 async function extractFirst9MinMp3FromYoutube(youtubeUrl, outDir) {
   if (!youtubeUrl) throw new Error("Missing url");
-  fs.mkdirSync(outDir, { recursive: true });
+
+  // temp workdir để chứa file tải về (không lưu bẩn vào public/audio)
+  const tmpWork = fs.mkdtempSync(path.join(os.tmpdir(), "yt_work_"));
 
   const ts = Date.now();
-  const outPath = path.join(outDir, `yt9m_${ts}.mp3`);
+  const outMp3 = path.join(outDir, `yt9m_${ts}.mp3`);
 
-  // Fast + avoids long-video timeout: stream & cut
-  const directAudioUrl = await ytdlpGetDirectAudioUrl(youtubeUrl);
-  await ffmpegCutMp3FromUrl(directAudioUrl, outPath, MAX_MUSIC_SECONDS);
+  let lastErr = null;
 
-  return outPath;
+  for (let attempt = 1; attempt <= Math.max(1, MUSIC_DOWNLOAD_RETRY + 1); attempt++) {
+    let downloaded = null;
+    try {
+      // 1) download local
+      downloaded = await ytdlpDownloadBestAudio(youtubeUrl, tmpWork);
+
+      // 2) trim + convert local to mp3 (first 9 minutes)
+      await ffmpegTrimToMp3Local(downloaded, outMp3, MAX_MUSIC_SECONDS);
+
+      // cleanup downloaded
+      safeUnlink(downloaded);
+      safeRmdir(tmpWork);
+      return outMp3;
+    } catch (e) {
+      lastErr = e;
+      console.error(`[MUSIC] attempt ${attempt} failed:`, e?.message || e);
+      // cleanup attempt
+      try { if (downloaded) safeUnlink(downloaded); } catch { }
+      await sleep(500 * attempt);
+    }
+  }
+
+  safeRmdir(tmpWork);
+  throw lastErr || new Error("Failed to extract music");
 }
 
 /* ===========================================================================  
@@ -208,7 +272,6 @@ async function concatTwoMp3(ttsPath, songPath, outDir, prefix = "mix") {
   const ts = Date.now();
   const outPath = path.join(outDir, `${prefix}_${ts}.mp3`);
 
-  // safer: re-encode with concat filter (avoid codec mismatch issues)
   const args = [
     "-y",
     "-hide_banner",
@@ -263,7 +326,6 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("robot/scanning180");
   mqttClient.subscribe("robot/label");
 
-  // if you really want gesture topics, subscribe here too
   mqttClient.subscribe("/robot/gesture/stopmusic");
   mqttClient.subscribe("/robot/gesture/stop");
   mqttClient.subscribe("robot/gesture/standup");
@@ -295,22 +357,18 @@ mqttClient.on("message", (topic, message) => {
       console.log("==> Detect gesture stop music");
       return;
     }
-
     if (topic === "/robot/gesture/stop") {
       console.log("==> Detect gesture stop");
       return;
     }
-
     if (topic === "robot/gesture/standup") {
       console.log("==> Detect gesture stand up");
       return;
     }
-
     if (topic === "robot/gesture/sit") {
       console.log("==> Detect gesture sitdown");
       return;
     }
-
     if (topic === "robot/gesture/moveleft") {
       console.log("==> Detect gesture turn left");
       return;
@@ -349,15 +407,12 @@ function getPublicHost() {
 
 /* ===========================================================================  
    VOICE (Eleven proxy server -> WAV -> MP3) + fallback OpenAI
-   + file-path versions (for concat)
 ===========================================================================*/
 const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
   "https://eleven-tts-wav-server-matthewrobotvoice.up.railway.app/convertvoice";
 
-// global timeout (for non-PI usage)
 const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
-// ✅ PI endpoint timeout nhỏ hơn để tránh 502
 const VOICE_TIMEOUT_PI_MS = Number(process.env.VOICE_TIMEOUT_PI_MS || 12000);
 
 const DEFAULT_VOICE_PAYLOAD = {
@@ -426,17 +481,16 @@ async function voiceServerToMp3FileWithTimeout(replyText, prefix = "eleven", tim
         .save(mp3Out)
     );
 
-    try { fs.unlinkSync(wavTmp); } catch { }
+    safeUnlink(wavTmp);
     return mp3Out;
   } catch (e) {
     clearTimeout(timer);
-    try { if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp); } catch { }
-    try { if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out); } catch { }
+    safeUnlink(wavTmp);
+    safeUnlink(mp3Out);
     throw e;
   }
 }
 
-// ✅ PI endpoint: attempt voice server first (short timeout), fallback OpenAI
 async function textToSpeechMp3FilePi(replyText, prefix = "pi_v2") {
   const safeText = (replyText || "").trim();
   if (!safeText) return await openaiTtsToMp3File("Dạ.", `${prefix}_fallback`);
@@ -790,10 +844,10 @@ app.post(
         console.log("🎤 PI_V2 STT:", text, `(${ms()}ms)`);
       } catch (e) {
         console.error("PI_V2 STT error:", e?.message || e);
-        try { fs.unlinkSync(wavPath); } catch { }
+        safeUnlink(wavPath);
         return res.json({ status: "error", transcript: "", label: "unknown", reply_text: "", audio_url: null, play: null, used_vision: false });
       } finally {
-        try { fs.unlinkSync(wavPath); } catch { }
+        safeUnlink(wavPath);
       }
 
       // clap short-circuit -> client bark
@@ -831,7 +885,7 @@ app.post(
       if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC (YouTube -> FIRST 9 MIN -> MP3) + PRE-VOICE + MERGE
+      // MUSIC (DOWNLOAD -> LOCAL TRIM -> MP3) + PRE-VOICE + MERGE
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
@@ -845,17 +899,16 @@ app.post(
           // 1) generate pre-voice mp3
           const preVoicePath = await textToSpeechMp3FilePi(preVoiceText, "prevoice");
 
-          // 2) extract first 9 minutes from youtube to mp3
+          // 2) download local + trim 9 minutes (LOCAL)
           const song9mPath = await extractFirst9MinMp3FromYoutube(top.url, audioDir);
 
           // 3) concat => final mp3
           const finalPath = await concatTwoMp3(preVoicePath, song9mPath, audioDir, "music_final");
-
           const audio_url = filePathToPublicUrl(finalPath);
 
-          // (optional) cleanup intermediate to save disk
-          try { if (fs.existsSync(preVoicePath)) fs.unlinkSync(preVoicePath); } catch { }
-          try { if (fs.existsSync(song9mPath)) fs.unlinkSync(song9mPath); } catch { }
+          // cleanup intermediate to save disk
+          safeUnlink(preVoicePath);
+          safeUnlink(song9mPath);
 
           mqttClient.publish(
             "robot/music",
@@ -1048,7 +1101,7 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube -> FIRST 9 MIN + Pre-Voice + Merge)");
+  res.send("Matthew Robot server is running 🚀 (YouTube DOWNLOAD -> LOCAL TRIM 9 MIN + Pre-Voice + Merge)");
 });
 
 /* ===========================================================================  
@@ -1058,5 +1111,7 @@ app.listen(PORT, async () => {
   console.log(`🚀 Server listening on port ${PORT}`);
   console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
   console.log(`🎵 MAX_MUSIC_SECONDS: ${MAX_MUSIC_SECONDS}`);
+  console.log(`🎵 yt-dlp timeout: ${MUSIC_YTDLP_TIMEOUT_MS} ms`);
+  console.log(`🎵 ffmpeg timeout: ${MUSIC_FFMPEG_TIMEOUT_MS} ms`);
   await checkYtdlpReady();
 });
