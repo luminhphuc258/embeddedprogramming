@@ -204,6 +204,36 @@ mqttClient.on("message", (topic, message) => {
       scanStatus = "done";
       return;
     }
+
+    if (topic === "/robot/gesture/stopmusic") {
+      console.log("==> Detect gesture stop music");
+      return;
+    }
+
+    if (topic === "/robot/gesture/stop") {
+      console.log("==> Detect gesture stop");
+      return;
+    }
+
+    if (topic === "robot/gesture/standup") {
+      console.log("==> Detect gesture stand up");
+      return;
+    }
+
+    if (topic === "robot/gesture/sit") {
+      console.log("==> Detect gesture sidown");
+      return;
+    }
+
+    if (topic === "robot/gesture/moveleft") {
+      console.log("==> Detect gesture turn left ");
+      return;
+    }
+    if (topic === "robot/moveright") {
+      console.log("==> Detect gesture turn right ");
+      return;
+    }
+
   } catch (err) {
     console.error("MQTT message error", err);
   }
