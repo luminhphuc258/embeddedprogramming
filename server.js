@@ -14,6 +14,7 @@
 ===========================================================================*/
 
 import express from "express";
+import http from "http";
 import fs from "fs";
 import path from "path";
 import dns from "dns";
@@ -41,6 +42,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json({ limit: "3mb" }));
+// ✅ prevent Node from timing out long requests (proxy/client may still timeout)
+app.use((req, res, next) => { try { res.setTimeout(0); } catch { } next(); });
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -142,7 +145,7 @@ const REMOTE_YT_SERVER =
   process.env.REMOTE_YT_SERVER || "https://endearing-upliftment-ytserver.up.railway.app";
 
 // threshold video dài (seconds). default: 20 phút
-const LONG_VIDEO_SECONDS = Number(process.env.LONG_VIDEO_SECONDS || 20 * 60);
+const LONG_VIDEO_SECONDS = Number(process.env.LONG_VIDEO_SECONDS || 8 * 60);
 
 // Nếu file remote quá to thì KHÔNG merge intro (tránh timeout/disk).
 const REMOTE_MERGE_MAX_MB = Number(process.env.REMOTE_MERGE_MAX_MB || 80);
@@ -655,6 +658,93 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
+
+/* ===========================================================================  
+   ✅ JOB QUEUE (avoid client timeout / disconnect)
+   - Long tasks (especially long YouTube) can exceed client/proxy timeouts.
+   - We create a job_id, respond early (202), keep processing, publish MQTT when ready.
+   - Client can poll: GET /job?id=JOB_ID
+===========================================================================*/
+const jobs = new Map();
+const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 60 * 60 * 1000); // 1h
+
+function newJobId() {
+  return `job_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function createJob(initial = {}) {
+  const id = newJobId();
+  jobs.set(id, {
+    id,
+    status: "queued",   // queued | running | done | error
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    result: null,
+    error: null,
+    ...initial,
+  });
+  return id;
+}
+
+function patchJob(id, patch = {}) {
+  const j = jobs.get(id);
+  if (!j) return null;
+  Object.assign(j, patch, { updatedAt: Date.now() });
+  jobs.set(id, j);
+  return j;
+}
+
+function getJob(id) {
+  const j = jobs.get(id);
+  if (!j) return null;
+  if (Date.now() - (j.createdAt || 0) > JOB_TTL_MS) {
+    jobs.delete(id);
+    return null;
+  }
+  return j;
+}
+
+async function runJob(id, fn) {
+  patchJob(id, { status: "running" });
+  try {
+    const result = await fn();
+    patchJob(id, { status: "done", result, error: null });
+    return result;
+  } catch (e) {
+    patchJob(id, { status: "error", error: e?.message || String(e) });
+    throw e;
+  }
+}
+
+async function waitJobDone(id, timeoutMs = 240000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const j = getJob(id);
+    if (!j) return null;
+    if (j.status === "done") return j;
+    if (j.status === "error") return j;
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  return getJob(id);
+}
+
+// cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, j] of jobs.entries()) {
+    if (!j?.createdAt || now - j.createdAt > JOB_TTL_MS) jobs.delete(id);
+  }
+}, 20 * 60 * 1000);
+
+app.get("/job", (req, res) => {
+  const id = (req.query.id || "").toString().trim();
+  if (!id) return res.status(400).json({ ok: false, error: "Missing ?id=" });
+  const j = getJob(id);
+  if (!j) return res.status(404).json({ ok: false, error: "Job not found/expired" });
+  return res.json({ ok: true, job: j });
+});
+
+
 /* ===========================================================================  
    ✅ NEW: endpoint lấy chunk tiếp theo
    GET /podcast_next?id=pod_xxx
@@ -879,7 +969,105 @@ async function tryFetchJson(url, opts) {
 async function fetchRemoteYtAudio({ url, title = "", seconds = null, query = "", stt = "", user = "" }) {
   if (!url) throw new Error("Missing url");
 
+  // ✅ Your remote server confirmed working endpoint (Postman):
+  // POST  /api/transcript  (form-data)
+  // keys: video_url, format=json, include_timestamp=false, send_metadata=false
+  //
+  // To avoid adding new deps, we send as x-www-form-urlencoded (most servers accept it).
+  // If your remote server ONLY accepts multipart/form-data, tell me and I'll switch to FormData.
+  const transcriptEndpoint = `${REMOTE_YT_SERVER}/api/transcript`;
+  try {
+    const body = new URLSearchParams();
+    body.set("video_url", url);
+    body.set("format", "json");
+    body.set("include_timestamp", "false");
+    body.set("send_metadata", "false");
+
+    const json = await tryFetchJson(transcriptEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      timeoutMs: 240000,
+    });
+
+    // Try to find audio_url in a few common shapes
+    const audio_url =
+      json?.audio_url ||
+      json?.audioUrl ||
+      json?.download_url ||
+      json?.downloadUrl ||
+      json?.audio ||
+      json?.data?.audio_url ||
+      json?.data?.audioUrl ||
+      json?.data?.download_url ||
+      json?.result?.audio_url ||
+      null;
+
+    if (audio_url) return audio_url;
+
+    // If remote only returns transcript, we log it (and fail gracefully upstream)
+    const hasTranscript =
+      typeof json?.transcript === "string" ||
+      typeof json?.text === "string" ||
+      typeof json?.data?.transcript === "string" ||
+      typeof json?.data?.text === "string";
+
+    if (hasTranscript) {
+      console.log("ℹ️ Remote /api/transcript returned transcript but no audio_url. keys=", Object.keys(json || {}));
+      // return null to let caller handle (reply with error message)
+      return null;
+    }
+
+    console.log("ℹ️ Remote /api/transcript response keys=", Object.keys(json || {}));
+  } catch (e) {
+    // If your remote endpoint ONLY accepts multipart/form-data, retry with FormData
+    try {
+      const fd = new FormData();
+      fd.set("video_url", url);
+      fd.set("format", "json");
+      fd.set("include_timestamp", "false");
+      fd.set("send_metadata", "false");
+
+      const resp = await fetch(transcriptEndpoint, { method: "POST", body: fd });
+      const text = await resp.text().catch(() => "");
+      let json = null;
+      try { json = JSON.parse(text); } catch { json = null; }
+
+      if (resp.ok && json) {
+        const audio_url =
+          json?.audio_url ||
+          json?.audioUrl ||
+          json?.download_url ||
+          json?.downloadUrl ||
+          json?.audio ||
+          json?.data?.audio_url ||
+          json?.data?.audioUrl ||
+          json?.data?.download_url ||
+          json?.result?.audio_url ||
+          null;
+        if (audio_url) return audio_url;
+        const hasTranscript =
+          typeof json?.transcript === "string" ||
+          typeof json?.text === "string" ||
+          typeof json?.data?.transcript === "string" ||
+          typeof json?.data?.text === "string";
+        if (hasTranscript) {
+          console.log("ℹ️ Remote /api/transcript (FormData) returned transcript but no audio_url. keys=", Object.keys(json || {}));
+          return null;
+        }
+      }
+    } catch (e2) {
+      // ignore
+    }
+
+    // continue to fallback endpoints below
+    console.error("⚠️ Remote /api/transcript failed:", e?.message || e);
+  }
+
+  // Fallback: try a few common endpoints (in case you later add audio endpoint)
   const endpoints = [
+    { method: "POST", path: "/api/audio" },
+    { method: "POST", path: "/api/ytdlp_audio" },
     { method: "POST", path: "/yt_audio" },
     { method: "POST", path: "/download_audio" },
     { method: "POST", path: "/extract_audio" },
@@ -904,7 +1092,7 @@ async function fetchRemoteYtAudio({ url, title = "", seconds = null, query = "",
         timeoutMs: 240000,
       });
 
-      const audio_url = json?.audio_url || json?.url || json?.audio || null;
+      const audio_url = json?.audio_url || json?.url || json?.audio || json?.download_url || null;
       if (audio_url) return audio_url;
 
       lastErr = new Error(`Remote returned no audio_url on ${ep.method} ${ep.path}`);
@@ -1255,17 +1443,32 @@ app.post(
         if (top?.url) {
           // ✅ LONG VIDEO => gửi qua server YT riêng để lấy audio_url
           if (isLong) {
-            console.log("📤 SEND_TO_REMOTE_YTSERVER:", {
-              remote: REMOTE_YT_SERVER,
-              url: top.url,
-              title: top.title,
-              seconds: top.seconds,
-              duration: durationStr,
-            });
+            const wantWait = String(req.query.wait || req.query.sync || "0") === "1";
 
-            let remoteAudioUrl = null;
-            try {
-              remoteAudioUrl = await fetchRemoteYtAudio({
+            const jobMeta = {
+              type: "yt_long",
+              user: userKey,
+              stt: text,
+              q,
+              yt: {
+                title: top.title,
+                url: top.url,
+                seconds: top.seconds,
+                duration: durationStr,
+              },
+              remote: REMOTE_YT_SERVER,
+            };
+
+            const processLong = async () => {
+              console.log("📤 SEND_TO_REMOTE_YTSERVER:", {
+                remote: REMOTE_YT_SERVER,
+                url: top.url,
+                title: top.title,
+                seconds: top.seconds,
+                duration: durationStr,
+              });
+
+              const remoteAudioUrl = await fetchRemoteYtAudio({
                 url: top.url,
                 title: top.title,
                 seconds: top.seconds,
@@ -1273,11 +1476,104 @@ app.post(
                 stt: text,
                 user: userKey,
               });
-            } catch (e) {
-              console.error("❌ Remote ytserver error:", e?.message || e);
+
+              if (!remoteAudioUrl) {
+                throw new Error("Remote ytserver returned no audio_url (check /api/transcript response)");
+              }
+
+              // (Optional) tạo intro + cố merge nếu remote file không quá to
+              const introText = `Video này hơi dài nên em nhờ server phụ xử lý. Đây là "${top.title}".`;
+              let final_audio_url = remoteAudioUrl;
+              let merged = false;
+              let merge_reason = "";
+
+              try {
+                const intro_url = await textToSpeechMp3Pi(introText, "music_intro_long");
+                const introLocalPath = audioUrlToLocalPath(intro_url);
+
+                const r = await maybeConcatIntroWithRemote(introLocalPath, remoteAudioUrl);
+                final_audio_url = r.final_audio_url;
+                merged = !!r.merged;
+                merge_reason = r.reason || "";
+
+                safeUnlink(introLocalPath);
+              } catch (e) {
+                console.error("⚠️ Merge intro+remote failed -> return remote only:", e?.message || e);
+                final_audio_url = remoteAudioUrl;
+                merged = false;
+                merge_reason = e?.message || "merge_exception";
+              }
+
+              console.log("✅ REMOTE_AUDIO_READY:", {
+                remoteAudioUrl,
+                final_audio_url,
+                merged,
+                merge_reason,
+              });
+
+              mqttClient.publish(
+                "robot/music",
+                JSON.stringify({
+                  label: "nhac",
+                  text: introText,
+                  audio_url: final_audio_url,
+                  user: userKey,
+                  yt: {
+                    title: top.title,
+                    url: top.url,
+                    seconds: top.seconds,
+                    duration: durationStr,
+                    route: "remote",
+                    remote_server: REMOTE_YT_SERVER,
+                    merged,
+                    merge_reason,
+                  },
+                }),
+                { qos: 1 }
+              );
+
+              return {
+                status: "ok",
+                transcript: text,
+                label: "nhac",
+                reply_text: introText,
+                audio_url: final_audio_url,
+                play: null,
+                used_vision: false,
+                job: { route: "REMOTE_YTSERVER" },
+              };
+            };
+
+            // ✅ default: async job to avoid client timeout
+            if (!wantWait) {
+              const job_id = createJob(jobMeta);
+              console.log("🧵 JOB_CREATED:", { job_id, ...jobMeta });
+              runJob(job_id, processLong).catch((e) => {
+                console.error("❌ Job failed:", job_id, e?.message || e);
+              });
+
+              // respond early so client won't timeout / disconnect
+              return res.status(202).json({
+                status: "processing",
+                job_id,
+                transcript: text,
+                label: "nhac",
+                title: top.title,
+                url: top.url,
+                seconds: top.seconds,
+                duration: durationStr,
+                route: "REMOTE_YTSERVER",
+                remote: REMOTE_YT_SERVER,
+              });
             }
 
-            if (!remoteAudioUrl) {
+            // ✅ sync wait=1 (debug)
+            const job_id = createJob({ ...jobMeta, note: "sync_wait=1" });
+            try {
+              const result = await runJob(job_id, processLong);
+              return res.json({ ...result, job_id });
+            } catch (e) {
+              console.error("❌ Remote ytserver error:", e?.message || e);
               const replyText = `Em bị lỗi khi lấy audio cho video dài "${top.title}". Anh thử bài khác giúp em nha.`;
               const audio_url = await textToSpeechMp3Pi(replyText, "yt_remote_fail");
               return res.json({
@@ -1288,69 +1584,9 @@ app.post(
                 audio_url,
                 play: null,
                 used_vision: false,
+                job_id,
               });
             }
-
-            // (Optional) tạo intro + cố merge nếu remote file không quá to
-            const introText = `Video này hơi dài nên em nhờ server phụ xử lý. Đây là "${top.title}".`;
-            let final_audio_url = remoteAudioUrl;
-            let merged = false;
-            let merge_reason = "";
-
-            try {
-              const intro_url = await textToSpeechMp3Pi(introText, "music_intro_long");
-              const introLocalPath = audioUrlToLocalPath(intro_url);
-
-              const r = await maybeConcatIntroWithRemote(introLocalPath, remoteAudioUrl);
-              final_audio_url = r.final_audio_url;
-              merged = !!r.merged;
-              merge_reason = r.reason || "";
-
-              safeUnlink(introLocalPath);
-            } catch (e) {
-              console.error("⚠️ Merge intro+remote failed -> return remote only:", e?.message || e);
-              final_audio_url = remoteAudioUrl;
-              merged = false;
-              merge_reason = e?.message || "merge_exception";
-            }
-
-            console.log("✅ REMOTE_AUDIO_READY:", {
-              remoteAudioUrl,
-              final_audio_url,
-              merged,
-              merge_reason,
-            });
-
-            mqttClient.publish(
-              "robot/music",
-              JSON.stringify({
-                label: "nhac",
-                text: introText,
-                audio_url: final_audio_url,
-                user: userKey,
-                yt: {
-                  title: top.title,
-                  url: top.url,
-                  seconds: top.seconds,
-                  duration: durationStr,
-                  route: "remote",
-                  remote_server: REMOTE_YT_SERVER,
-                  merged,
-                  merge_reason,
-                },
-              }),
-              { qos: 1 }
-            );
-
-            return res.json({
-              status: "ok",
-              transcript: text,
-              label: "nhac",
-              reply_text: introText,
-              audio_url: final_audio_url,
-              play: null,
-              used_vision: false,
-            });
           }
 
           // ✅ SHORT VIDEO => tải mp3 như cũ (local yt-dlp)
@@ -1604,10 +1840,19 @@ app.get("/", (req, res) => {
 });
 
 /* ===========================================================================  
-   START SERVER
+   START SERVER (tune timeouts)
 ===========================================================================*/
-app.listen(PORT, async () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`🗣️ Voice server: ${VOICE_SERVER_URL}`);
+const server = http.createServer(app);
+// allow long responses (still subject to Railway / client limits)
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+try { server.requestTimeout = 0; } catch { }
+
+server.listen(PORT, async () => {
+  console.log(` Server listening on port ${PORT}`);
+  console.log(` Voice server: ${VOICE_SERVER_URL}`);
   await checkYtdlpReady();
 });
+console.log(` Voice server: ${VOICE_SERVER_URL}`);
+await checkYtdlpReady();
+
