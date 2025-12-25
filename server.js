@@ -4,9 +4,13 @@
    - MUSIC: YouTube search (yt-search) -> yt-dlp extract mp3 -> return audio_url (NO VIDEO)
    - ✅ NEW: tạo 1 đoạn intro TTS: "Ây da, mình tìm được bài hát ...", rồi ghép vào trước nhạc
             => trả về 1 audio mp3 cuối cho client
-   - ✅ NEW (minimal change): nếu YouTube video > 20 phút => lấy transcript (captions)
-            -> TTS transcript (chunk) -> ghép thành 1 mp3 trả về
-            -> nếu không có transcript => trả về "không tìm thấy transcript"
+   - ✅ NEW (FIX LONG YT > 20 phút):
+        + KHÔNG tải audio dài nữa để tránh timeout
+        + Dùng yt-dlp lấy transcript/caption (vtt)
+        + Nếu có transcript: server đọc transcript theo từng đoạn (podcast chunks)
+          - trả ngay chunk #0 (kèm intro)
+          - client gọi /podcast_next?id=... để lấy chunk tiếp theo
+        + Nếu không có transcript: trả về "không tìm thấy transcript"
    - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
    - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
@@ -16,7 +20,6 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import dns from "dns";
-import os from "os";
 import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
@@ -121,9 +124,13 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
 }
 
 /* ===========================================================================  
-   yt-dlp (binary) -> mp3
+   yt-dlp (binary) -> mp3 / captions
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+
+// ✅ tránh “tv client / deno” bằng cách ép youtube player_client=android
+// (đây là chỗ FIX chính theo yêu cầu của bạn)
+const YT_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android"];
 
 async function checkYtdlpReady() {
   try {
@@ -147,6 +154,7 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
   const args = [
     "--no-playlist",
     "--force-ipv4",
+    ...YT_EXTRACTOR_ARGS,
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "0",
@@ -164,114 +172,128 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
 }
 
 /* ===========================================================================  
-   ✅ NEW: Transcript helpers (captions -> text)
-   - Video > 20 phút: ưu tiên đọc transcript (nếu có), không tải video/audio dài
+   ✅ NEW: YT transcript/captions (vtt) for long videos
 ===========================================================================*/
-function safeRmDir(dir) {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
-}
+function vttToPlainText(vttRaw = "") {
+  const lines = vttRaw.split(/\r?\n/);
+  const keep = [];
 
-function stripVttToText(vttContent = "") {
-  if (!vttContent) return "";
-  const lines = vttContent.split(/\r?\n/);
-  const out = [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line === "WEBVTT") continue;
-    if (/^\d+$/.test(line)) continue;
-    if (/^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}/.test(line)) continue;
-
-    // remove vtt styling tags
-    const cleaned = line
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (cleaned) out.push(cleaned);
+  for (const line of lines) {
+    const l = (line || "").trim();
+    if (!l) continue;
+    if (l === "WEBVTT") continue;
+    if (/^\d+$/.test(l)) continue;                // cue number
+    if (l.includes("-->")) continue;              // timestamps
+    if (/^(NOTE|Kind:|Language:)/i.test(l)) continue;
+    keep.push(l);
   }
-  return out.join(" ").replace(/\s+/g, " ").trim();
+
+  // join + cleanup
+  return keep
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
 }
 
-// split text into chunks for TTS (rough, minimal)
-function splitTextForTts(text, { maxChars = 1200, maxChunks = 8 } = {}) {
-  const t = (text || "").trim();
+async function ytdlpFetchCaptionVtt(url, outDir) {
+  if (!url) return null;
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const ts = Date.now();
+  const outTemplate = path.join(outDir, `cap_${ts}.%(ext)s`);
+
+  // NOTE:
+  // - write-subs + write-auto-subs: lấy cả caption người upload + auto-caption
+  // - sub-langs: thử vi trước, rồi en (thêm biến thể hay gặp)
+  const args = [
+    "--skip-download",
+    "--no-playlist",
+    "--force-ipv4",
+    ...YT_EXTRACTOR_ARGS,
+    "--write-subs",
+    "--write-auto-subs",
+    "--sub-format", "vtt",
+    "--sub-langs", "vi,vi-VN,en,en-US",
+    "-o", outTemplate,
+    url,
+  ];
+
+  // captions thường nhanh hơn tải audio, nên timeout 120s là hợp lý
+  try {
+    await run(YTDLP_BIN, args, { timeoutMs: 120000 });
+  } catch (e) {
+    // fail captions => return null (đừng làm sập server)
+    console.error("⚠️ ytdlp captions error:", e?.message || e);
+    return null;
+  }
+
+  const files = fs
+    .readdirSync(outDir)
+    .filter((f) => f.startsWith(`cap_${ts}.`) && f.endsWith(".vtt"));
+
+  if (!files.length) return null;
+
+  // ưu tiên vi trước
+  const pick =
+    files.find((f) => f.includes(".vi.") || f.includes(".vi-VN.")) ||
+    files.find((f) => f.includes(".en.") || f.includes(".en-US.")) ||
+    files[0];
+
+  return path.join(outDir, pick);
+}
+
+async function getYoutubeTranscriptText(url) {
+  const vttPath = await ytdlpFetchCaptionVtt(url, audioDir);
+  if (!vttPath) return "";
+
+  try {
+    const raw = fs.readFileSync(vttPath, "utf-8");
+    const text = vttToPlainText(raw);
+    return (text || "").trim();
+  } catch (e) {
+    console.error("⚠️ read vtt error:", e?.message || e);
+    return "";
+  } finally {
+    try { fs.unlinkSync(vttPath); } catch { }
+  }
+}
+
+function chunkTextSmart(text = "", maxChars = 520) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
   if (!t) return [];
+
+  // split by sentence-ish
+  const parts = t.split(/(?<=[\.\!\?\。\！\？])\s+/g);
   const chunks = [];
   let cur = "";
 
-  // split by sentence-ish punctuation first
-  const parts = t.split(/(?<=[.!?。！？])\s+/g);
-
   for (const p of parts) {
-    const seg = p.trim();
-    if (!seg) continue;
+    const s = (p || "").trim();
+    if (!s) continue;
 
-    if ((cur + " " + seg).trim().length <= maxChars) {
-      cur = (cur ? cur + " " : "") + seg;
+    if ((cur + " " + s).trim().length <= maxChars) {
+      cur = (cur + " " + s).trim();
+      continue;
+    }
+
+    if (cur) chunks.push(cur);
+    cur = "";
+
+    if (s.length <= maxChars) {
+      cur = s;
     } else {
-      if (cur) chunks.push(cur.trim());
-      cur = seg;
-      if (chunks.length >= maxChunks) break;
+      // nếu 1 câu quá dài -> cắt thẳng
+      for (let i = 0; i < s.length; i += maxChars) {
+        chunks.push(s.slice(i, i + maxChars).trim());
+      }
     }
   }
-  if (chunks.length < maxChunks && cur) chunks.push(cur.trim());
-  return chunks.slice(0, maxChunks);
-}
 
-async function ytdlpFetchTranscriptTextFromYoutube(url, { preferLangs = ["vi", "en"] } = {}) {
-  if (!url) return null;
-
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ytcap_"));
-  try {
-    // yt-dlp writes subtitles near output template
-    // we DO NOT download media
-    const outTemplate = path.join(tmpDir, "%(id)s.%(ext)s");
-    const subLangs = preferLangs.join(",");
-
-    const args = [
-      "--skip-download",
-      "--no-playlist",
-      "--force-ipv4",
-      "--write-subs",
-      "--write-auto-subs",
-      "--sub-format", "vtt",
-      "--sub-langs", subLangs,
-      "-o", outTemplate,
-      url,
-    ];
-
-    // quick-ish timeout (caption download should be fast)
-    await run(YTDLP_BIN, args, { timeoutMs: 60000 });
-
-    const files = fs.readdirSync(tmpDir);
-
-    // pick best vtt by preferred lang order
-    // common names: <id>.<lang>.vtt OR <id>.<lang>-something.vtt
-    let picked = null;
-    for (const lang of preferLangs) {
-      const f = files.find((x) => x.endsWith(".vtt") && x.includes(`.${lang}`));
-      if (f) { picked = f; break; }
-    }
-    if (!picked) {
-      // any vtt at all?
-      picked = files.find((x) => x.endsWith(".vtt")) || null;
-    }
-    if (!picked) return null;
-
-    const vttPath = path.join(tmpDir, picked);
-    const vtt = fs.readFileSync(vttPath, "utf-8");
-    const text = stripVttToText(vtt);
-
-    if (!text || text.length < 20) return null;
-    return text;
-  } catch (e) {
-    console.error("⚠️ fetch transcript failed:", e?.message || e);
-    return null;
-  } finally {
-    safeRmDir(tmpDir);
-  }
+  if (cur) chunks.push(cur);
+  return chunks;
 }
 
 /* ===========================================================================  
@@ -399,6 +421,9 @@ const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
 // ✅ PI endpoint timeout nhỏ hơn để tránh 502
 const VOICE_TIMEOUT_PI_MS = Number(process.env.VOICE_TIMEOUT_PI_MS || 12000);
 
+// ✅ long TTS (podcast chunk) timeout dài hơn
+const VOICE_TIMEOUT_LONG_MS = Number(process.env.VOICE_TIMEOUT_LONG_MS || 45000);
+
 const DEFAULT_VOICE_PAYLOAD = {
   voice_settings: {
     stability: 0.45,
@@ -486,8 +511,21 @@ async function textToSpeechMp3Pi(replyText, prefix = "pi_v2") {
   }
 }
 
+// ✅ long text (podcast chunks): timeout dài hơn, fallback OpenAI
+async function textToSpeechMp3Long(replyText, prefix = "long") {
+  const safeText = (replyText || "").trim();
+  if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
+
+  try {
+    return await voiceServerToMp3WithTimeout(safeText, `${prefix}_eleven`, VOICE_TIMEOUT_LONG_MS);
+  } catch (e) {
+    console.error("⚠️ LONG voice server fail -> fallback OpenAI:", e?.message || e);
+    return await openaiTtsToMp3(safeText, `${prefix}_openai`);
+  }
+}
+
 /* ===========================================================================  
-   ✅ NEW: CONCAT intro mp3 + song mp3 => final mp3 (public URL)
+   ✅ CONCAT mp3 helpers
 ===========================================================================*/
 function safeUnlink(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch { }
@@ -518,33 +556,94 @@ async function concatMp3LocalToPublicUrl(mp3APath, mp3BPath, prefix = "music_fin
   return `${getPublicHost()}/audio/${path.basename(outPath)}`;
 }
 
-/** ✅ NEW: concat MANY mp3 local -> mp3 local, return public URL */
-async function concatManyMp3LocalToPublicUrl(paths, prefix = "podcast_final") {
-  const list = (paths || []).filter(Boolean);
-  if (list.length === 0) throw new Error("No mp3 inputs to concat");
-  if (list.length === 1) return `${getPublicHost()}/audio/${path.basename(list[0])}`;
+/* ===========================================================================  
+   ✅ NEW: Podcast session store (transcript -> chunks)
+===========================================================================*/
+const podcastSessions = new Map();
+const PODCAST_TTL_MS = Number(process.env.PODCAST_TTL_MS || 60 * 60 * 1000); // 1h
+const PODCAST_MAX_CHUNKS = Number(process.env.PODCAST_MAX_CHUNKS || 240);
 
-  const ts = Date.now();
-  const outPath = path.join(audioDir, `${prefix}_${ts}.mp3`);
-
-  await new Promise((resolve, reject) => {
-    const cmd = ffmpeg();
-    list.forEach((p) => cmd.input(p));
-
-    // build concat filter: [0:a][1:a]...[n:a]concat=n=N:v=0:a=1[outa]
-    const inputs = list.map((_, i) => `[${i}:a]`).join("");
-    const filter = `${inputs}concat=n=${list.length}:v=0:a=1[outa]`;
-
-    cmd
-      .complexFilter([filter])
-      .outputOptions(["-map [outa]", "-ac 2", "-ar 44100", "-b:a 192k"])
-      .on("end", resolve)
-      .on("error", reject)
-      .save(outPath);
-  });
-
-  return `${getPublicHost()}/audio/${path.basename(outPath)}`;
+function newPodcastId() {
+  return `pod_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
+
+function createPodcastSession({ title = "", url = "", transcriptText = "" }) {
+  let chunks = chunkTextSmart(transcriptText, 520);
+
+  // tránh quá dài -> giữ tối đa N chunks đầu
+  if (chunks.length > PODCAST_MAX_CHUNKS) {
+    chunks = chunks.slice(0, PODCAST_MAX_CHUNKS);
+  }
+
+  const id = newPodcastId();
+  podcastSessions.set(id, {
+    id,
+    title,
+    url,
+    chunks,
+    index: 0,
+    createdAt: Date.now(),
+  });
+  return id;
+}
+
+function getPodcastSession(id) {
+  const s = podcastSessions.get(id);
+  if (!s) return null;
+  if (Date.now() - s.createdAt > PODCAST_TTL_MS) {
+    podcastSessions.delete(id);
+    return null;
+  }
+  return s;
+}
+
+// cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of podcastSessions.entries()) {
+    if (!s?.createdAt || now - s.createdAt > PODCAST_TTL_MS) {
+      podcastSessions.delete(id);
+    }
+  }
+}, 30 * 60 * 1000);
+
+/* ===========================================================================  
+   ✅ NEW: endpoint lấy chunk tiếp theo
+   GET /podcast_next?id=pod_xxx
+===========================================================================*/
+app.get("/podcast_next", async (req, res) => {
+  try {
+    const id = (req.query.id || "").toString().trim();
+    if (!id) return res.status(400).json({ ok: false, error: "Missing ?id=" });
+
+    const s = getPodcastSession(id);
+    if (!s) return res.status(404).json({ ok: false, error: "Podcast session not found/expired" });
+
+    const nextIndex = Number(s.index || 0) + 1;
+    if (nextIndex >= s.chunks.length) {
+      podcastSessions.delete(id);
+      return res.json({ ok: true, id, done: true, index: nextIndex, total: s.chunks.length, audio_url: null });
+    }
+
+    s.index = nextIndex;
+
+    const chunkText = s.chunks[nextIndex];
+    const audio_url = await textToSpeechMp3Long(chunkText, `pod_${id}_${nextIndex}`);
+
+    return res.json({
+      ok: true,
+      id,
+      done: false,
+      index: nextIndex,
+      total: s.chunks.length,
+      audio_url,
+      title: s.title,
+    });
+  } catch (e) {
+    console.error("/podcast_next error:", e);
+    res.status(500).json({ ok: false, error: e?.message || "server error" });
+  }
+});
 
 /* ===========================================================================  
    MUSIC QUERY CLEANING
@@ -918,7 +1017,7 @@ app.post(
       if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC (YouTube -> MP3) / Long video (>20m) -> Transcript -> TTS
+      // MUSIC (YouTube)
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
@@ -926,11 +1025,11 @@ app.post(
         console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url, seconds: top?.seconds }, `(${ms()}ms)`);
 
         if (top?.url) {
-          const isLongVideo = typeof top.seconds === "number" && top.seconds > 20 * 60;
+          const isLong = typeof top.seconds === "number" && top.seconds >= 20 * 60;
 
-          // ✅ NEW: video dài -> transcript TTS (nếu có), không download mp3 dài
-          if (isLongVideo) {
-            const transcriptText = await ytdlpFetchTranscriptTextFromYoutube(top.url, { preferLangs: ["vi", "en"] });
+          // ✅ LONG VIDEO => transcript/podcast mode
+          if (isLong) {
+            const transcriptText = await getYoutubeTranscriptText(top.url);
 
             if (!transcriptText) {
               const replyText = `Em không tìm thấy transcript (caption) cho video "${top.title}". Anh thử video khác giúp em nha.`;
@@ -946,75 +1045,60 @@ app.post(
               });
             }
 
-            const introText = `Ây da, video này dài hơn 20 phút nên em sẽ đọc transcript cho anh nghe. Tựa đề là "${top.title}".`;
-            const intro_url = await textToSpeechMp3Pi(introText, "podcast_intro");
+            // create session
+            const podcast_id = createPodcastSession({
+              title: top.title,
+              url: top.url,
+              transcriptText,
+            });
+
+            const s = getPodcastSession(podcast_id);
+            const firstChunk = s?.chunks?.[0] || "";
+            const introText = `Ây da, video này dài nên em sẽ đọc transcript cho bạn nghe nha. Tiêu đề: "${top.title}".`;
+
+            // intro + chunk0 => final mp3
+            const intro_url = await textToSpeechMp3Long(introText, "pod_intro");
+            const chunk0_url = await textToSpeechMp3Long(firstChunk, "pod_chunk0");
+
             const introLocal = audioUrlToLocalPath(intro_url);
+            const chunk0Local = audioUrlToLocalPath(chunk0_url);
+            const final_audio_url = await concatMp3LocalToPublicUrl(introLocal, chunk0Local, "podcast_0");
 
-            // chunk transcript -> TTS từng đoạn (giới hạn để tránh treo server)
-            const chunks = splitTextForTts(transcriptText, { maxChars: 1200, maxChunks: 8 });
-            if (chunks.length === 0) {
-              const replyText = `Em có lấy được transcript nhưng nội dung rỗng/không hợp lệ. Anh thử video khác giúp em nha.`;
-              const audio_url = await textToSpeechMp3Pi(replyText, "yt_transcript_empty");
-              safeUnlink(introLocal);
-              return res.json({
-                status: "ok",
-                transcript: text,
+            safeUnlink(introLocal);
+            safeUnlink(chunk0Local);
+
+            const next_url = `${getPublicHost()}/podcast_next?id=${podcast_id}`;
+
+            mqttClient.publish(
+              "robot/music",
+              JSON.stringify({
                 label: "nhac",
-                reply_text: replyText,
-                audio_url,
-                play: null,
-                used_vision: false,
-              });
-            }
-
-            const tmpMp3Paths = [introLocal];
-            try {
-              for (let i = 0; i < chunks.length; i++) {
-                // dùng OpenAI TTS cho ổn định (không phụ thuộc voice server timeout)
-                const u = await openaiTtsToMp3(chunks[i], `podcast_part${String(i + 1).padStart(2, "0")}`);
-                const p = audioUrlToLocalPath(u);
-                tmpMp3Paths.push(p);
-              }
-
-              const final_audio_url = await concatManyMp3LocalToPublicUrl(tmpMp3Paths, "podcast_final");
-
-              // cleanup trung gian
-              tmpMp3Paths.forEach(safeUnlink);
-
-              mqttClient.publish(
-                "robot/music",
-                JSON.stringify({ label: "nhac", text: introText, audio_url: final_audio_url, user: userKey }),
-                { qos: 1 }
-              );
-
-              return res.json({
-                status: "ok",
-                transcript: text,
-                label: "nhac",
-                reply_text: introText,
+                text: introText,
                 audio_url: final_audio_url,
-                play: null,
-                used_vision: false,
-              });
-            } catch (e) {
-              console.error("podcast transcript TTS/concat error:", e?.message || e);
-              tmpMp3Paths.forEach(safeUnlink);
+                user: userKey,
+                podcast: { id: podcast_id, index: 0, total: s?.chunks?.length || 0, next_url },
+              }),
+              { qos: 1 }
+            );
 
-              const replyText = "Em bị lỗi khi tạo audio từ transcript. Anh thử lại giúp em nha.";
-              const audio_url = await textToSpeechMp3Pi(replyText, "podcast_fail");
-              return res.json({
-                status: "ok",
-                transcript: text,
-                label: "nhac",
-                reply_text: replyText,
-                audio_url,
-                play: null,
-                used_vision: false,
-              });
-            }
+            return res.json({
+              status: "ok",
+              transcript: text,
+              label: "nhac",
+              reply_text: introText,
+              audio_url: final_audio_url,
+              play: {
+                type: "podcast",
+                id: podcast_id,
+                index: 0,
+                total: s?.chunks?.length || 0,
+                next_url,
+              },
+              used_vision: false,
+            });
           }
 
-          // ✅ Normal: bài ngắn (<=20m) -> tải mp3 + ghép intro như cũ
+          // ✅ SHORT VIDEO => tải mp3 như cũ
           const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
 
           // 1) TTS intro -> URL mp3 trong /audio
@@ -1042,7 +1126,7 @@ app.post(
             transcript: text,
             label: "nhac",
             reply_text: introText,
-            audio_url: final_audio_url, // ✅ mp3 cuối, client đọc được
+            audio_url: final_audio_url,
             play: null,
             used_vision: false,
           });
@@ -1221,7 +1305,7 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 + Intro + Merge + Long Video Transcript)");
+  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 + Intro + Merge + LONG transcript podcast)");
 });
 
 /* ===========================================================================  
