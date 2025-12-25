@@ -161,6 +161,87 @@ async function checkYtdlpReady() {
   }
 }
 
+// ======================
+// YTSERVER connectivity check (run on startup)
+// ======================
+async function checkYtServerConnectivity(remoteBaseUrl) {
+  const base = String(remoteBaseUrl || "").replace(/\/+$/, ""); // remove trailing /
+  if (!base) {
+    console.log("⚠️  YTSERVER: REMOTE_YTSERVER_BASE not set. Skip check.");
+    return { ok: false, reason: "missing_base" };
+  }
+
+  const healthUrl = `${base}/health`;
+  const testUrl = `${base}/api/transcript?video_url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&format=json&include_timestamp=false&send_metadata=false`;
+
+  const fetchWithTimeout = async (url, ms = 16000) => {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms);
+    try {
+      const res = await fetch(url, { method: "GET", signal: ac.signal });
+      const text = await res.text();
+      return { res, text };
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  try {
+    // 1) Check /health
+    const { res, text } = await fetchWithTimeout(healthUrl, 6000);
+
+    if (res.ok) {
+      // Expect JSON like {"status":"ok"}
+      let js = null;
+      try { js = JSON.parse(text); } catch (_) { }
+      console.log("✅ YTSERVER CONNECT OK:", {
+        base,
+        health: healthUrl,
+        status: res.status,
+        body: js || (text || "").slice(0, 120),
+      });
+      return { ok: true, status: res.status };
+    }
+
+    // health not ok -> fallback check route existence
+    console.log("⚠️  YTSERVER health not OK, fallback /api/transcript check:", {
+      health: healthUrl,
+      status: res.status,
+      bodyPreview: (text || "").slice(0, 160),
+    });
+
+    const r2 = await fetchWithTimeout(testUrl, 18000);
+    if (r2.res.status === 404) {
+      console.log("❌ YTSERVER ROUTE NOT FOUND:", {
+        base,
+        tried: "/api/transcript",
+        hint: "Remote server returned 404. Check deploy/service URL or route path.",
+      });
+      return { ok: false, reason: "route_404" };
+    }
+
+    console.log("✅ YTSERVER reachable (but /health not OK):", {
+      base,
+      transcriptCheckStatus: r2.res.status,
+      bodyPreview: (r2.text || "").slice(0, 160),
+    });
+    return { ok: r2.res.ok, status: r2.res.status };
+
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const isAbort = msg.toLowerCase().includes("abort");
+    console.log("❌ YTSERVER CONNECT FAIL:", {
+      base,
+      health: healthUrl,
+      error: msg,
+      hint: isAbort ? "Timeout (server down / cold start / network blocked)" : "Network/DNS/TLS error",
+    });
+    return { ok: false, reason: "network_error", error: msg };
+  }
+}
+
+
+
 /** Extract mp3 from YouTube URL into audioDir, return absolute mp3 filepath */
 async function ytdlpExtractMp3FromYoutube(url, outDir) {
   if (!url) throw new Error("Missing url");
@@ -1852,7 +1933,11 @@ server.listen(PORT, async () => {
   console.log(` Server listening on port ${PORT}`);
   console.log(` Voice server: ${VOICE_SERVER_URL}`);
   await checkYtdlpReady();
+  // ví dụ env bạn đang dùng:
+  const REMOTE_YTSERVER_BASE = process.env.REMOTE_YTSERVER_BASE
+    || "https://endearing-upliftment-ytserver.up.railway.app";
+
+  await checkYtServerConnectivity(REMOTE_YTSERVER_BASE);
 });
-console.log(` Voice server: ${VOICE_SERVER_URL}`);
-await checkYtdlpReady();
+
 
