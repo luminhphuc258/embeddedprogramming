@@ -4,6 +4,9 @@
    - MUSIC: YouTube search (yt-search) -> yt-dlp extract mp3 -> return audio_url (NO VIDEO)
    - ✅ NEW: tạo 1 đoạn intro TTS: "Ây da, mình tìm được bài hát ...", rồi ghép vào trước nhạc
             => trả về 1 audio mp3 cuối cho client
+   - ✅ NEW (minimal change): nếu YouTube video > 20 phút => lấy transcript (captions)
+            -> TTS transcript (chunk) -> ghép thành 1 mp3 trả về
+            -> nếu không có transcript => trả về "không tìm thấy transcript"
    - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
    - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
@@ -13,6 +16,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import dns from "dns";
+import os from "os";
 import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
@@ -157,6 +161,117 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
   const mp3 = files.find((f) => f.endsWith(".mp3"));
   if (!mp3) throw new Error("MP3 not found after yt-dlp run");
   return path.join(outDir, mp3);
+}
+
+/* ===========================================================================  
+   ✅ NEW: Transcript helpers (captions -> text)
+   - Video > 20 phút: ưu tiên đọc transcript (nếu có), không tải video/audio dài
+===========================================================================*/
+function safeRmDir(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
+}
+
+function stripVttToText(vttContent = "") {
+  if (!vttContent) return "";
+  const lines = vttContent.split(/\r?\n/);
+  const out = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === "WEBVTT") continue;
+    if (/^\d+$/.test(line)) continue;
+    if (/^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}/.test(line)) continue;
+
+    // remove vtt styling tags
+    const cleaned = line
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (cleaned) out.push(cleaned);
+  }
+  return out.join(" ").replace(/\s+/g, " ").trim();
+}
+
+// split text into chunks for TTS (rough, minimal)
+function splitTextForTts(text, { maxChars = 1200, maxChunks = 8 } = {}) {
+  const t = (text || "").trim();
+  if (!t) return [];
+  const chunks = [];
+  let cur = "";
+
+  // split by sentence-ish punctuation first
+  const parts = t.split(/(?<=[.!?。！？])\s+/g);
+
+  for (const p of parts) {
+    const seg = p.trim();
+    if (!seg) continue;
+
+    if ((cur + " " + seg).trim().length <= maxChars) {
+      cur = (cur ? cur + " " : "") + seg;
+    } else {
+      if (cur) chunks.push(cur.trim());
+      cur = seg;
+      if (chunks.length >= maxChunks) break;
+    }
+  }
+  if (chunks.length < maxChunks && cur) chunks.push(cur.trim());
+  return chunks.slice(0, maxChunks);
+}
+
+async function ytdlpFetchTranscriptTextFromYoutube(url, { preferLangs = ["vi", "en"] } = {}) {
+  if (!url) return null;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ytcap_"));
+  try {
+    // yt-dlp writes subtitles near output template
+    // we DO NOT download media
+    const outTemplate = path.join(tmpDir, "%(id)s.%(ext)s");
+    const subLangs = preferLangs.join(",");
+
+    const args = [
+      "--skip-download",
+      "--no-playlist",
+      "--force-ipv4",
+      "--write-subs",
+      "--write-auto-subs",
+      "--sub-format", "vtt",
+      "--sub-langs", subLangs,
+      "-o", outTemplate,
+      url,
+    ];
+
+    // quick-ish timeout (caption download should be fast)
+    await run(YTDLP_BIN, args, { timeoutMs: 60000 });
+
+    const files = fs.readdirSync(tmpDir);
+
+    // pick best vtt by preferred lang order
+    // common names: <id>.<lang>.vtt OR <id>.<lang>-something.vtt
+    let picked = null;
+    for (const lang of preferLangs) {
+      const f = files.find((x) => x.endsWith(".vtt") && x.includes(`.${lang}`));
+      if (f) { picked = f; break; }
+    }
+    if (!picked) {
+      // any vtt at all?
+      picked = files.find((x) => x.endsWith(".vtt")) || null;
+    }
+    if (!picked) return null;
+
+    const vttPath = path.join(tmpDir, picked);
+    const vtt = fs.readFileSync(vttPath, "utf-8");
+    const text = stripVttToText(vtt);
+
+    if (!text || text.length < 20) return null;
+    return text;
+  } catch (e) {
+    console.error("⚠️ fetch transcript failed:", e?.message || e);
+    return null;
+  } finally {
+    safeRmDir(tmpDir);
+  }
 }
 
 /* ===========================================================================  
@@ -394,6 +509,34 @@ async function concatMp3LocalToPublicUrl(mp3APath, mp3BPath, prefix = "music_fin
       .input(mp3APath)
       .input(mp3BPath)
       .complexFilter(["[0:a][1:a]concat=n=2:v=0:a=1[outa]"])
+      .outputOptions(["-map [outa]", "-ac 2", "-ar 44100", "-b:a 192k"])
+      .on("end", resolve)
+      .on("error", reject)
+      .save(outPath);
+  });
+
+  return `${getPublicHost()}/audio/${path.basename(outPath)}`;
+}
+
+/** ✅ NEW: concat MANY mp3 local -> mp3 local, return public URL */
+async function concatManyMp3LocalToPublicUrl(paths, prefix = "podcast_final") {
+  const list = (paths || []).filter(Boolean);
+  if (list.length === 0) throw new Error("No mp3 inputs to concat");
+  if (list.length === 1) return `${getPublicHost()}/audio/${path.basename(list[0])}`;
+
+  const ts = Date.now();
+  const outPath = path.join(audioDir, `${prefix}_${ts}.mp3`);
+
+  await new Promise((resolve, reject) => {
+    const cmd = ffmpeg();
+    list.forEach((p) => cmd.input(p));
+
+    // build concat filter: [0:a][1:a]...[n:a]concat=n=N:v=0:a=1[outa]
+    const inputs = list.map((_, i) => `[${i}:a]`).join("");
+    const filter = `${inputs}concat=n=${list.length}:v=0:a=1[outa]`;
+
+    cmd
+      .complexFilter([filter])
       .outputOptions(["-map [outa]", "-ac 2", "-ar 44100", "-b:a 192k"])
       .on("end", resolve)
       .on("error", reject)
@@ -775,15 +918,103 @@ app.post(
       if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
 
       // ===========================
-      // MUSIC (YouTube -> MP3)
+      // MUSIC (YouTube -> MP3) / Long video (>20m) -> Transcript -> TTS
       // ===========================
       if (label === "nhac") {
         const q = extractSongQuery(text) || text;
         const top = await searchYouTubeTop1(q);
-        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url }, `(${ms()}ms)`);
+        console.log("🎵 MUSIC:", { stt: text, q, found: !!top?.url, url: top?.url, seconds: top?.seconds }, `(${ms()}ms)`);
 
         if (top?.url) {
-          // ✅ Intro đúng câu bạn yêu cầu
+          const isLongVideo = typeof top.seconds === "number" && top.seconds > 20 * 60;
+
+          // ✅ NEW: video dài -> transcript TTS (nếu có), không download mp3 dài
+          if (isLongVideo) {
+            const transcriptText = await ytdlpFetchTranscriptTextFromYoutube(top.url, { preferLangs: ["vi", "en"] });
+
+            if (!transcriptText) {
+              const replyText = `Em không tìm thấy transcript (caption) cho video "${top.title}". Anh thử video khác giúp em nha.`;
+              const audio_url = await textToSpeechMp3Pi(replyText, "yt_no_transcript");
+              return res.json({
+                status: "ok",
+                transcript: text,
+                label: "nhac",
+                reply_text: replyText,
+                audio_url,
+                play: null,
+                used_vision: false,
+              });
+            }
+
+            const introText = `Ây da, video này dài hơn 20 phút nên em sẽ đọc transcript cho anh nghe. Tựa đề là "${top.title}".`;
+            const intro_url = await textToSpeechMp3Pi(introText, "podcast_intro");
+            const introLocal = audioUrlToLocalPath(intro_url);
+
+            // chunk transcript -> TTS từng đoạn (giới hạn để tránh treo server)
+            const chunks = splitTextForTts(transcriptText, { maxChars: 1200, maxChunks: 8 });
+            if (chunks.length === 0) {
+              const replyText = `Em có lấy được transcript nhưng nội dung rỗng/không hợp lệ. Anh thử video khác giúp em nha.`;
+              const audio_url = await textToSpeechMp3Pi(replyText, "yt_transcript_empty");
+              safeUnlink(introLocal);
+              return res.json({
+                status: "ok",
+                transcript: text,
+                label: "nhac",
+                reply_text: replyText,
+                audio_url,
+                play: null,
+                used_vision: false,
+              });
+            }
+
+            const tmpMp3Paths = [introLocal];
+            try {
+              for (let i = 0; i < chunks.length; i++) {
+                // dùng OpenAI TTS cho ổn định (không phụ thuộc voice server timeout)
+                const u = await openaiTtsToMp3(chunks[i], `podcast_part${String(i + 1).padStart(2, "0")}`);
+                const p = audioUrlToLocalPath(u);
+                tmpMp3Paths.push(p);
+              }
+
+              const final_audio_url = await concatManyMp3LocalToPublicUrl(tmpMp3Paths, "podcast_final");
+
+              // cleanup trung gian
+              tmpMp3Paths.forEach(safeUnlink);
+
+              mqttClient.publish(
+                "robot/music",
+                JSON.stringify({ label: "nhac", text: introText, audio_url: final_audio_url, user: userKey }),
+                { qos: 1 }
+              );
+
+              return res.json({
+                status: "ok",
+                transcript: text,
+                label: "nhac",
+                reply_text: introText,
+                audio_url: final_audio_url,
+                play: null,
+                used_vision: false,
+              });
+            } catch (e) {
+              console.error("podcast transcript TTS/concat error:", e?.message || e);
+              tmpMp3Paths.forEach(safeUnlink);
+
+              const replyText = "Em bị lỗi khi tạo audio từ transcript. Anh thử lại giúp em nha.";
+              const audio_url = await textToSpeechMp3Pi(replyText, "podcast_fail");
+              return res.json({
+                status: "ok",
+                transcript: text,
+                label: "nhac",
+                reply_text: replyText,
+                audio_url,
+                play: null,
+                used_vision: false,
+              });
+            }
+          }
+
+          // ✅ Normal: bài ngắn (<=20m) -> tải mp3 + ghép intro như cũ
           const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
 
           // 1) TTS intro -> URL mp3 trong /audio
@@ -990,7 +1221,7 @@ app.get("/get_scanningstatus", (req, res) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 + Intro + Merge)");
+  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 + Intro + Merge + Long Video Transcript)");
 });
 
 /* ===========================================================================  
