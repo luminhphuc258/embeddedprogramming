@@ -4,10 +4,10 @@
    - MUSIC: YouTube search (yt-search) -> yt-dlp extract mp3 -> return audio_url (NO VIDEO)
    - ✅ NEW: tạo 1 đoạn intro TTS: "Ây da, mình tìm được bài hát ...", rồi ghép vào trước nhạc
             => trả về 1 audio mp3 cuối cho client
-   - ✅ NEW (FIX LONG YT > 20 phút):
+   - ✅ NEW ARCH (FIX LONG YT > threshold):
         + In log ra thời lượng video sau khi search
-        + Chỉ video dài mới gửi qua server YT riêng (REMOTE_YT_SERVER) để xử lý lấy audio_url
-        + Video ngắn vẫn tải mp3 local như cũ
+        + Video dài: lấy transcript từ REMOTE_YT_SERVER -> GPT chấm dấu câu -> TTS theo chunk
+        + Trả về audio chunk #0 + podcast_id để client gọi /podcast_next lấy tiếp
    - PI endpoint: TEXT ONLY (no vision), image optional (ignored)
    - AvoidObstacle vision endpoint kept
    - Label override + scan endpoints + camera rotate
@@ -43,7 +43,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json({ limit: "3mb" }));
 // ✅ prevent Node from timing out long requests (proxy/client may still timeout)
-app.use((req, res, next) => { try { res.setTimeout(0); } catch { } next(); });
+app.use((req, res, next) => {
+  try {
+    res.setTimeout(0);
+  } catch { }
+  next();
+});
 const PORT = process.env.PORT || 8080;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -103,7 +108,9 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
     let err = "";
 
     const timer = setTimeout(() => {
-      try { p.kill("SIGKILL"); } catch { }
+      try {
+        p.kill("SIGKILL");
+      } catch { }
       reject(new Error(`Timeout: ${cmd} ${args.join(" ")}`));
     }, timeoutMs);
 
@@ -129,8 +136,7 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
 // ✅ IMPORTANT (FIX 403 / PO Token):
-// Một số "player_client" (đặc biệt android https formats) có thể yêu cầu PO Token -> dễ dính 403 trên Railway.
-// Vì vậy ta ưu tiên web/ios và có cơ chế retry theo danh sách client.
+// Ưu tiên web/ios và retry theo danh sách client.
 const YT_PLAYER_CLIENTS = (process.env.YT_PLAYER_CLIENTS || "web,ios,android")
   .split(",")
   .map((s) => s.trim())
@@ -140,15 +146,19 @@ function ytExtractorArgsForClient(client) {
   return ["--extractor-args", `youtube:player_client=${client}`];
 }
 
-// ✅ Chỉ video dài mới gửi qua server YT riêng để xử lý lấy audio
+// ✅ NEW ARCH: remote transcript server
 const REMOTE_YT_SERVER =
-  process.env.REMOTE_YT_SERVER || "https://endearing-upliftment-ytserver.up.railway.app";
+  process.env.REMOTE_YT_SERVER ||
+  "https://endearing-upliftment-ytserver.up.railway.app";
 
 // threshold video dài (seconds). default: 20 phút
-const LONG_VIDEO_SECONDS = Number(process.env.LONG_VIDEO_SECONDS || 8 * 60);
+const LONG_VIDEO_SECONDS = Number(process.env.LONG_VIDEO_SECONDS || 20 * 60);
 
-// Nếu file remote quá to thì KHÔNG merge intro (tránh timeout/disk).
-const REMOTE_MERGE_MAX_MB = Number(process.env.REMOTE_MERGE_MAX_MB || 80);
+// giới hạn transcript (tránh quá dài làm GPT/TTS timeout)
+const TRANSCRIPT_MAX_CHARS = Number(process.env.TRANSCRIPT_MAX_CHARS || 20000);
+
+// model punctuation
+const PUNCTUATE_MODEL = process.env.PUNCTUATE_MODEL || "gpt-4.1-mini";
 
 async function checkYtdlpReady() {
   try {
@@ -165,14 +175,13 @@ async function checkYtdlpReady() {
 // YTSERVER connectivity check (run on startup)
 // ======================
 async function checkYtServerConnectivity(remoteBaseUrl) {
-  const base = String(remoteBaseUrl || "").replace(/\/+$/, ""); // remove trailing /
+  const base = String(remoteBaseUrl || "").replace(/\/+$/, "");
   if (!base) {
-    console.log("⚠️  YTSERVER: REMOTE_YTSERVER_BASE not set. Skip check.");
+    console.log("⚠️  YTSERVER: REMOTE_YT_SERVER not set. Skip check.");
     return { ok: false, reason: "missing_base" };
   }
 
   const healthUrl = `${base}/health`;
-  const testUrl = `${base}/api/transcript?video_url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&format=json&include_timestamp=false&send_metadata=false`;
 
   const fetchWithTimeout = async (url, ms = 16000) => {
     const ac = new AbortController();
@@ -187,13 +196,12 @@ async function checkYtServerConnectivity(remoteBaseUrl) {
   };
 
   try {
-    // 1) Check /health
     const { res, text } = await fetchWithTimeout(healthUrl, 6000);
-
     if (res.ok) {
-      // Expect JSON like {"status":"ok"}
       let js = null;
-      try { js = JSON.parse(text); } catch (_) { }
+      try {
+        js = JSON.parse(text);
+      } catch (_) { }
       console.log("✅ YTSERVER CONNECT OK:", {
         base,
         health: healthUrl,
@@ -203,30 +211,12 @@ async function checkYtServerConnectivity(remoteBaseUrl) {
       return { ok: true, status: res.status };
     }
 
-    // health not ok -> fallback check route existence
-    console.log("⚠️  YTSERVER health not OK, fallback /api/transcript check:", {
-      health: healthUrl,
+    console.log("⚠️  YTSERVER health not OK:", {
+      base,
       status: res.status,
       bodyPreview: (text || "").slice(0, 160),
     });
-
-    const r2 = await fetchWithTimeout(testUrl, 18000);
-    if (r2.res.status === 404) {
-      console.log("❌ YTSERVER ROUTE NOT FOUND:", {
-        base,
-        tried: "/api/transcript",
-        hint: "Remote server returned 404. Check deploy/service URL or route path.",
-      });
-      return { ok: false, reason: "route_404" };
-    }
-
-    console.log("✅ YTSERVER reachable (but /health not OK):", {
-      base,
-      transcriptCheckStatus: r2.res.status,
-      bodyPreview: (r2.text || "").slice(0, 160),
-    });
-    return { ok: r2.res.ok, status: r2.res.status };
-
+    return { ok: false, reason: "health_not_ok", status: res.status };
   } catch (e) {
     const msg = String(e?.message || e);
     const isAbort = msg.toLowerCase().includes("abort");
@@ -234,13 +224,13 @@ async function checkYtServerConnectivity(remoteBaseUrl) {
       base,
       health: healthUrl,
       error: msg,
-      hint: isAbort ? "Timeout (server down / cold start / network blocked)" : "Network/DNS/TLS error",
+      hint: isAbort
+        ? "Timeout (server down / cold start / network blocked)"
+        : "Network/DNS/TLS error",
     });
     return { ok: false, reason: "network_error", error: msg };
   }
 }
-
-
 
 /** Extract mp3 from YouTube URL into audioDir, return absolute mp3 filepath */
 async function ytdlpExtractMp3FromYoutube(url, outDir) {
@@ -249,17 +239,6 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
 
   const ts = Date.now();
   const outTemplate = path.join(outDir, `yt_${ts}.%(ext)s`);
-
-  const baseArgs = [
-    "--no-playlist",
-    "--force-ipv4",
-    "-x",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
-    "--ffmpeg-location", ffmpegPath,
-    "-o", outTemplate,
-    url,
-  ];
 
   let lastErr = null;
 
@@ -270,10 +249,14 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
       "--force-ipv4",
       ...ytExtractorArgsForClient(client),
       "-x",
-      "--audio-format", "mp3",
-      "--audio-quality", "0",
-      "--ffmpeg-location", ffmpegPath,
-      "-o", outTemplate,
+      "--audio-format",
+      "mp3",
+      "--audio-quality",
+      "0",
+      "--ffmpeg-location",
+      ffmpegPath,
+      "-o",
+      outTemplate,
       url,
     ];
 
@@ -281,7 +264,9 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
       console.log("▶️ yt-dlp download (client):", client, url);
       await run(YTDLP_BIN, args, { timeoutMs: 240000 });
 
-      const files = fs.readdirSync(outDir).filter((f) => f.startsWith(`yt_${ts}.`));
+      const files = fs
+        .readdirSync(outDir)
+        .filter((f) => f.startsWith(`yt_${ts}.`));
       const mp3 = files.find((f) => f.endsWith(".mp3"));
       if (!mp3) throw new Error("MP3 not found after yt-dlp run");
       console.log("✅ yt-dlp ok (client):", client, "->", mp3);
@@ -292,7 +277,9 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
       console.error("⚠️ yt-dlp fail (client):", client, msg.slice(0, 600));
       // dọn file rác nếu có
       try {
-        const junk = fs.readdirSync(outDir).filter((f) => f.startsWith(`yt_${ts}.`));
+        const junk = fs
+          .readdirSync(outDir)
+          .filter((f) => f.startsWith(`yt_${ts}.`));
         for (const f of junk) safeUnlink(path.join(outDir, f));
       } catch { }
       // thử client tiếp theo
@@ -302,9 +289,8 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
   throw lastErr || new Error("yt-dlp failed (all clients)");
 }
 
-
 /* ===========================================================================  
-   ✅ NEW: YT transcript/captions (vtt) for long videos
+   ✅ Captions local fallback (vtt -> text)
 ===========================================================================*/
 function vttToPlainText(vttRaw = "") {
   const lines = vttRaw.split(/\r?\n/);
@@ -314,13 +300,12 @@ function vttToPlainText(vttRaw = "") {
     const l = (line || "").trim();
     if (!l) continue;
     if (l === "WEBVTT") continue;
-    if (/^\d+$/.test(l)) continue;                // cue number
-    if (l.includes("-->")) continue;              // timestamps
+    if (/^\d+$/.test(l)) continue; // cue number
+    if (l.includes("-->")) continue; // timestamps
     if (/^(NOTE|Kind:|Language:)/i.test(l)) continue;
     keep.push(l);
   }
 
-  // join + cleanup
   return keep
     .join(" ")
     .replace(/\s+/g, " ")
@@ -337,9 +322,6 @@ async function ytdlpFetchCaptionVtt(url, outDir) {
   const ts = Date.now();
   const outTemplate = path.join(outDir, `cap_${ts}.%(ext)s`);
 
-  // NOTE:
-  // - write-subs + write-auto-subs: lấy cả caption người upload + auto-caption
-  // - sub-langs: thử vi trước, rồi en (thêm biến thể hay gặp)
   const args = [
     "--skip-download",
     "--no-playlist",
@@ -347,17 +329,18 @@ async function ytdlpFetchCaptionVtt(url, outDir) {
     ...ytExtractorArgsForClient("web"),
     "--write-subs",
     "--write-auto-subs",
-    "--sub-format", "vtt",
-    "--sub-langs", "vi,vi-VN,en,en-US",
-    "-o", outTemplate,
+    "--sub-format",
+    "vtt",
+    "--sub-langs",
+    "vi,vi-VN,en,en-US",
+    "-o",
+    outTemplate,
     url,
   ];
 
-  // captions thường nhanh hơn tải audio, nên timeout 120s là hợp lý
   try {
     await run(YTDLP_BIN, args, { timeoutMs: 120000 });
   } catch (e) {
-    // fail captions => return null (đừng làm sập server)
     console.error("⚠️ ytdlp captions error:", e?.message || e);
     return null;
   }
@@ -368,7 +351,6 @@ async function ytdlpFetchCaptionVtt(url, outDir) {
 
   if (!files.length) return null;
 
-  // ưu tiên vi trước
   const pick =
     files.find((f) => f.includes(".vi.") || f.includes(".vi-VN.")) ||
     files.find((f) => f.includes(".en.") || f.includes(".en-US.")) ||
@@ -377,7 +359,7 @@ async function ytdlpFetchCaptionVtt(url, outDir) {
   return path.join(outDir, pick);
 }
 
-async function getYoutubeTranscriptText(url) {
+async function getYoutubeTranscriptTextLocal(url) {
   const vttPath = await ytdlpFetchCaptionVtt(url, audioDir);
   if (!vttPath) return "";
 
@@ -389,15 +371,158 @@ async function getYoutubeTranscriptText(url) {
     console.error("⚠️ read vtt error:", e?.message || e);
     return "";
   } finally {
-    try { fs.unlinkSync(vttPath); } catch { }
+    try {
+      fs.unlinkSync(vttPath);
+    } catch { }
   }
 }
 
+/* ===========================================================================  
+   ✅ NEW ARCH: fetch transcript from remote YT server
+   Expect: POST /api/transcript (or similar) -> JSON includes transcript/text
+===========================================================================*/
+async function tryFetchJson(url, opts) {
+  const controller = new AbortController();
+  const timeoutMs = Number(opts?.timeoutMs || 180000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url, { ...opts, signal: controller.signal });
+    const text = await resp.text().catch(() => "");
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+
+    if (!resp.ok) {
+      const msg = json?.error || text || `HTTP ${resp.status}`;
+      throw new Error(`Remote ${resp.status}: ${String(msg).slice(0, 400)}`);
+    }
+    return json || { raw: text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeRemoteTranscript(json) {
+  if (!json) return "";
+
+  // common direct strings
+  const direct =
+    (typeof json.transcript === "string" && json.transcript) ||
+    (typeof json.text === "string" && json.text) ||
+    (typeof json.caption === "string" && json.caption) ||
+    (typeof json?.data?.transcript === "string" && json.data.transcript) ||
+    (typeof json?.data?.text === "string" && json.data.text) ||
+    (typeof json?.result?.transcript === "string" && json.result.transcript) ||
+    "";
+
+  if (direct) return String(direct).trim();
+
+  // array segments: [{text:"..."}, ...]
+  const arr =
+    (Array.isArray(json.segments) && json.segments) ||
+    (Array.isArray(json.items) && json.items) ||
+    (Array.isArray(json.data?.segments) && json.data.segments) ||
+    null;
+
+  if (arr) {
+    const joined = arr
+      .map((x) => (typeof x === "string" ? x : x?.text || x?.transcript || ""))
+      .filter(Boolean)
+      .join(" ");
+    return joined.replace(/\s+/g, " ").trim();
+  }
+
+  return "";
+}
+
+async function fetchRemoteTranscriptText({ videoUrl }) {
+  const endpoint = `${String(REMOTE_YT_SERVER).replace(/\/+$/, "")}/api/transcript`;
+
+  const body = new URLSearchParams();
+  body.set("video_url", videoUrl);
+  body.set("format", "json");
+  body.set("include_timestamp", "false");
+  body.set("send_metadata", "false");
+
+  const json = await tryFetchJson(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+    timeoutMs: 240000,
+  });
+
+  const txt = normalizeRemoteTranscript(json);
+  return (txt || "").trim();
+}
+
+/* ===========================================================================  
+   ✅ Punctuation with GPT (keep words, add punctuation only)
+===========================================================================*/
+function chunkByChars(text = "", maxChars = 2400) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return [];
+  const chunks = [];
+  let i = 0;
+  while (i < t.length) {
+    chunks.push(t.slice(i, i + maxChars));
+    i += maxChars;
+  }
+  return chunks;
+}
+
+async function punctuateWithGPT(rawText = "") {
+  const t = (rawText || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+
+  // hard cap
+  const capped =
+    t.length > TRANSCRIPT_MAX_CHARS ? t.slice(0, TRANSCRIPT_MAX_CHARS) : t;
+
+  const parts = chunkByChars(capped, 2400);
+  const out = [];
+
+  for (let idx = 0; idx < parts.length; idx++) {
+    const piece = parts[idx];
+
+    const system = `
+Bạn là công cụ "chấm dấu câu" cho transcript.
+YÊU CẦU:
+- Giữ nguyên từ ngữ, KHÔNG thêm/đổi/bớt ý.
+- Chỉ thêm dấu câu, xuống dòng nếu cần cho dễ đọc/nghe.
+- Không giải thích. Chỉ xuất ra văn bản đã chấm dấu câu.
+`.trim();
+
+    const completion = await openai.chat.completions.create({
+      model: PUNCTUATE_MODEL,
+      messages: [
+        { role: "system", content: system },
+        {
+          role: "user",
+          content: `PHẦN ${idx + 1}/${parts.length}:\n${piece}`,
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 900,
+    });
+
+    const punct = completion.choices?.[0]?.message?.content?.trim() || piece;
+    out.push(punct);
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/* ===========================================================================  
+   ✅ Chunk for TTS (podcast)
+===========================================================================*/
 function chunkTextSmart(text = "", maxChars = 520) {
   const t = (text || "").replace(/\s+/g, " ").trim();
   if (!t) return [];
 
-  // split by sentence-ish
   const parts = t.split(/(?<=[\.\!\?\。\！\？])\s+/g);
   const chunks = [];
   let cur = "";
@@ -417,7 +542,6 @@ function chunkTextSmart(text = "", maxChars = 520) {
     if (s.length <= maxChars) {
       cur = s;
     } else {
-      // nếu 1 câu quá dài -> cắt thẳng
       for (let i = 0; i < s.length; i += maxChars) {
         chunks.push(s.slice(i, i + maxChars).trim());
       }
@@ -460,7 +584,7 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("robot/scanning180");
   mqttClient.subscribe("robot/label");
 
-  // (optional) gesture topics if you use them
+  // (optional) gesture topics
   mqttClient.subscribe("/robot/gesture/stopmusic");
   mqttClient.subscribe("/robot/gesture/stop");
   mqttClient.subscribe("robot/gesture/standup");
@@ -547,13 +671,8 @@ const VOICE_SERVER_URL =
   process.env.VOICE_SERVER_URL ||
   "https://eleven-tts-wav-server-matthewrobotvoice.up.railway.app/convertvoice";
 
-// global timeout (for non-PI usage)
 const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS || 45000);
-
-// ✅ PI endpoint timeout nhỏ hơn để tránh 502
 const VOICE_TIMEOUT_PI_MS = Number(process.env.VOICE_TIMEOUT_PI_MS || 12000);
-
-// ✅ long TTS (podcast chunk) timeout dài hơn
 const VOICE_TIMEOUT_LONG_MS = Number(process.env.VOICE_TIMEOUT_LONG_MS || 45000);
 
 const DEFAULT_VOICE_PAYLOAD = {
@@ -581,7 +700,11 @@ async function openaiTtsToMp3(replyText, prefix = "tts") {
   return `${getPublicHost()}/audio/${filename}`;
 }
 
-async function voiceServerToMp3WithTimeout(replyText, prefix = "eleven", timeoutMs = VOICE_TIMEOUT_MS) {
+async function voiceServerToMp3WithTimeout(
+  replyText,
+  prefix = "eleven",
+  timeoutMs = VOICE_TIMEOUT_MS
+) {
   const ts = Date.now();
   const wavTmp = path.join(audioDir, `${prefix}_${ts}.wav`);
   const mp3Out = path.join(audioDir, `${prefix}_${ts}.mp3`);
@@ -607,49 +730,63 @@ async function voiceServerToMp3WithTimeout(replyText, prefix = "eleven", timeout
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
     const buf = Buffer.from(await resp.arrayBuffer());
 
-    // voice server trả mp3 luôn
     if (ct.includes("audio/mpeg") || ct.includes("audio/mp3")) {
       fs.writeFileSync(mp3Out, buf);
       return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
     }
 
-    // voice server trả wav -> convert mp3
     fs.writeFileSync(wavTmp, buf);
 
     await new Promise((resolve, reject) =>
-      ffmpeg(wavTmp).toFormat("mp3").on("end", resolve).on("error", reject).save(mp3Out)
+      ffmpeg(wavTmp)
+        .toFormat("mp3")
+        .on("end", resolve)
+        .on("error", reject)
+        .save(mp3Out)
     );
 
-    try { fs.unlinkSync(wavTmp); } catch { }
+    try {
+      fs.unlinkSync(wavTmp);
+    } catch { }
     return `${getPublicHost()}/audio/${path.basename(mp3Out)}`;
   } catch (e) {
     clearTimeout(timer);
-    try { if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp); } catch { }
-    try { if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out); } catch { }
+    try {
+      if (fs.existsSync(wavTmp)) fs.unlinkSync(wavTmp);
+    } catch { }
+    try {
+      if (fs.existsSync(mp3Out)) fs.unlinkSync(mp3Out);
+    } catch { }
     throw e;
   }
 }
 
-// ✅ PI endpoint: bắt buộc attempt voice server trước, nhưng timeout nhỏ hơn
 async function textToSpeechMp3Pi(replyText, prefix = "pi_v2") {
   const safeText = (replyText || "").trim();
   if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
 
   try {
-    return await voiceServerToMp3WithTimeout(safeText, `${prefix}_eleven`, VOICE_TIMEOUT_PI_MS);
+    return await voiceServerToMp3WithTimeout(
+      safeText,
+      `${prefix}_eleven`,
+      VOICE_TIMEOUT_PI_MS
+    );
   } catch (e) {
     console.error("⚠️ PI voice server timeout/fail -> fallback OpenAI:", e?.message || e);
     return await openaiTtsToMp3(safeText, `${prefix}_openai`);
   }
 }
 
-// ✅ long text (podcast chunks): timeout dài hơn, fallback OpenAI
 async function textToSpeechMp3Long(replyText, prefix = "long") {
   const safeText = (replyText || "").trim();
   if (!safeText) return await openaiTtsToMp3("Dạ.", `${prefix}_fallback`);
 
   try {
-    return await voiceServerToMp3WithTimeout(safeText, `${prefix}_eleven`, VOICE_TIMEOUT_LONG_MS);
+    return await voiceServerToMp3WithTimeout(
+      safeText,
+      `${prefix}_eleven`,
+      VOICE_TIMEOUT_LONG_MS
+    );
   } catch (e) {
     console.error("⚠️ LONG voice server fail -> fallback OpenAI:", e?.message || e);
     return await openaiTtsToMp3(safeText, `${prefix}_openai`);
@@ -660,7 +797,9 @@ async function textToSpeechMp3Long(replyText, prefix = "long") {
    ✅ CONCAT mp3 helpers
 ===========================================================================*/
 function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch { }
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch { }
 }
 
 function audioUrlToLocalPath(audio_url) {
@@ -669,7 +808,6 @@ function audioUrlToLocalPath(audio_url) {
   return path.join(audioDir, filename);
 }
 
-/** concat 2 mp3 local -> mp3 local, return public URL */
 async function concatMp3LocalToPublicUrl(mp3APath, mp3BPath, prefix = "music_final") {
   const ts = Date.now();
   const outPath = path.join(audioDir, `${prefix}_${ts}.mp3`);
@@ -689,7 +827,7 @@ async function concatMp3LocalToPublicUrl(mp3APath, mp3BPath, prefix = "music_fin
 }
 
 /* ===========================================================================  
-   ✅ NEW: Podcast session store (transcript -> chunks)
+   ✅ Podcast session store (punctuated transcript -> chunks)
 ===========================================================================*/
 const podcastSessions = new Map();
 const PODCAST_TTL_MS = Number(process.env.PODCAST_TTL_MS || 60 * 60 * 1000); // 1h
@@ -702,7 +840,6 @@ function newPodcastId() {
 function createPodcastSession({ title = "", url = "", transcriptText = "" }) {
   let chunks = chunkTextSmart(transcriptText, 520);
 
-  // tránh quá dài -> giữ tối đa N chunks đầu
   if (chunks.length > PODCAST_MAX_CHUNKS) {
     chunks = chunks.slice(0, PODCAST_MAX_CHUNKS);
   }
@@ -713,7 +850,7 @@ function createPodcastSession({ title = "", url = "", transcriptText = "" }) {
     title,
     url,
     chunks,
-    index: 0,
+    index: 0, // current index already served (0 means chunk0 will be served now)
     createdAt: Date.now(),
   });
   return id;
@@ -729,7 +866,6 @@ function getPodcastSession(id) {
   return s;
 }
 
-// cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of podcastSessions.entries()) {
@@ -739,12 +875,8 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
-
 /* ===========================================================================  
-   ✅ JOB QUEUE (avoid client timeout / disconnect)
-   - Long tasks (especially long YouTube) can exceed client/proxy timeouts.
-   - We create a job_id, respond early (202), keep processing, publish MQTT when ready.
-   - Client can poll: GET /job?id=JOB_ID
+   ✅ JOB QUEUE (avoid client timeout)
 ===========================================================================*/
 const jobs = new Map();
 const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 60 * 60 * 1000); // 1h
@@ -757,7 +889,7 @@ function createJob(initial = {}) {
   const id = newJobId();
   jobs.set(id, {
     id,
-    status: "queued",   // queued | running | done | error
+    status: "queued", // queued | running | done | error
     createdAt: Date.now(),
     updatedAt: Date.now(),
     result: null,
@@ -797,19 +929,6 @@ async function runJob(id, fn) {
   }
 }
 
-async function waitJobDone(id, timeoutMs = 240000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const j = getJob(id);
-    if (!j) return null;
-    if (j.status === "done") return j;
-    if (j.status === "error") return j;
-    await new Promise((r) => setTimeout(r, 800));
-  }
-  return getJob(id);
-}
-
-// cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [id, j] of jobs.entries()) {
@@ -825,9 +944,8 @@ app.get("/job", (req, res) => {
   return res.json({ ok: true, job: j });
 });
 
-
 /* ===========================================================================  
-   ✅ NEW: endpoint lấy chunk tiếp theo
+   ✅ endpoint lấy chunk tiếp theo
    GET /podcast_next?id=pod_xxx
 ===========================================================================*/
 app.get("/podcast_next", async (req, res) => {
@@ -841,7 +959,14 @@ app.get("/podcast_next", async (req, res) => {
     const nextIndex = Number(s.index || 0) + 1;
     if (nextIndex >= s.chunks.length) {
       podcastSessions.delete(id);
-      return res.json({ ok: true, id, done: true, index: nextIndex, total: s.chunks.length, audio_url: null });
+      return res.json({
+        ok: true,
+        id,
+        done: true,
+        index: nextIndex,
+        total: s.chunks.length,
+        audio_url: null,
+      });
     }
 
     s.index = nextIndex;
@@ -918,8 +1043,19 @@ function extractSongQuery(text = "") {
 function isQuestionLike(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const q = [
-    "la ai", "la gi", "cai gi", "vi sao", "tai sao", "o dau", "khi nao", "bao nhieu",
-    "how", "what", "why", "where", "?"
+    "la ai",
+    "la gi",
+    "cai gi",
+    "vi sao",
+    "tai sao",
+    "o dau",
+    "khi nao",
+    "bao nhieu",
+    "how",
+    "what",
+    "why",
+    "where",
+    "?",
   ];
   return q.some((k) => t.includes(stripDiacritics(k)));
 }
@@ -942,9 +1078,22 @@ function looksLikeSongTitleOnly(userText = "") {
 function containsMusicIntent(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const keys = [
-    "nghe", "nghe nhac", "phat", "phat nhac", "mo", "mo nhac", "mo bai", "bat nhac",
-    "bai hat", "cho toi nghe", "mở", "bật", "phát",
-    "listen", "play song", "play music"
+    "nghe",
+    "nghe nhac",
+    "phat",
+    "phat nhac",
+    "mo",
+    "mo nhac",
+    "mo bai",
+    "bat nhac",
+    "bai hat",
+    "cho toi nghe",
+    "mở",
+    "bật",
+    "phát",
+    "listen",
+    "play song",
+    "play music",
   ];
   return keys.some((k) => t.includes(stripDiacritics(k)));
 }
@@ -1010,7 +1159,6 @@ async function searchYouTubeTop1(query) {
   }
 }
 
-
 function formatDuration(seconds) {
   if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0) return "";
   const s = Math.floor(seconds);
@@ -1020,241 +1168,6 @@ function formatDuration(seconds) {
   const pad = (n) => String(n).padStart(2, "0");
   if (hh > 0) return `${hh}:${pad(mm)}:${pad(ss)}`;
   return `${mm}:${pad(ss)}`;
-}
-
-async function tryFetchJson(url, opts) {
-  const controller = new AbortController();
-  const timeoutMs = Number(opts?.timeoutMs || 180000);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const resp = await fetch(url, { ...opts, signal: controller.signal });
-    const text = await resp.text().catch(() => "");
-    let json = null;
-    try { json = JSON.parse(text); } catch { json = null; }
-
-    if (!resp.ok) {
-      const msg = json?.error || text || `HTTP ${resp.status}`;
-      throw new Error(`Remote ${resp.status}: ${String(msg).slice(0, 400)}`);
-    }
-    return json || { raw: text };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Gọi server YT riêng để xử lý video dài và trả về audio_url.
- * - Try vài endpoint phổ biến để bạn khỏi phải sửa nhiều nếu server kia đổi route.
- */
-async function fetchRemoteYtAudio({ url, title = "", seconds = null, query = "", stt = "", user = "" }) {
-  if (!url) throw new Error("Missing url");
-
-  // ✅ Your remote server confirmed working endpoint (Postman):
-  // POST  /api/transcript  (form-data)
-  // keys: video_url, format=json, include_timestamp=false, send_metadata=false
-  //
-  // To avoid adding new deps, we send as x-www-form-urlencoded (most servers accept it).
-  // If your remote server ONLY accepts multipart/form-data, tell me and I'll switch to FormData.
-  const transcriptEndpoint = `${REMOTE_YT_SERVER}/api/transcript`;
-  try {
-    const body = new URLSearchParams();
-    body.set("video_url", url);
-    body.set("format", "json");
-    body.set("include_timestamp", "false");
-    body.set("send_metadata", "false");
-
-    const json = await tryFetchJson(transcriptEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      timeoutMs: 240000,
-    });
-
-    // Try to find audio_url in a few common shapes
-    const audio_url =
-      json?.audio_url ||
-      json?.audioUrl ||
-      json?.download_url ||
-      json?.downloadUrl ||
-      json?.audio ||
-      json?.data?.audio_url ||
-      json?.data?.audioUrl ||
-      json?.data?.download_url ||
-      json?.result?.audio_url ||
-      null;
-
-    if (audio_url) return audio_url;
-
-    // If remote only returns transcript, we log it (and fail gracefully upstream)
-    const hasTranscript =
-      typeof json?.transcript === "string" ||
-      typeof json?.text === "string" ||
-      typeof json?.data?.transcript === "string" ||
-      typeof json?.data?.text === "string";
-
-    if (hasTranscript) {
-      console.log("ℹ️ Remote /api/transcript returned transcript but no audio_url. keys=", Object.keys(json || {}));
-      // return null to let caller handle (reply with error message)
-      return null;
-    }
-
-    console.log("ℹ️ Remote /api/transcript response keys=", Object.keys(json || {}));
-  } catch (e) {
-    // If your remote endpoint ONLY accepts multipart/form-data, retry with FormData
-    try {
-      const fd = new FormData();
-      fd.set("video_url", url);
-      fd.set("format", "json");
-      fd.set("include_timestamp", "false");
-      fd.set("send_metadata", "false");
-
-      const resp = await fetch(transcriptEndpoint, { method: "POST", body: fd });
-      const text = await resp.text().catch(() => "");
-      let json = null;
-      try { json = JSON.parse(text); } catch { json = null; }
-
-      if (resp.ok && json) {
-        const audio_url =
-          json?.audio_url ||
-          json?.audioUrl ||
-          json?.download_url ||
-          json?.downloadUrl ||
-          json?.audio ||
-          json?.data?.audio_url ||
-          json?.data?.audioUrl ||
-          json?.data?.download_url ||
-          json?.result?.audio_url ||
-          null;
-        if (audio_url) return audio_url;
-        const hasTranscript =
-          typeof json?.transcript === "string" ||
-          typeof json?.text === "string" ||
-          typeof json?.data?.transcript === "string" ||
-          typeof json?.data?.text === "string";
-        if (hasTranscript) {
-          console.log("ℹ️ Remote /api/transcript (FormData) returned transcript but no audio_url. keys=", Object.keys(json || {}));
-          return null;
-        }
-      }
-    } catch (e2) {
-      // ignore
-    }
-
-    // continue to fallback endpoints below
-    console.error("⚠️ Remote /api/transcript failed:", e?.message || e);
-  }
-
-  // Fallback: try a few common endpoints (in case you later add audio endpoint)
-  const endpoints = [
-    { method: "POST", path: "/api/audio" },
-    { method: "POST", path: "/api/ytdlp_audio" },
-    { method: "POST", path: "/yt_audio" },
-    { method: "POST", path: "/download_audio" },
-    { method: "POST", path: "/extract_audio" },
-    { method: "POST", path: "/ytdlp_audio" },
-    { method: "GET", path: "/yt_audio" },
-    { method: "GET", path: "/download_audio" },
-  ];
-
-  const payload = { url, title, seconds, query, stt, user };
-
-  let lastErr = null;
-  for (const ep of endpoints) {
-    try {
-      const full = `${REMOTE_YT_SERVER}${ep.path}`;
-      const isGet = ep.method === "GET";
-      const fullUrl = isGet ? `${full}?url=${encodeURIComponent(url)}` : full;
-
-      const json = await tryFetchJson(fullUrl, {
-        method: ep.method,
-        headers: { "Content-Type": "application/json" },
-        body: isGet ? undefined : JSON.stringify(payload),
-        timeoutMs: 240000,
-      });
-
-      const audio_url = json?.audio_url || json?.url || json?.audio || json?.download_url || null;
-      if (audio_url) return audio_url;
-
-      lastErr = new Error(`Remote returned no audio_url on ${ep.method} ${ep.path}`);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  throw lastErr || new Error("Remote ytserver failed");
-}
-
-async function headContentLength(fileUrl) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
-  try {
-    const resp = await fetch(fileUrl, { method: "HEAD", signal: controller.signal });
-    if (!resp.ok) return null;
-    const v = resp.headers.get("content-length");
-    const n = v ? Number(v) : NaN;
-    return Number.isFinite(n) ? n : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function downloadToFile(fileUrl, outPath, { timeoutMs = 240000, maxBytes = null } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let ws = null;
-  try {
-    const resp = await fetch(fileUrl, { method: "GET", signal: controller.signal });
-    if (!resp.ok) throw new Error(`Download failed ${resp.status}`);
-
-    ws = fs.createWriteStream(outPath);
-    let downloaded = 0;
-
-    for await (const chunk of resp.body) {
-      downloaded += chunk.length;
-      if (maxBytes && downloaded > maxBytes) {
-        throw new Error(`Remote audio too large > ${Math.round(maxBytes / (1024 * 1024))}MB`);
-      }
-      ws.write(chunk);
-    }
-
-    await new Promise((resolve, reject) => {
-      ws.end(resolve);
-      ws.on("error", reject);
-    });
-
-    return { bytes: downloaded };
-  } finally {
-    clearTimeout(timer);
-    try { if (ws) ws.close?.(); } catch { }
-  }
-}
-
-/**
- * Cố gắng merge intro + remote audio (chỉ khi file remote không quá lớn).
- * Nếu quá lớn / lỗi => trả về remoteAudioUrl luôn để không bị timeout.
- */
-async function maybeConcatIntroWithRemote(introLocalPath, remoteAudioUrl) {
-  const maxBytes = Math.max(1, REMOTE_MERGE_MAX_MB) * 1024 * 1024;
-
-  const size = await headContentLength(remoteAudioUrl);
-  if (size && size > maxBytes) {
-    return { final_audio_url: remoteAudioUrl, merged: false, reason: "remote_too_large_head" };
-  }
-
-  const dlPath = path.join(audioDir, `remote_${Date.now()}.mp3`);
-  try {
-    await downloadToFile(remoteAudioUrl, dlPath, { timeoutMs: 240000, maxBytes });
-    const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, dlPath, "music_final_remote");
-    safeUnlink(dlPath);
-    return { final_audio_url, merged: true };
-  } catch (e) {
-    safeUnlink(dlPath);
-    return { final_audio_url: remoteAudioUrl, merged: false, reason: e?.message || "merge_failed" };
-  }
 }
 
 /* ===========================================================================  
@@ -1418,6 +1331,7 @@ app.post(
     try {
       const t0 = Date.now();
       const ms = () => Date.now() - t0;
+
       const audioFile = (
         req.files?.audio?.[0] ||
         req.files?.file?.[0] ||
@@ -1427,7 +1341,11 @@ app.post(
       );
       const userKey = getClientKey(req);
 
-      if (!audioFile?.buffer) return res.status(400).json({ error: "No audio uploaded (expected multipart field: audio/file/voice/wav/recording)" });
+      if (!audioFile?.buffer) {
+        return res.status(400).json({
+          error: "No audio uploaded (expected multipart field: audio/file/voice/wav/recording)",
+        });
+      }
 
       let meta = {};
       try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
@@ -1504,7 +1422,7 @@ app.post(
 
         const durationStr = formatDuration(top?.seconds);
         const isLong = typeof top?.seconds === "number" && top.seconds >= LONG_VIDEO_SECONDS;
-        const route = isLong ? "REMOTE_YTSERVER" : "LOCAL_YTDLP";
+        const route = isLong ? "REMOTE_TRANSCRIPT_TTS" : "LOCAL_YTDLP";
 
         console.log(
           "🎵 YT_SEARCH_RESULT:",
@@ -1521,222 +1439,257 @@ app.post(
           `(${ms()}ms)`
         );
 
-        if (top?.url) {
-          // ✅ LONG VIDEO => gửi qua server YT riêng để lấy audio_url
-          if (isLong) {
-            const wantWait = String(req.query.wait || req.query.sync || "0") === "1";
-
-            const jobMeta = {
-              type: "yt_long",
-              user: userKey,
-              stt: text,
-              q,
-              yt: {
-                title: top.title,
-                url: top.url,
-                seconds: top.seconds,
-                duration: durationStr,
-              },
-              remote: REMOTE_YT_SERVER,
-            };
-
-            const processLong = async () => {
-              console.log("📤 SEND_TO_REMOTE_YTSERVER:", {
-                remote: REMOTE_YT_SERVER,
-                url: top.url,
-                title: top.title,
-                seconds: top.seconds,
-                duration: durationStr,
-              });
-
-              const remoteAudioUrl = await fetchRemoteYtAudio({
-                url: top.url,
-                title: top.title,
-                seconds: top.seconds,
-                query: q,
-                stt: text,
-                user: userKey,
-              });
-
-              if (!remoteAudioUrl) {
-                throw new Error("Remote ytserver returned no audio_url (check /api/transcript response)");
-              }
-
-              // (Optional) tạo intro + cố merge nếu remote file không quá to
-              const introText = `Video này hơi dài nên em nhờ server phụ xử lý. Đây là "${top.title}".`;
-              let final_audio_url = remoteAudioUrl;
-              let merged = false;
-              let merge_reason = "";
-
-              try {
-                const intro_url = await textToSpeechMp3Pi(introText, "music_intro_long");
-                const introLocalPath = audioUrlToLocalPath(intro_url);
-
-                const r = await maybeConcatIntroWithRemote(introLocalPath, remoteAudioUrl);
-                final_audio_url = r.final_audio_url;
-                merged = !!r.merged;
-                merge_reason = r.reason || "";
-
-                safeUnlink(introLocalPath);
-              } catch (e) {
-                console.error("⚠️ Merge intro+remote failed -> return remote only:", e?.message || e);
-                final_audio_url = remoteAudioUrl;
-                merged = false;
-                merge_reason = e?.message || "merge_exception";
-              }
-
-              console.log("✅ REMOTE_AUDIO_READY:", {
-                remoteAudioUrl,
-                final_audio_url,
-                merged,
-                merge_reason,
-              });
-
-              mqttClient.publish(
-                "robot/music",
-                JSON.stringify({
-                  label: "nhac",
-                  text: introText,
-                  audio_url: final_audio_url,
-                  user: userKey,
-                  yt: {
-                    title: top.title,
-                    url: top.url,
-                    seconds: top.seconds,
-                    duration: durationStr,
-                    route: "remote",
-                    remote_server: REMOTE_YT_SERVER,
-                    merged,
-                    merge_reason,
-                  },
-                }),
-                { qos: 1 }
-              );
-
-              return {
-                status: "ok",
-                transcript: text,
-                label: "nhac",
-                reply_text: introText,
-                audio_url: final_audio_url,
-                play: null,
-                used_vision: false,
-                job: { route: "REMOTE_YTSERVER" },
-              };
-            };
-
-            // ✅ default: async job to avoid client timeout
-            if (!wantWait) {
-              const job_id = createJob(jobMeta);
-              console.log("🧵 JOB_CREATED:", { job_id, ...jobMeta });
-              runJob(job_id, processLong).catch((e) => {
-                console.error("❌ Job failed:", job_id, e?.message || e);
-              });
-
-              // respond early so client won't timeout / disconnect
-              return res.status(202).json({
-                status: "processing",
-                job_id,
-                transcript: text,
-                label: "nhac",
-                title: top.title,
-                url: top.url,
-                seconds: top.seconds,
-                duration: durationStr,
-                route: "REMOTE_YTSERVER",
-                remote: REMOTE_YT_SERVER,
-              });
-            }
-
-            // ✅ sync wait=1 (debug)
-            const job_id = createJob({ ...jobMeta, note: "sync_wait=1" });
-            try {
-              const result = await runJob(job_id, processLong);
-              return res.json({ ...result, job_id });
-            } catch (e) {
-              console.error("❌ Remote ytserver error:", e?.message || e);
-              const replyText = `Em bị lỗi khi lấy audio cho video dài "${top.title}". Anh thử bài khác giúp em nha.`;
-              const audio_url = await textToSpeechMp3Pi(replyText, "yt_remote_fail");
-              return res.json({
-                status: "ok",
-                transcript: text,
-                label: "nhac",
-                reply_text: replyText,
-                audio_url,
-                play: null,
-                used_vision: false,
-                job_id,
-              });
-            }
-          }
-
-          // ✅ SHORT VIDEO => tải mp3 như cũ (local yt-dlp)
-          console.log("📦 LOCAL_YTDLP_DOWNLOAD:", {
-            url: top.url,
-            title: top.title,
-            seconds: top.seconds,
-            duration: durationStr,
-          });
-
-          const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
-
-          // 1) TTS intro -> URL mp3 trong /audio
-          const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
-
-          // 2) yt-dlp tải mp3 nhạc (local path)
-          const songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
-
-          // 3) Ghép intro + nhạc => mp3 cuối
-          const introLocalPath = audioUrlToLocalPath(intro_url);
-          const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
-
-          // dọn file trung gian (để tránh đầy disk)
-          safeUnlink(introLocalPath);
-          safeUnlink(songMp3Path);
-
-          console.log("✅ LOCAL_AUDIO_READY:", {
-            final_audio_url,
-            title: top.title,
-            duration: durationStr,
-          });
-
-          mqttClient.publish(
-            "robot/music",
-            JSON.stringify({
-              label: "nhac",
-              text: introText,
-              audio_url: final_audio_url,
-              user: userKey,
-              yt: {
-                title: top.title,
-                url: top.url,
-                seconds: top.seconds,
-                duration: durationStr,
-                route: "local",
-              },
-            }),
-            { qos: 1 }
-          );
-
+        if (!top?.url) {
+          const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
+          const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
           return res.json({
             status: "ok",
             transcript: text,
             label: "nhac",
-            reply_text: introText,
-            audio_url: final_audio_url,
+            reply_text: replyText,
+            audio_url,
             play: null,
             used_vision: false,
           });
         }
 
-        const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
-        const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
+        // ✅ LONG VIDEO => transcript -> punctuate -> TTS chunk -> podcast_next
+        if (isLong) {
+          const wantWait = String(req.query.wait || req.query.sync || "0") === "1";
+
+          const jobMeta = {
+            type: "yt_long_transcript_tts",
+            user: userKey,
+            stt: text,
+            q,
+            yt: {
+              title: top.title,
+              url: top.url,
+              seconds: top.seconds,
+              duration: durationStr,
+            },
+            remote: REMOTE_YT_SERVER,
+          };
+
+          const processLong = async () => {
+            console.log("📤 LONG_YT -> FETCH TRANSCRIPT REMOTE:", {
+              remote: REMOTE_YT_SERVER,
+              url: top.url,
+              title: top.title,
+              seconds: top.seconds,
+              duration: durationStr,
+            });
+
+            // 1) remote transcript
+            let transcript = "";
+            try {
+              transcript = await fetchRemoteTranscriptText({ videoUrl: top.url });
+            } catch (e) {
+              console.error("⚠️ Remote transcript failed:", e?.message || e);
+              transcript = "";
+            }
+
+            // 2) fallback local captions if remote empty
+            if (!transcript || transcript.length < 30) {
+              console.log("⚠️ Remote transcript empty -> fallback local captions (yt-dlp vtt)");
+              transcript = await getYoutubeTranscriptTextLocal(top.url);
+            }
+
+            if (!transcript || transcript.length < 30) {
+              throw new Error("No transcript available (remote + local captions both empty)");
+            }
+
+            // cap transcript to avoid huge tasks
+            if (transcript.length > TRANSCRIPT_MAX_CHARS) {
+              transcript = transcript.slice(0, TRANSCRIPT_MAX_CHARS);
+            }
+
+            console.log("📝 TRANSCRIPT_LEN:", transcript.length);
+
+            // 3) GPT punctuation
+            console.log("🔧 PUNCTUATE_WITH_GPT...");
+            const punctuated = await punctuateWithGPT(transcript);
+            console.log("✅ PUNCTUATED_LEN:", punctuated.length);
+
+            // 4) create podcast session
+            const podcast_id = createPodcastSession({
+              title: top.title,
+              url: top.url,
+              transcriptText: punctuated,
+            });
+
+            const s = getPodcastSession(podcast_id);
+            const total = s?.chunks?.length || 0;
+
+            // 5) TTS intro + chunk0, then concat
+            const introText = `Video này hơi dài. Em sẽ đọc nội dung cho bạn nghe từng phần. Đây là "${top.title}".`;
+            const intro_url = await textToSpeechMp3Long(introText, `pod_intro_${podcast_id}`);
+            const introLocal = audioUrlToLocalPath(intro_url);
+
+            const chunk0 = s.chunks[0] || punctuated.slice(0, 520);
+            const chunk0_url = await textToSpeechMp3Long(chunk0, `pod_${podcast_id}_0`);
+            const chunk0Local = audioUrlToLocalPath(chunk0_url);
+
+            const first_audio_url = await concatMp3LocalToPublicUrl(
+              introLocal,
+              chunk0Local,
+              `pod_first_${podcast_id}`
+            );
+
+            safeUnlink(introLocal);
+            safeUnlink(chunk0Local);
+
+            console.log("✅ LONG_TTS_READY:", {
+              podcast_id,
+              total,
+              first_audio_url,
+              title: top.title,
+              duration: durationStr,
+            });
+
+            // MQTT notify
+            mqttClient.publish(
+              "robot/music",
+              JSON.stringify({
+                label: "nhac",
+                mode: "podcast_transcript_tts",
+                text: introText,
+                audio_url: first_audio_url,
+                user: userKey,
+                podcast: { id: podcast_id, index: 0, total },
+                yt: {
+                  title: top.title,
+                  url: top.url,
+                  seconds: top.seconds,
+                  duration: durationStr,
+                  route: "remote_transcript_tts",
+                  remote_server: REMOTE_YT_SERVER,
+                },
+              }),
+              { qos: 1 }
+            );
+
+            return {
+              status: "ok",
+              transcript: text,
+              label: "nhac",
+              reply_text: introText,
+              audio_url: first_audio_url,
+              play: null,
+              used_vision: false,
+              yt: {
+                title: top.title,
+                url: top.url,
+                seconds: top.seconds,
+                duration: durationStr,
+                route: "REMOTE_TRANSCRIPT_TTS",
+              },
+              podcast: { id: podcast_id, index: 0, total },
+            };
+          };
+
+          // ✅ default async job to avoid timeout
+          if (!wantWait) {
+            const job_id = createJob(jobMeta);
+            console.log("🧵 JOB_CREATED:", { job_id, ...jobMeta });
+            runJob(job_id, processLong).catch((e) => {
+              console.error("❌ Job failed:", job_id, e?.message || e);
+            });
+
+            return res.status(202).json({
+              status: "processing",
+              job_id,
+              transcript: text,
+              label: "nhac",
+              title: top.title,
+              url: top.url,
+              seconds: top.seconds,
+              duration: durationStr,
+              route: "REMOTE_TRANSCRIPT_TTS",
+              remote: REMOTE_YT_SERVER,
+            });
+          }
+
+          // ✅ sync wait=1 (debug)
+          const job_id = createJob({ ...jobMeta, note: "sync_wait=1" });
+          try {
+            const result = await runJob(job_id, processLong);
+            return res.json({ ...result, job_id });
+          } catch (e) {
+            console.error("❌ LONG transcript TTS error:", e?.message || e);
+            const replyText = `Em bị lỗi khi lấy transcript cho video dài "${top.title}". Anh thử video khác giúp em nha.`;
+            const audio_url = await textToSpeechMp3Pi(replyText, "yt_long_fail");
+            return res.json({
+              status: "ok",
+              transcript: text,
+              label: "nhac",
+              reply_text: replyText,
+              audio_url,
+              play: null,
+              used_vision: false,
+              job_id,
+            });
+          }
+        }
+
+        // ✅ SHORT VIDEO => tải mp3 như cũ (local yt-dlp)
+        console.log("📦 LOCAL_YTDLP_DOWNLOAD:", {
+          url: top.url,
+          title: top.title,
+          seconds: top.seconds,
+          duration: durationStr,
+        });
+
+        const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
+
+        // 1) TTS intro -> URL mp3 trong /audio
+        const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
+
+        // 2) yt-dlp tải mp3 nhạc (local path)
+        const songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+
+        // 3) Ghép intro + nhạc => mp3 cuối
+        const introLocalPath = audioUrlToLocalPath(intro_url);
+        const final_audio_url = await concatMp3LocalToPublicUrl(
+          introLocalPath,
+          songMp3Path,
+          "music_final"
+        );
+
+        // dọn file trung gian
+        safeUnlink(introLocalPath);
+        safeUnlink(songMp3Path);
+
+        console.log("✅ LOCAL_AUDIO_READY:", {
+          final_audio_url,
+          title: top.title,
+          duration: durationStr,
+        });
+
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({
+            label: "nhac",
+            text: introText,
+            audio_url: final_audio_url,
+            user: userKey,
+            yt: {
+              title: top.title,
+              url: top.url,
+              seconds: top.seconds,
+              duration: durationStr,
+              route: "local",
+            },
+          }),
+          { qos: 1 }
+        );
+
         return res.json({
           status: "ok",
           transcript: text,
           label: "nhac",
-          reply_text: replyText,
-          audio_url,
+          reply_text: introText,
+          audio_url: final_audio_url,
           play: null,
           used_vision: false,
         });
@@ -1898,8 +1851,6 @@ app.get("/get_scanningstatus", (req, res) => {
   res.json({ status: scanStatus });
 });
 
-
-
 /* ===========================================================================  
    MULTER ERROR HANDLER (better logs)
 ===========================================================================*/
@@ -1917,27 +1868,26 @@ app.use((err, req, res, next) => {
    ROOT
 ===========================================================================*/
 app.get("/", (req, res) => {
-  res.send("Matthew Robot server is running 🚀 (YouTube -> MP3 + Intro + Merge + LONG transcript podcast)");
+  res.send("Matthew Robot server is running 🚀 (YouTube short=mp3+intro, long=transcript->punctuate->TTS podcast)");
 });
 
 /* ===========================================================================  
    START SERVER (tune timeouts)
 ===========================================================================*/
 const server = http.createServer(app);
-// allow long responses (still subject to Railway / client limits)
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
-try { server.requestTimeout = 0; } catch { }
+try {
+  server.requestTimeout = 0;
+} catch { }
 
 server.listen(PORT, async () => {
   console.log(` Server listening on port ${PORT}`);
   console.log(` Voice server: ${VOICE_SERVER_URL}`);
+  console.log(` Remote YT server: ${REMOTE_YT_SERVER}`);
+  console.log(` LONG_VIDEO_SECONDS: ${LONG_VIDEO_SECONDS}`);
+  console.log(` TRANSCRIPT_MAX_CHARS: ${TRANSCRIPT_MAX_CHARS}`);
+  console.log(` PUNCTUATE_MODEL: ${PUNCTUATE_MODEL}`);
   await checkYtdlpReady();
-  // ví dụ env bạn đang dùng:
-  const REMOTE_YTSERVER_BASE = process.env.REMOTE_YTSERVER_BASE
-    || "https://endearing-upliftment-ytserver.up.railway.app";
-
-  await checkYtServerConnectivity(REMOTE_YTSERVER_BASE);
+  await checkYtServerConnectivity(REMOTE_YT_SERVER);
 });
-
-
