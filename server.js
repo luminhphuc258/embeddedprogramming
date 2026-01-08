@@ -1125,6 +1125,101 @@ Return JSON schema exactly:
   }
 });
 
+
+//===========
+
+function clamp(n, a, b) {
+  n = Number(n);
+  if (!Number.isFinite(n)) return a;
+  return Math.max(a, Math.min(b, n));
+}
+function clamp01(n) { return clamp(n, 0, 1); }
+
+function sanitizeBboxNormalized(b) {
+  if (!Array.isArray(b) || b.length !== 4) return null;
+  const x1 = clamp01(b[0]);
+  const y1 = clamp01(b[1]);
+  const x2 = clamp01(b[2]);
+  const y2 = clamp01(b[3]);
+  // ensure proper order
+  const xx1 = Math.min(x1, x2);
+  const xx2 = Math.max(x1, x2);
+  const yy1 = Math.min(y1, y2);
+  const yy2 = Math.max(y1, y2);
+  if (xx2 - xx1 < 1e-6 || yy2 - yy1 < 1e-6) return null;
+  return [xx1, yy1, xx2, yy2];
+}
+
+function normalizeState(s) {
+  const v = String(s || "").toLowerCase().trim();
+  if (v === "player_x" || v === "x") return "player_x";
+  if (v === "robot_line" || v === "robot" || v === "line") return "robot_line";
+  return "empty";
+}
+
+function bboxCenter(b) {
+  const [x1, y1, x2, y2] = b;
+  return { cx: (x1 + x2) / 2, cy: (y1 + y2) / 2 };
+}
+
+/**
+ * ✅ Recompute row/col purely from geometry:
+ *  row = floor((cy - gy1)/cell_h)
+ *  col = floor((cx - gx1)/cell_w)
+ * Clamp into [0..rows-1], [0..cols-1]
+ */
+function recomputeRowColFromGrid(cells, grid_bbox, rows, cols) {
+  if (!grid_bbox || rows <= 0 || cols <= 0) return cells;
+
+  const [gx1, gy1, gx2, gy2] = grid_bbox;
+  const gw = gx2 - gx1;
+  const gh = gy2 - gy1;
+
+  // safety
+  if (gw <= 1e-6 || gh <= 1e-6) return cells;
+
+  const cellW = gw / cols;
+  const cellH = gh / rows;
+
+  return cells.map((c) => {
+    const b = c.bbox;
+    if (!b) return c;
+
+    const { cx, cy } = bboxCenter(b);
+
+    // if center is outside grid, keep original (or clamp)
+    const relX = (cx - gx1);
+    const relY = (cy - gy1);
+
+    let col = Math.floor(relX / cellW);
+    let row = Math.floor(relY / cellH);
+
+    col = clamp(col, 0, cols - 1);
+    row = clamp(row, 0, rows - 1);
+
+    return { ...c, row, col };
+  });
+}
+
+/**
+ * Optional: dedupe if multiple cells land on same (row,col)
+ * Keep the one with largest bbox area (more confident)
+ */
+function dedupeByRowCol(cells) {
+  const area = (b) => (b ? Math.max(0, (b[2] - b[0]) * (b[3] - b[1])) : 0);
+  const map = new Map();
+  for (const c of cells) {
+    const key = `${c.row},${c.col}`;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, c);
+      continue;
+    }
+    if (area(c.bbox) > area(prev.bbox)) map.set(key, c);
+  }
+  return Array.from(map.values());
+}
+
 /* ===========================================================================  
    SCAN CHESS (tic-tac-toe / caro)
 ===========================================================================*/
@@ -1164,13 +1259,6 @@ app.post(
         return res.status(400).json({ ...fallback, debug: "No image buffer" });
       }
 
-      // DEBUG: confirm multer nhận file
-      console.log("[scan_chess] got file:", {
-        field: imageFile.fieldname,
-        mime: imageFile.mimetype,
-        size: imageFile.size,
-      });
-
       const b64 = imageFile.buffer.toString("base64");
       const dataUrl = `data:${imageFile.mimetype || "image/jpeg"};base64,${b64}`;
 
@@ -1185,7 +1273,7 @@ Cell state:
 - "player_x" (handwritten X)
 - "robot_line" (robot mark as line)
 If not found, set found=false and still return valid JSON with empty cells.
-`.trim();
+      `.trim();
 
       const user = [
         {
@@ -1207,13 +1295,12 @@ Return exactly:
   "image_space": "normalized",
   "confidence": number
 }
-`.trim(),
+          `.trim(),
         },
         { type: "image_url", image_url: { url: dataUrl } },
       ];
 
       const model = process.env.VISION_MODEL || "gpt-4.1-mini";
-
       const completion = await openai.chat.completions.create({
         model,
         messages: [
@@ -1222,50 +1309,42 @@ Return exactly:
         ],
         temperature: 0,
         max_tokens: 1200,
-
-        // ✅ ép model trả JSON hợp lệ
         response_format: { type: "json_object" },
       });
 
       const raw = completion.choices?.[0]?.message?.content?.trim() || "";
-      console.log("[scan_chess] raw len:", raw.length);
-      console.log("[scan_chess] raw head:", raw.slice(0, 200));
-
       let result = null;
       try {
         result = JSON.parse(raw);
       } catch (e) {
-        console.error("[scan_chess] JSON.parse failed:", e?.message || e);
         return res.json({ ...fallback, debug: "JSON.parse failed", raw_head: raw.slice(0, 300) });
       }
 
-      // ---- sanitize ----
-      const clamp01 = (n) => Math.max(0, Math.min(1, Number(n)));
-      const sanitizeBbox = (b) => {
-        if (!Array.isArray(b) || b.length !== 4) return null;
-        const [x1, y1, x2, y2] = b.map(clamp01);
-        return [x1, y1, x2, y2];
-      };
-      const normalizeState = (s) => {
-        const v = String(s || "").toLowerCase().trim();
-        if (v === "player_x" || v === "x") return "player_x";
-        if (v === "robot_line" || v === "robot" || v === "line") return "robot_line";
-        return "empty";
-      };
-
       const found = !!result.found;
-      const rows = Number.isFinite(result.rows) ? Math.max(0, Math.floor(result.rows)) : 0;
-      const cols = Number.isFinite(result.cols) ? Math.max(0, Math.floor(result.cols)) : 0;
 
+      // Use fixed expected size if model trả bậy
+      const rows = Number.isFinite(result.rows) ? Math.max(1, Math.floor(result.rows)) : 6;
+      const cols = Number.isFinite(result.cols) ? Math.max(1, Math.floor(result.cols)) : 4;
+
+      const grid_bbox = sanitizeBboxNormalized(result.grid_bbox);
+
+      // sanitize cells
       const cellsRaw = Array.isArray(result.cells) ? result.cells : [];
-      const cells = cellsRaw
+      let cells = cellsRaw
         .map((c) => ({
+          // keep original for debug but will recompute anyway
           row: Number.isFinite(c?.row) ? Math.max(0, Math.floor(c.row)) : 0,
           col: Number.isFinite(c?.col) ? Math.max(0, Math.floor(c.col)) : 0,
-          bbox: sanitizeBbox(c?.bbox),
+          bbox: sanitizeBboxNormalized(c?.bbox),
           state: normalizeState(c?.state),
         }))
-        .filter((c) => c.bbox); // bỏ cell bbox null
+        .filter((c) => c.bbox);
+
+      // ✅ 핵심: recompute row/col from geometry
+      if (grid_bbox) {
+        cells = recomputeRowColFromGrid(cells, grid_bbox, rows, cols);
+        cells = dedupeByRowCol(cells);
+      }
 
       const counts = cells.reduce(
         (acc, c) => {
@@ -1280,22 +1359,20 @@ Return exactly:
       const cell_count =
         Number.isFinite(result.cell_count) && result.cell_count > 0
           ? Math.floor(result.cell_count)
-          : rows > 0 && cols > 0
-            ? rows * cols
-            : cells.length;
+          : rows * cols;
 
       const response = {
         found,
         rows,
         cols,
         cell_count,
-        grid_bbox: sanitizeBbox(result.grid_bbox),
+        grid_bbox,
         cells,
         empty_count: Number.isFinite(result.empty_count) ? Math.max(0, Math.floor(result.empty_count)) : counts.empty,
         player_count: Number.isFinite(result.player_count) ? Math.max(0, Math.floor(result.player_count)) : counts.player,
         robot_count: Number.isFinite(result.robot_count) ? Math.max(0, Math.floor(result.robot_count)) : counts.robot,
         image_space: "normalized",
-        confidence: Number.isFinite(result.confidence) ? clamp01(result.confidence) : 0.5,
+        confidence: Number.isFinite(result.confidence) ? clamp01(result.confidence) : 0.6,
       };
 
       if (!response.found) {
@@ -1303,6 +1380,7 @@ Return exactly:
           ...fallback,
           confidence: Math.min(response.confidence, 0.3),
           debug: "model_returned_found_false",
+          grid_bbox: response.grid_bbox,
         });
       }
 
