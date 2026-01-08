@@ -1126,6 +1126,96 @@ Return JSON schema exactly:
 });
 
 /* ===========================================================================  
+   Chess board scan endpoint
+   - Receives image (multipart field: "image")
+   - Sends to configured vision GPT model
+   - Returns JSON with detected squares, empty piece count/positions,
+     moves by user X (or by white if unspecified), and board polygon for drawing
+   - Logs raw model output to server console
+===========================================================================*/
+app.post(
+  "/scan_chess",
+  uploadVision.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.buffer) return res.status(400).json({ error: "No image" });
+      let meta = {};
+      try { meta = req.body?.meta ? JSON.parse(req.body.meta) : {}; } catch { meta = {}; }
+
+      const b64 = req.file.buffer.toString("base64");
+      const dataUrl = `data:image/jpeg;base64,${b64}`;
+
+      const system = `
+Bạn là module "ChessScanner".
+Nhiệm vụ: phân tích 1 bức ảnh bàn cờ cờ vua và trả về JSON hợp lệ (KHÔNG giải thích).
+Trả về chính xác theo schema JSON phía dưới.
+`.trim();
+
+      const user = [
+        { type: "text", text: `Meta: ${JSON.stringify(meta)}\n\nReturn JSON schema exactly as below:` },
+        { type: "text", text: `
+{
+  "squares": [{ "name": string, "row": number, "col": number, "bbox": [x1,y1,x2,y2], "center": [x,y] }],
+  "moves_user_X": number,            // số nước user 'X' đã đi (nếu không rõ trả về moves_by_white & moves_by_black)
+  "moves_by_white": number,
+  "moves_by_black": number,
+  "n_empty_squares": number,
+  "empty_positions": [{ "name": string, "center": [x,y], "row": number, "col": number }],
+  "board_polygon": [[x,y],[x,y],...], // polygon coords để vẽ viền bàn cờ
+  "confidence": number
+}
+`.trim() },
+        { type: "image_url", image_url: { url: dataUrl } },
+      ];
+
+      const model = process.env.VISION_MODEL || "gpt-4.1-mini";
+      const completion = await openai.chat.completions.create({
+        model,
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
+        temperature: 0.0,
+        max_tokens: 900,
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+      console.log("/scan_chess RAW OUTPUT:", raw);
+
+      let result = null;
+      try { result = JSON.parse(raw); } catch {
+        const m = raw.match(/\{[\s\S]*\}$/);
+        if (m) { try { result = JSON.parse(m[0]); } catch { } }
+      }
+
+      // Fallback minimal response when parsing fails
+      if (!result || typeof result !== "object") {
+        return res.status(200).json({
+          squares: [],
+          moves_user_X: null,
+          moves_by_white: null,
+          moves_by_black: null,
+          n_empty_squares: 0,
+          empty_positions: [],
+          board_polygon: [],
+          confidence: 0,
+          raw: raw.slice(0, 400)
+        });
+      }
+
+      // Ensure fields exist and have sane defaults
+      if (!Array.isArray(result.squares)) result.squares = [];
+      if (!Array.isArray(result.empty_positions)) result.empty_positions = [];
+      if (!Array.isArray(result.board_polygon)) result.board_polygon = [];
+      if (typeof result.n_empty_squares !== "number") result.n_empty_squares = result.empty_positions.length || 0;
+      if (typeof result.confidence !== "number") result.confidence = 0.5;
+
+      return res.json(result);
+    } catch (err) {
+      console.error("/scan_chess error:", err);
+      res.status(500).json({ error: err.message || "vision failed" });
+    }
+  }
+);
+
+/* ===========================================================================  
    ✅ PI upload audio v2
 ===========================================================================*/
 app.post(
