@@ -1137,6 +1137,21 @@ app.post(
     { name: "frame", maxCount: 1 },
   ]),
   async (req, res) => {
+    const fallback = {
+      found: false,
+      rows: 0,
+      cols: 0,
+      cell_count: 0,
+      grid_bbox: null,
+      cells: [],
+      empty_count: 0,
+      player_count: 0,
+      robot_count: 0,
+      image_space: "normalized",
+      confidence: 0,
+      debug: null,
+    };
+
     try {
       const imageFile =
         req.file ||
@@ -1145,27 +1160,38 @@ app.post(
         req.files?.file?.[0] ||
         req.files?.frame?.[0];
 
-      if (!imageFile?.buffer) return res.status(400).json({ error: "No image" });
+      if (!imageFile?.buffer) {
+        return res.status(400).json({ ...fallback, debug: "No image buffer" });
+      }
+
+      // DEBUG: confirm multer nhận file
+      console.log("[scan_chess] got file:", {
+        field: imageFile.fieldname,
+        mime: imageFile.mimetype,
+        size: imageFile.size,
+      });
 
       const b64 = imageFile.buffer.toString("base64");
-      const dataUrl = `data:image/jpeg;base64,${b64}`;
+      const dataUrl = `data:${imageFile.mimetype || "image/jpeg"};base64,${b64}`;
 
       const system = `
-Ban la module thi giac may tinh cho nhiem vu quet ban co caro (tic-tac-toe) chup theo chieu ngang, ban co dang nam tren mat phang, thuong ban co caro la hinh chu nhat,  se  co 4 cot va 6 hang.
-Chi tra ve JSON hop le, KHONG giai thich, KHONG markdown.
-Toa do bbox o dang normalized [0..1] theo kich thuoc anh goc.
-Trang thai o:
-- "empty": o trong
-- "player_x": o co chu X small cua nguoi choi
-- "robot_line": o co net ve thang mau viet chi (robot)
-Neu khong tim thay ban co, tra ve found=false va cac truong con lai hop le.
+You are a computer vision module scanning a Caro board (grid) from a photo.
+Board is a rectangle on a flat surface.
+Expected grid: 4 cols x 6 rows.
+Return ONLY valid JSON (no markdown, no extra text).
+All bboxes are normalized [0..1] in original image space.
+Cell state:
+- "empty"
+- "player_x" (handwritten X)
+- "robot_line" (robot mark as line)
+If not found, set found=false and still return valid JSON with empty cells.
 `.trim();
 
       const user = [
         {
           type: "text",
           text: `
-Return JSON schema exactly:
+Return exactly:
 {
   "found": boolean,
   "rows": number,
@@ -1187,20 +1213,39 @@ Return JSON schema exactly:
       ];
 
       const model = process.env.VISION_MODEL || "gpt-4.1-mini";
+
       const completion = await openai.chat.completions.create({
         model,
-        messages: [{ role: "system", content: system }, { role: "user", content: user }],
-        temperature: 0.1,
-        max_tokens: 900,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        temperature: 0,
+        max_tokens: 1200,
+
+        // ✅ ép model trả JSON hợp lệ
+        response_format: { type: "json_object" },
       });
 
       const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+      console.log("[scan_chess] raw len:", raw.length);
+      console.log("[scan_chess] raw head:", raw.slice(0, 200));
+
       let result = null;
-      try { result = JSON.parse(raw); } catch {
-        const m = raw.match(/\{[\s\S]*\}/);
-        if (m) { try { result = JSON.parse(m[0]); } catch { } }
+      try {
+        result = JSON.parse(raw);
+      } catch (e) {
+        console.error("[scan_chess] JSON.parse failed:", e?.message || e);
+        return res.json({ ...fallback, debug: "JSON.parse failed", raw_head: raw.slice(0, 300) });
       }
 
+      // ---- sanitize ----
+      const clamp01 = (n) => Math.max(0, Math.min(1, Number(n)));
+      const sanitizeBbox = (b) => {
+        if (!Array.isArray(b) || b.length !== 4) return null;
+        const [x1, y1, x2, y2] = b.map(clamp01);
+        return [x1, y1, x2, y2];
+      };
       const normalizeState = (s) => {
         const v = String(s || "").toLowerCase().trim();
         if (v === "player_x" || v === "x") return "player_x";
@@ -1208,39 +1253,19 @@ Return JSON schema exactly:
         return "empty";
       };
 
-      const clamp01 = (n) => Math.max(0, Math.min(1, Number(n)));
-      const sanitizeBbox = (b) => {
-        if (!Array.isArray(b) || b.length !== 4) return null;
-        const [x1, y1, x2, y2] = b.map(clamp01);
-        return [x1, y1, x2, y2];
-      };
-
-      const fallback = {
-        found: false,
-        rows: 0,
-        cols: 0,
-        cell_count: 0,
-        grid_bbox: null,
-        cells: [],
-        empty_count: 0,
-        player_count: 0,
-        robot_count: 0,
-        image_space: "normalized",
-        confidence: 0,
-      };
-
-      if (!result || typeof result !== "object") return res.json(fallback);
-
       const found = !!result.found;
       const rows = Number.isFinite(result.rows) ? Math.max(0, Math.floor(result.rows)) : 0;
       const cols = Number.isFinite(result.cols) ? Math.max(0, Math.floor(result.cols)) : 0;
+
       const cellsRaw = Array.isArray(result.cells) ? result.cells : [];
-      const cells = cellsRaw.map((c) => ({
-        row: Number.isFinite(c?.row) ? Math.max(0, Math.floor(c.row)) : 0,
-        col: Number.isFinite(c?.col) ? Math.max(0, Math.floor(c.col)) : 0,
-        bbox: sanitizeBbox(c?.bbox),
-        state: normalizeState(c?.state),
-      }));
+      const cells = cellsRaw
+        .map((c) => ({
+          row: Number.isFinite(c?.row) ? Math.max(0, Math.floor(c.row)) : 0,
+          col: Number.isFinite(c?.col) ? Math.max(0, Math.floor(c.col)) : 0,
+          bbox: sanitizeBbox(c?.bbox),
+          state: normalizeState(c?.state),
+        }))
+        .filter((c) => c.bbox); // bỏ cell bbox null
 
       const counts = cells.reduce(
         (acc, c) => {
@@ -1270,28 +1295,25 @@ Return JSON schema exactly:
         player_count: Number.isFinite(result.player_count) ? Math.max(0, Math.floor(result.player_count)) : counts.player,
         robot_count: Number.isFinite(result.robot_count) ? Math.max(0, Math.floor(result.robot_count)) : counts.robot,
         image_space: "normalized",
-        confidence: Number.isFinite(result.confidence) ? clamp01(result.confidence) : 0.4,
+        confidence: Number.isFinite(result.confidence) ? clamp01(result.confidence) : 0.5,
       };
 
       if (!response.found) {
-        response.rows = 0;
-        response.cols = 0;
-        response.cell_count = 0;
-        response.grid_bbox = null;
-        response.cells = [];
-        response.empty_count = 0;
-        response.player_count = 0;
-        response.robot_count = 0;
-        response.confidence = Math.min(response.confidence, 0.3);
+        return res.json({
+          ...fallback,
+          confidence: Math.min(response.confidence, 0.3),
+          debug: "model_returned_found_false",
+        });
       }
 
       return res.json(response);
     } catch (err) {
       console.error("/scan_chess error:", err);
-      res.status(500).json({ error: err.message || "vision failed" });
+      return res.status(500).json({ ...fallback, debug: err?.message || "vision failed" });
     }
   }
 );
+
 
 /* ===========================================================================  
    ✅ PI upload audio v2
