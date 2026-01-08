@@ -1151,12 +1151,12 @@ app.post(
       const dataUrl = `data:image/jpeg;base64,${b64}`;
 
       const system = `
-Ban la module thi giac may tinh cho nhiem vu quet ban co caro (tic-tac-toe).
+Ban la module thi giac may tinh cho nhiem vu quet ban co caro (tic-tac-toe) chup theo chieu ngang, ban co dang nam tren mat phang, thuong ban co caro la hinh chu nhat,  se  co 4 cot va 6 hang.
 Chi tra ve JSON hop le, KHONG giai thich, KHONG markdown.
 Toa do bbox o dang normalized [0..1] theo kich thuoc anh goc.
 Trang thai o:
 - "empty": o trong
-- "player_x": o co chu X cua nguoi choi
+- "player_x": o co chu X small cua nguoi choi
 - "robot_line": o co net ve thang mau viet chi (robot)
 Neu khong tim thay ban co, tra ve found=false va cac truong con lai hop le.
 `.trim();
