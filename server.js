@@ -207,6 +207,8 @@ const MQTT_HOST = process.env.MQTT_HOST || "rfff7184.ala.us-east-1.emqxsl.com";
 const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
 const MQTT_USER = process.env.MQTT_USER || "robot_matthew";
 const MQTT_PASS = process.env.MQTT_PASS || "";
+const PIDOG_CHAT_REQUEST_TOPIC = process.env.PIDOG_CHAT_REQUEST_TOPIC || "/pidog/chat/request";
+const PIDOG_CHAT_STATUS_PREFIX = process.env.PIDOG_CHAT_STATUS_PREFIX || "/pidog/chat/status";
 
 const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
 const mqttClient = mqtt.connect(mqttUrl, {
@@ -226,6 +228,7 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("robot/audio_in");
   mqttClient.subscribe("robot/scanning180");
   mqttClient.subscribe("robot/label");
+  mqttClient.subscribe(PIDOG_CHAT_REQUEST_TOPIC);
 
   mqttClient.subscribe("/robot/gesture/stopmusic");
   mqttClient.subscribe("/robot/gesture/stop");
@@ -238,6 +241,13 @@ mqttClient.on("connect", () => {
 mqttClient.on("message", (topic, message) => {
   try {
     const msg = message.toString();
+
+    if (topic === PIDOG_CHAT_REQUEST_TOPIC) {
+      handlePidogChatRequest(msg).catch((err) => {
+        console.error("PIDOG chat request error:", err?.message || err);
+      });
+      return;
+    }
 
     if (topic === "robot/label") {
       console.log("==> Robot quyết định hướng:", msg);
@@ -292,6 +302,28 @@ function stripDiacritics(s = "") {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/đ/g, "d")
     .replace(/Đ/g, "D");
+}
+
+function escapeRegExp(s = "") {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanTranscriptText(text = "") {
+  let t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+
+  const fillers = [
+    "à", "ờ", "ừ", "ừm", "ờm", "ơ", "ê", "dạ", "vâng", "ạ",
+    "uh", "um", "erm", "hmm", "ah", "eh",
+  ];
+
+  const fillerPattern = new RegExp(`(^|\\s)(?:${fillers.map(escapeRegExp).join("|")})(?=\\s|$)`, "giu");
+  t = t.replace(fillerPattern, " ");
+
+  // remove repeated consecutive words: "tôi tôi" -> "tôi"
+  t = t.replace(/\b([\p{L}\p{N}]+)(\s+\1\b)+/giu, "$1");
+  t = t.replace(/\s+/g, " ").trim();
+  return t;
 }
 
 function getClientKey(req) {
@@ -424,6 +456,28 @@ function audioUrlToLocalPath(audio_url) {
   const u = new URL(audio_url);
   const filename = path.basename(u.pathname);
   return path.join(audioDir, filename);
+}
+
+function resolveLocalAudioPath(audio_url) {
+  const t = (audio_url || "").toString().trim();
+  if (!t) return null;
+
+  if (t.startsWith("/audio/")) {
+    const p = path.join(audioDir, path.basename(t));
+    return fs.existsSync(p) ? p : null;
+  }
+
+  if (t.startsWith("http://") || t.startsWith("https://")) {
+    try {
+      const u = new URL(t);
+      if (u.pathname.startsWith("/audio/")) {
+        const p = path.join(audioDir, path.basename(u.pathname));
+        return fs.existsSync(p) ? p : null;
+      }
+    } catch { }
+  }
+
+  return null;
 }
 
 async function concatMp3LocalToPublicUrl(mp3APath, mp3BPath, prefix = "music_final") {
@@ -590,6 +644,80 @@ app.get("/job", (req, res) => {
   const j = getJob(id);
   if (!j) return res.status(404).json({ ok: false, error: "Job not found/expired" });
   return res.json({ ok: true, job: j });
+});
+
+/* ===========================================================================  
+   ✅ PIDOG chat answer store (MQTT request -> HTTP fetch)
+===========================================================================*/
+const chatAnswers = new Map();
+const chatRequestsInFlight = new Set();
+const CHAT_ANSWER_TTL_MS = Number(process.env.CHAT_ANSWER_TTL_MS || 60 * 60 * 1000);
+
+function saveChatAnswer(id, { status = "processing", result = null, error = null } = {}) {
+  if (!id) return null;
+  const now = Date.now();
+  const prev = chatAnswers.get(id);
+  const audio_path = resolveLocalAudioPath(result?.audio_url);
+
+  const record = {
+    id,
+    status,
+    result,
+    error,
+    audio_path: audio_path || prev?.audio_path || null,
+    createdAt: prev?.createdAt || now,
+    updatedAt: now,
+  };
+  chatAnswers.set(id, record);
+  return record;
+}
+
+function getChatAnswer(id) {
+  if (!id) return null;
+  const rec = chatAnswers.get(id);
+  if (!rec) return null;
+  if (Date.now() - (rec.createdAt || 0) > CHAT_ANSWER_TTL_MS) {
+    chatAnswers.delete(id);
+    return null;
+  }
+  return rec;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, rec] of chatAnswers.entries()) {
+    if (!rec?.createdAt || now - rec.createdAt > CHAT_ANSWER_TTL_MS) chatAnswers.delete(id);
+  }
+}, 30 * 60 * 1000);
+
+app.get("/getmyaudioanswer", (req, res) => {
+  const id = (req.query.Id || req.query.id || "").toString().trim();
+  if (!id) return res.status(400).json({ status: "error", error: "Missing Id" });
+
+  const rec = getChatAnswer(id);
+  if (!rec) return res.status(404).json({ status: "error", error: "Answer not found/expired" });
+
+  if (rec.status !== "done") {
+    return res.status(202).json({ status: rec.status || "processing", id, error: rec.error || null });
+  }
+
+  if (rec.error) {
+    return res.status(500).json({ status: "error", id, error: rec.error });
+  }
+
+  const wantJson = String(req.query.format || "").toLowerCase() === "json" || String(req.query.meta || "") === "1";
+  if (wantJson) {
+    return res.json({ status: "ok", id, ...(rec.result || {}) });
+  }
+
+  const audioPath = rec.audio_path || resolveLocalAudioPath(rec.result?.audio_url);
+  if (!audioPath) {
+    return res.json({ status: "ok", id, ...(rec.result || {}), warning: "audio_file_missing" });
+  }
+
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "no-store");
+  return res.sendFile(audioPath);
 });
 
 /* ===========================================================================  
@@ -1015,6 +1143,311 @@ function isClapText(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const keys = ["clap", "applause", "hand clap", "clapping", "vo tay", "tieng vo tay"];
   return keys.some((k) => t.includes(stripDiacritics(k)));
+}
+
+/* ===========================================================================  
+   ✅ PIDOG chat (MQTT) helpers
+===========================================================================*/
+function parsePidogChatPayload(raw = "") {
+  const payload = (raw || "").toString().trim();
+  if (!payload) return { id: "", text: "" };
+
+  try {
+    const data = JSON.parse(payload);
+    if (typeof data === "string") return { id: "", text: data.trim() };
+    if (data && typeof data === "object") {
+      const id = (data.id || data.Id || data.ID || "").toString().trim();
+      const text = (data.text || data.transcript || data.message || data.msg || "").toString().trim();
+      return { id, text };
+    }
+  } catch { }
+
+  return { id: "", text: payload };
+}
+
+function publishPidogChatStatus(id, status = "done", extra = {}) {
+  if (!id) return;
+  const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
+  const payload = JSON.stringify({ id, status, ...extra });
+  mqttClient.publish(topic, payload, { qos: 0 });
+}
+
+async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true } = {}) {
+  if (isClapText(text)) {
+    return { status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null };
+  }
+
+  if (detectStopPlayback(text)) {
+    const replyText = "Dạ, em tắt nhạc nha.";
+    const audio_url = await textToSpeechMp3Pi(replyText, "stop");
+    return { status: "ok", transcript: text, label: "stop_playback", reply_text: replyText, audio_url };
+  }
+
+  let label = overrideLabelByText("unknown", text);
+  if (label !== "nhac" && shouldAutoSwitchToMusic(text)) label = "nhac";
+
+  // ===========================
+  // MUSIC
+  // ===========================
+  if (label === "nhac") {
+    const q = extractSongQuery(text) || text;
+    const top = await searchYouTubeTop1(q);
+
+    const durationStr = formatDuration(top?.seconds);
+    const isLong = typeof top?.seconds === "number" && top.seconds >= LONG_VIDEO_SECONDS;
+
+    console.log("🎵 MQTT YT_SEARCH_RESULT:", {
+      stt: text,
+      q,
+      found: !!top?.url,
+      title: top?.title,
+      url: top?.url,
+      seconds: top?.seconds,
+      duration: durationStr,
+      route: isLong ? "PODCAST_TRANSCRIPT" : "LOCAL_YTDLP",
+    });
+
+    if (!top?.url) {
+      const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
+      const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
+      return { status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url };
+    }
+
+    // ✅ LONG VIDEO => transcript -> GPT punctuation -> podcast chunks
+    if (isLong) {
+      const jobMeta = {
+        type: "yt_podcast",
+        user: userKey,
+        stt: text,
+        q,
+        yt: { title: top.title, url: top.url, seconds: top.seconds, duration: durationStr },
+        remote: REMOTE_YT_SERVER,
+      };
+
+      const processLongPodcast = async () => {
+        console.log("📥 MQTT LONG_YT -> FETCH TRANSCRIPT REMOTE:", {
+          remote: REMOTE_YT_SERVER,
+          url: top.url,
+          title: top.title,
+          seconds: top.seconds,
+          duration: durationStr,
+        });
+
+        // 1) remote transcript
+        let transcript = "";
+        try {
+          transcript = await fetchRemoteTranscriptText(top.url);
+        } catch (e) {
+          console.error("⚠️ Remote transcript fetch error:", e?.message || e);
+          transcript = "";
+        }
+
+        if (transcript) {
+          console.log("✅ Remote transcript length:", transcript.length);
+        } else {
+          console.log("⚠️ Remote transcript empty -> fallback local captions (yt-dlp vtt)");
+          transcript = await getYoutubeTranscriptTextLocalFallback(top.url);
+        }
+
+        if (!transcript) {
+          throw new Error("No transcript available (remote + local captions both empty)");
+        }
+
+        // 2) punctuation by GPT
+        console.log("✍️ Punctuating transcript by GPT...");
+        const punctuated = await punctuateTranscriptWithGpt(transcript, "vi");
+        const finalText = punctuated || transcript;
+
+        // 3) create podcast session
+        const podcast_id = createPodcastSession({
+          title: top.title,
+          url: top.url,
+          transcriptText: finalText,
+        });
+
+        const s = getPodcastSession(podcast_id);
+        const total = s?.chunks?.length || 0;
+
+        console.log("✅ PODCAST READY:", { podcast_id, total });
+
+        // 4) generate first audio chunk
+        const introText = `Video này hơi dài. Em sẽ đọc theo từng đoạn. Đây là "${top.title}".`;
+        const firstChunk = s.chunks[0] || "";
+        const firstText = `${introText}\n\n${firstChunk}`.trim();
+
+        const audio_url = await textToSpeechMp3Long(firstText, `pod_first_${podcast_id}`);
+
+        // publish MQTT first chunk (robot sẽ play)
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({
+            label: "nhac",
+            text: introText,
+            audio_url,
+            user: userKey,
+            podcast: { podcast_id, index: 0, total },
+            yt: { title: top.title, url: top.url, seconds: top.seconds, duration: durationStr, route: "podcast_transcript" },
+          }),
+          { qos: 1 }
+        );
+
+        return {
+          status: "ok",
+          transcript: text,
+          label: "nhac",
+          reply_text: introText,
+          audio_url,
+          play: null,
+          used_vision: false,
+          podcast: { podcast_id, index: 0, total },
+        };
+      };
+
+      if (!wantWait) {
+        const job_id = createJob(jobMeta);
+        console.log("🧵 MQTT JOB_CREATED:", { job_id, ...jobMeta });
+        runJob(job_id, processLongPodcast).catch((e) => console.error("❌ Job failed:", job_id, e?.message || e));
+
+        return {
+          status: "processing",
+          job_id,
+          transcript: text,
+          label: "nhac",
+          title: top.title,
+          url: top.url,
+          seconds: top.seconds,
+          duration: durationStr,
+          route: "PODCAST_TRANSCRIPT",
+          remote: REMOTE_YT_SERVER,
+        };
+      }
+
+      const job_id = createJob({ ...jobMeta, note: "sync_wait=1" });
+      try {
+        const result = await runJob(job_id, processLongPodcast);
+        return { ...result, job_id };
+      } catch (e) {
+        console.error("❌ Podcast long error:", e?.message || e);
+        const replyText = `Em bị lỗi khi lấy transcript cho video dài "${top.title}". Anh thử bài khác giúp em nha.`;
+        const audio_url = await textToSpeechMp3Pi(replyText, "yt_podcast_fail");
+        return { status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url, job_id };
+      }
+    }
+
+    // ✅ SHORT VIDEO => tải mp3 local + ghép intro
+    const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
+    const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
+    const songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+    const introLocalPath = audioUrlToLocalPath(intro_url);
+    const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
+
+    safeUnlink(introLocalPath);
+    safeUnlink(songMp3Path);
+
+    mqttClient.publish(
+      "robot/music",
+      JSON.stringify({
+        label: "nhac",
+        text: introText,
+        audio_url: final_audio_url,
+        user: userKey,
+        yt: { title: top.title, url: top.url, seconds: top.seconds, duration: durationStr, route: "local" },
+      }),
+      { qos: 1 }
+    );
+
+    return {
+      status: "ok",
+      transcript: text,
+      label: "nhac",
+      reply_text: introText,
+      audio_url: final_audio_url,
+      play: null,
+      used_vision: false,
+    };
+  }
+
+  // ===========================
+  // MOVEMENT labels -> MQTT
+  // ===========================
+  if (["tien", "lui", "trai", "phai"].includes(label)) {
+    mqttClient.publish("robot/label", JSON.stringify({ label }), { qos: 1, retain: true });
+    return { status: "ok", transcript: text, label, reply_text: "", audio_url: null };
+  }
+
+  // ===========================
+  // GPT (chat / question) — TEXT ONLY
+  // ===========================
+  const memoryText = (memoryArr || [])
+    .slice(-12)
+    .map((m, i) => {
+      const u = (m.transcript || "").trim();
+      const a = (m.reply_text || "").trim();
+      return `#${i + 1} USER: ${u}\n#${i + 1} BOT: ${a}`;
+    })
+    .join("\n\n");
+
+  const system = `
+Bạn là dog robot của Matthew. Trả lời ngắn gọn, dễ hiểu, thân thiện.
+Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của người dùng.
+`.trim();
+
+  const messages = [{ role: "system", content: system }];
+  if (memoryText) messages.push({ role: "system", content: `Robot recent memory:\n${memoryText}`.slice(0, 6000) });
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [...messages, { role: "user", content: text }],
+    temperature: 0.25,
+    max_tokens: 260,
+  });
+
+  const replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+  const audio_url = await textToSpeechMp3Pi(replyText, "pi_v2");
+
+  mqttClient.publish("robot/music", JSON.stringify({ audio_url, text: replyText, label, user: userKey }), { qos: 1 });
+
+  return { status: "ok", transcript: text, label, reply_text: replyText, audio_url, play: null, used_vision: false };
+}
+
+async function handlePidogChatRequest(rawPayload) {
+  const { id, text } = parsePidogChatPayload(rawPayload);
+  if (!id) {
+    console.warn("PIDOG chat request missing id");
+    return;
+  }
+
+  const existing = getChatAnswer(id);
+  if (existing?.status === "done") {
+    publishPidogChatStatus(id, "done", { ok: !existing.error });
+    return;
+  }
+
+  if (chatRequestsInFlight.has(id)) return;
+  chatRequestsInFlight.add(id);
+  saveChatAnswer(id, { status: "processing" });
+
+  try {
+    const cleaned = cleanTranscriptText(text);
+    const finalText = cleaned || text || "";
+    if (!finalText) {
+      const errMsg = "empty_text";
+      saveChatAnswer(id, { status: "error", error: errMsg });
+      publishPidogChatStatus(id, "done", { ok: false, error: errMsg });
+      return;
+    }
+
+    const userKey = `mqtt_${id.slice(0, 8)}`;
+    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true });
+    saveChatAnswer(id, { status: "done", result, error: null });
+    publishPidogChatStatus(id, "done", { ok: true });
+  } catch (e) {
+    const errMsg = e?.message || String(e);
+    saveChatAnswer(id, { status: "error", error: errMsg });
+    publishPidogChatStatus(id, "done", { ok: false, error: errMsg });
+  } finally {
+    chatRequestsInFlight.delete(id);
+  }
 }
 
 /* ===========================================================================  
