@@ -710,13 +710,15 @@ app.get("/getmyaudioanswer", (req, res) => {
   const wantJson = String(req.query.format || "").toLowerCase() === "json" || String(req.query.meta || "") === "1";
   if (wantJson) {
     clearPidogChatStatus(id);
-    return res.json({ status: "ok", id, ...(rec.result || {}) });
+    return res.json(normalizePidogResponse({ id, status: "done", ok: true, result: rec.result }));
   }
 
   const audioPath = rec.audio_path || resolveLocalAudioPath(rec.result?.audio_url);
   if (!audioPath) {
     clearPidogChatStatus(id);
-    return res.json({ status: "ok", id, ...(rec.result || {}), warning: "audio_file_missing" });
+    const payload = normalizePidogResponse({ id, status: "done", ok: true, result: rec.result });
+    payload.warning = "audio_file_missing";
+    return res.json(payload);
   }
 
   res.setHeader("Content-Type", "audio/mpeg");
@@ -762,12 +764,14 @@ app.all("/pidog/chat/request", async (req, res) => {
       (req.headers["accept"] || "").includes("audio/mpeg");
 
     if (wantJson && !wantMp3) {
-      return res.json({ ok: true, status: "done", id, ...(result || {}) });
+      return res.json(normalizePidogResponse({ id, status: "done", ok: true, result }));
     }
 
     const audioPath = resolveLocalAudioPath(result?.audio_url);
     if (!audioPath) {
-      return res.json({ ok: true, status: "done", id, ...(result || {}), warning: "audio_file_missing" });
+      const payload = normalizePidogResponse({ id, status: "done", ok: true, result });
+      payload.warning = "audio_file_missing";
+      return res.json(payload);
     }
 
     res.setHeader("Content-Type", "audio/mpeg");
@@ -780,7 +784,7 @@ app.all("/pidog/chat/request", async (req, res) => {
     saveChatAnswer(id, { status: "error", error: errMsg });
     publishPidogChatStatus(id, "done", { ok: false, error: errMsg });
     logPidogStage(id, "error", { error: errMsg });
-    return res.status(500).json({ ok: false, status: "error", id, error: errMsg });
+    return res.status(500).json(normalizePidogResponse({ id, status: "error", ok: false, error: errMsg }));
   }
 });
 
@@ -793,14 +797,20 @@ app.all("/pidog/chat/status", (req, res) => {
   if (!rec) return res.status(404).json({ ok: false, error: "Answer not found/expired" });
 
   if (rec.status !== "done") {
-    return res.status(202).json({ ok: true, status: rec.status || "processing", id, error: rec.error || null });
+    return res.status(202).json(normalizePidogResponse({
+      id,
+      status: rec.status || "processing",
+      ok: true,
+      result: rec.result,
+      error: rec.error || null,
+    }));
   }
 
   if (rec.error) {
-    return res.status(500).json({ ok: false, status: "error", id, error: rec.error });
+    return res.status(500).json(normalizePidogResponse({ id, status: "error", ok: false, error: rec.error }));
   }
 
-  return res.json({ ok: true, status: "done", id, ...(rec.result || {}) });
+  return res.json(normalizePidogResponse({ id, status: "done", ok: true, result: rec.result }));
 });
 
 /* ===========================================================================  
@@ -1300,6 +1310,19 @@ function clearPidogChatStatus(id) {
 function logPidogStage(requestId, stage, extra = {}) {
   if (!requestId) return;
   console.log("🐾 PIDOG_STAGE:", { id: requestId, stage, ...extra });
+}
+
+function normalizePidogResponse({ id, status = "done", ok = true, result = null, error = null } = {}) {
+  return {
+    ok: !!ok,
+    status,
+    id: id || "",
+    text: result?.transcript || "",
+    label: result?.label || "",
+    reply_text: result?.reply_text || "",
+    audio_url: result?.audio_url || null,
+    error: error || null,
+  };
 }
 
 async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true, requestId = "" } = {}) {
