@@ -739,12 +739,7 @@ app.all("/pidog/chat/request", async (req, res) => {
     ""
   ).toString().trim();
 
-  console.log("🌐 PIDOG_CHAT_HTTP_REQUEST:", {
-    method: req.method,
-    id,
-    text_preview: text.slice(0, 200),
-    ip: req.ip,
-  });
+  logPidogStage(id, "received", { text_preview: text.slice(0, 200) });
 
   if (!text) return res.status(400).json({ ok: false, error: "Missing text" });
 
@@ -757,9 +752,10 @@ app.all("/pidog/chat/request", async (req, res) => {
     publishPidogChatStatus(id, "processing", { ok: true });
 
     const userKey = `http_${id.slice(0, 8)}`;
-    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true });
+    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true, requestId: id });
     saveChatAnswer(id, { status: "done", result, error: null });
     publishPidogChatStatus(id, "done", { ok: true });
+    logPidogStage(id, "done", { label: result?.label || "unknown", has_audio: !!result?.audio_url });
 
     const wantJson = String(req.query.format || "").toLowerCase() === "json" || String(req.query.meta || "") === "1";
     const wantMp3 = String(req.query.format || "").toLowerCase() === "mp3" ||
@@ -783,6 +779,7 @@ app.all("/pidog/chat/request", async (req, res) => {
     const errMsg = err?.message || String(err);
     saveChatAnswer(id, { status: "error", error: errMsg });
     publishPidogChatStatus(id, "done", { ok: false, error: errMsg });
+    logPidogStage(id, "error", { error: errMsg });
     return res.status(500).json({ ok: false, status: "error", id, error: errMsg });
   }
 });
@@ -790,12 +787,6 @@ app.all("/pidog/chat/request", async (req, res) => {
 // Debug/compat: HTTP status check for pidog chat by id
 app.all("/pidog/chat/status", (req, res) => {
   const id = (req.query.Id || req.query.id || req.body?.id || "").toString().trim();
-  console.log("🌐 PIDOG_STATUS_HTTP:", {
-    method: req.method,
-    id: id || null,
-    ip: req.ip,
-  });
-
   if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
 
   const rec = getChatAnswer(id);
@@ -1306,8 +1297,13 @@ function clearPidogChatStatus(id) {
   console.log("🧹 PIDOG_STATUS_CLEAR_HTTP_ONLY:", { id });
 }
 
-async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true } = {}) {
-  console.log("🐶 PIDOG_CHAT_TEXT:", { userKey, wantWait, text_preview: String(text).slice(0, 160) });
+function logPidogStage(requestId, stage, extra = {}) {
+  if (!requestId) return;
+  console.log("🐾 PIDOG_STAGE:", { id: requestId, stage, ...extra });
+}
+
+async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true, requestId = "" } = {}) {
+  logPidogStage(requestId, "start", { userKey, text_preview: String(text).slice(0, 160) });
   if (isClapText(text)) {
     return { status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null };
   }
@@ -1325,7 +1321,9 @@ async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = []
   // MUSIC
   // ===========================
   if (label === "nhac") {
+    logPidogStage(requestId, "music_intent");
     const q = extractSongQuery(text) || text;
+    logPidogStage(requestId, "yt_search", { q_preview: String(q).slice(0, 120) });
     const top = await searchYouTubeTop1(q);
 
     const durationStr = formatDuration(top?.seconds);
@@ -1530,6 +1528,7 @@ Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của ngư
   const messages = [{ role: "system", content: system }];
   if (memoryText) messages.push({ role: "system", content: `Robot recent memory:\n${memoryText}`.slice(0, 6000) });
 
+  logPidogStage(requestId, "gpt_reply");
   const completion = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
     messages: [...messages, { role: "user", content: text }],
@@ -1538,6 +1537,7 @@ Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của ngư
   });
 
   const replyText = completion.choices?.[0]?.message?.content?.trim() || "Em chưa hiểu câu này.";
+  logPidogStage(requestId, "tts_start");
   const audio_url = await textToSpeechMp3Pi(replyText, "pi_v2");
 
   mqttClient.publish("robot/music", JSON.stringify({ audio_url, text: replyText, label, user: userKey }), { qos: 1 });
@@ -1577,7 +1577,7 @@ async function handlePidogChatRequest(rawPayload) {
     }
 
     const userKey = `mqtt_${id.slice(0, 8)}`;
-    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true });
+    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true, requestId: id });
     saveChatAnswer(id, { status: "done", result, error: null });
     publishPidogChatStatus(id, "done", { ok: true });
   } catch (e) {
