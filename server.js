@@ -16,6 +16,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import dns from "dns";
+import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import mqtt from "mqtt";
 import dotenv from "dotenv";
@@ -730,6 +731,37 @@ app.get("/getmyaudioanswer", (req, res) => {
   return res.sendFile(audioPath);
 });
 
+// HTTP -> MQTT request bridge for pidog chat
+app.all("/pidog/chat/request", (req, res) => {
+  const id = (req.query.Id || req.query.id || req.body?.id || "").toString().trim() || makePidogRequestId();
+  const text = (
+    req.body?.text ||
+    req.body?.transcript ||
+    req.body?.message ||
+    req.body?.msg ||
+    req.query.text ||
+    req.query.transcript ||
+    req.query.message ||
+    ""
+  ).toString().trim();
+
+  console.log("🌐 PIDOG_CHAT_HTTP_REQUEST:", {
+    method: req.method,
+    id,
+    text_preview: text.slice(0, 200),
+    ip: req.ip,
+  });
+
+  if (!text) return res.status(400).json({ ok: false, error: "Missing text" });
+
+  const rawPayload = JSON.stringify({ id, text });
+  handlePidogChatRequest(rawPayload).catch((err) => {
+    console.error("PIDOG chat request error (HTTP):", err?.message || err);
+  });
+
+  return res.json({ ok: true, id });
+});
+
 // Debug/compat: HTTP status check for pidog chat by id
 app.all("/pidog/chat/status", (req, res) => {
   const id = (req.query.Id || req.query.id || req.body?.id || "").toString().trim();
@@ -1200,6 +1232,14 @@ function parsePidogChatPayload(raw = "") {
   return { id: "", text: payload };
 }
 
+function makePidogRequestId() {
+  try {
+    return randomUUID().replace(/-/g, "");
+  } catch {
+    return `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`;
+  }
+}
+
 function publishPidogChatStatus(id, status = "done", extra = {}) {
   if (!id) return;
   const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
@@ -1473,6 +1513,7 @@ async function handlePidogChatRequest(rawPayload) {
   if (chatRequestsInFlight.has(id)) return;
   chatRequestsInFlight.add(id);
   saveChatAnswer(id, { status: "processing" });
+  publishPidogChatStatus(id, "processing", { ok: true });
 
   try {
     const cleaned = cleanTranscriptText(text);
