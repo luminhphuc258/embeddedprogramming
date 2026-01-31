@@ -236,11 +236,18 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("robot/gesture/sit");
   mqttClient.subscribe("robot/gesture/moveleft");
   mqttClient.subscribe("robot/moveright");
+  // debug: log any status traffic coming from client/broker
+  mqttClient.subscribe(`${PIDOG_CHAT_STATUS_PREFIX}/#`);
 });
 
 mqttClient.on("message", (topic, message) => {
   try {
     const msg = message.toString();
+
+    if (topic.startsWith(`${PIDOG_CHAT_STATUS_PREFIX}/`)) {
+      console.log("📥 PIDOG_STATUS_TOPIC:", { topic, payload: msg.slice(0, 300) });
+      return;
+    }
 
     if (topic === PIDOG_CHAT_REQUEST_TOPIC) {
       handlePidogChatRequest(msg).catch((err) => {
@@ -707,17 +714,45 @@ app.get("/getmyaudioanswer", (req, res) => {
 
   const wantJson = String(req.query.format || "").toLowerCase() === "json" || String(req.query.meta || "") === "1";
   if (wantJson) {
+    clearPidogChatStatus(id);
     return res.json({ status: "ok", id, ...(rec.result || {}) });
   }
 
   const audioPath = rec.audio_path || resolveLocalAudioPath(rec.result?.audio_url);
   if (!audioPath) {
+    clearPidogChatStatus(id);
     return res.json({ status: "ok", id, ...(rec.result || {}), warning: "audio_file_missing" });
   }
 
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Cache-Control", "no-store");
+  clearPidogChatStatus(id);
   return res.sendFile(audioPath);
+});
+
+// Debug/compat: HTTP status check for pidog chat by id
+app.all("/pidog/chat/status", (req, res) => {
+  const id = (req.query.Id || req.query.id || req.body?.id || "").toString().trim();
+  console.log("🌐 PIDOG_STATUS_HTTP:", {
+    method: req.method,
+    id: id || null,
+    ip: req.ip,
+  });
+
+  if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
+
+  const rec = getChatAnswer(id);
+  if (!rec) return res.status(404).json({ ok: false, error: "Answer not found/expired" });
+
+  if (rec.status !== "done") {
+    return res.status(202).json({ ok: true, status: rec.status || "processing", id, error: rec.error || null });
+  }
+
+  if (rec.error) {
+    return res.status(500).json({ ok: false, status: "error", id, error: rec.error });
+  }
+
+  return res.json({ ok: true, status: "done", id, ...(rec.result || {}) });
 });
 
 /* ===========================================================================  
@@ -1169,10 +1204,19 @@ function publishPidogChatStatus(id, status = "done", extra = {}) {
   if (!id) return;
   const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
   const payload = JSON.stringify({ id, status, ...extra });
-  mqttClient.publish(topic, payload, { qos: 0 });
+  console.log("📤 PIDOG_STATUS_PUBLISH:", { topic, payload });
+  mqttClient.publish(topic, payload, { qos: 1, retain: true });
+}
+
+function clearPidogChatStatus(id) {
+  if (!id) return;
+  const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
+  console.log("🧹 PIDOG_STATUS_CLEAR:", { topic });
+  mqttClient.publish(topic, "", { qos: 1, retain: true });
 }
 
 async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true } = {}) {
+  console.log("🐶 PIDOG_CHAT_TEXT:", { userKey, wantWait, text_preview: String(text).slice(0, 160) });
   if (isClapText(text)) {
     return { status: "ok", transcript: text, label: "clap", reply_text: "", audio_url: null };
   }
@@ -1411,11 +1455,14 @@ Tạm thời KHÔNG mô tả ảnh. Trả lời dựa trên câu nói của ngư
 }
 
 async function handlePidogChatRequest(rawPayload) {
+  console.log("📥 PIDOG_CHAT_REQUEST_RAW:", String(rawPayload || "").slice(0, 220));
   const { id, text } = parsePidogChatPayload(rawPayload);
   if (!id) {
     console.warn("PIDOG chat request missing id");
     return;
   }
+
+  console.log("🧾 PIDOG_CHAT_REQUEST_PARSED:", { id, text_preview: String(text || "").slice(0, 160) });
 
   const existing = getChatAnswer(id);
   if (existing?.status === "done") {
