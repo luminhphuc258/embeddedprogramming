@@ -127,6 +127,7 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
    yt-dlp (binary)
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 25000);
 
 // player clients retry list
 const YT_PLAYER_CLIENTS = (process.env.YT_PLAYER_CLIENTS || "web,ios,android")
@@ -876,7 +877,7 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
 
     try {
       console.log("▶️ yt-dlp download (client):", client, url);
-      await run(YTDLP_BIN, args, { timeoutMs: 240000 });
+      await run(YTDLP_BIN, args, { timeoutMs: YTDLP_TIMEOUT_MS });
 
       const files = fs.readdirSync(outDir).filter((f) => f.startsWith(`yt_${ts}.`));
       const mp3 = files.find((f) => f.endsWith(".mp3"));
@@ -894,6 +895,49 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
   }
 
   throw lastErr || new Error("yt-dlp failed (all clients)");
+}
+
+async function downloadFromItunes(query, outDir) {
+  if (!query) throw new Error("Missing query");
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const searchUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=1`;
+  const searchResp = await fetch(searchUrl, { method: "GET" });
+  if (!searchResp.ok) throw new Error("iTunes search failed");
+  const data = await searchResp.json();
+  if (!data.results || data.results.length === 0) throw new Error("No song found on iTunes");
+
+  const song = data.results[0];
+  const previewUrl = song.previewUrl;
+  if (!previewUrl) throw new Error("No preview URL");
+
+  const ts = Date.now();
+  const tmpM4a = path.join(outDir, `itunes_${ts}.m4a`);
+  const outMp3 = path.join(outDir, `itunes_${ts}.mp3`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch(previewUrl, { method: "GET", signal: controller.signal });
+    if (!r.ok) throw new Error("iTunes preview download failed");
+    const buf = Buffer.from(await r.arrayBuffer());
+    fs.writeFileSync(tmpM4a, buf);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  await new Promise((resolve, reject) =>
+    ffmpeg(tmpM4a)
+      .audioCodec("libmp3lame")
+      .audioBitrate(128)
+      .toFormat("mp3")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(outMp3)
+  );
+
+  safeUnlink(tmpM4a);
+  return outMp3;
 }
 
 /* ===========================================================================  
@@ -1493,7 +1537,24 @@ async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = []
     // ✅ SHORT VIDEO => tải mp3 local + ghép intro
     const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
     const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
-    const songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+    let songMp3Path;
+    try {
+      songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+    } catch (e) {
+      logPidogStage(requestId, "yt_download_failed", { error: (e?.message || String(e)).slice(0, 180) });
+      console.error("YouTube download failed, trying iTunes fallback:", e?.message || e);
+      try {
+        logPidogStage(requestId, "itunes_fallback");
+        songMp3Path = await downloadFromItunes(q, audioDir);
+        console.log("✅ Fallback to iTunes successful");
+      } catch (e2) {
+        logPidogStage(requestId, "itunes_failed", { error: (e2?.message || String(e2)).slice(0, 180) });
+        console.error("iTunes fallback failed:", e2?.message || e2);
+        const replyText = "Em không tải được bài hát từ YouTube và iTunes. Anh thử bài khác giúp em nha.";
+        const audio_url = await textToSpeechMp3Pi(replyText, "download_fail");
+        return { status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url };
+      }
+    }
     const introLocalPath = audioUrlToLocalPath(intro_url);
     const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
 
@@ -2238,7 +2299,22 @@ app.post(
         // ✅ SHORT VIDEO => tải mp3 local như cũ + ghép intro
         const introText = `Ây da, mình tìm được bài hát "${top.title}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
         const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
-        const songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+        let songMp3Path;
+        try {
+          songMp3Path = await ytdlpExtractMp3FromYoutube(top.url, audioDir);
+        } catch (e) {
+          console.error("⚠️ yt-dlp failed, fallback to iTunes");
+          console.error("YouTube download failed, trying iTunes fallback:", e?.message || e);
+          try {
+            songMp3Path = await downloadFromItunes(q, audioDir);
+            console.log("✅ Fallback to iTunes successful");
+          } catch (e2) {
+            console.error("iTunes fallback failed:", e2?.message || e2);
+            const replyText = "Em không tải được bài hát từ YouTube và iTunes. Anh thử bài khác giúp em nha.";
+            const audio_url = await textToSpeechMp3Pi(replyText, "download_fail");
+            return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url });
+          }
+        }
         const introLocalPath = audioUrlToLocalPath(intro_url);
         const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
 
