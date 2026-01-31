@@ -1408,9 +1408,38 @@ async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = []
     });
 
     if (!top?.url) {
-      const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
-      const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
-      return { status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url };
+      logPidogStage(requestId, "yt_not_found");
+      try {
+        logPidogStage(requestId, "itunes_fallback");
+        const introText = `Ây da, mình tìm được bài hát "${q}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
+        const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
+        const songMp3Path = await downloadFromItunes(q, audioDir);
+
+        const introLocalPath = audioUrlToLocalPath(intro_url);
+        const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
+
+        safeUnlink(introLocalPath);
+        safeUnlink(songMp3Path);
+
+        mqttClient.publish(
+          "robot/music",
+          JSON.stringify({
+            label: "nhac",
+            text: introText,
+            audio_url: final_audio_url,
+            user: userKey,
+            source: "itunes",
+          }),
+          { qos: 1 }
+        );
+
+        return { status: "ok", transcript: text, label: "nhac", reply_text: introText, audio_url: final_audio_url };
+      } catch (e2) {
+        logPidogStage(requestId, "itunes_failed", { error: (e2?.message || String(e2)).slice(0, 180) });
+        const replyText = "Em không tìm thấy bài trên YouTube và iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
+        const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
+        return { status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url };
+      }
     }
 
     // ✅ LONG VIDEO => transcript -> GPT punctuation -> podcast chunks
@@ -2168,9 +2197,23 @@ app.post(
         }, `(${ms()}ms)`);
 
         if (!top?.url) {
-          const replyText = "Em không tìm thấy bài trên YouTube. Anh nói lại tên bài + ca sĩ giúp em nha.";
-          const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
-          return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url });
+          try {
+            const introText = `Ây da, mình tìm được bài hát "${q}" rồi, mình sẽ cho bạn nghe đây, nghe vui nha.`;
+            const intro_url = await textToSpeechMp3Pi(introText, "music_intro");
+            const songMp3Path = await downloadFromItunes(q, audioDir);
+
+            const introLocalPath = audioUrlToLocalPath(intro_url);
+            const final_audio_url = await concatMp3LocalToPublicUrl(introLocalPath, songMp3Path, "music_final");
+
+            safeUnlink(introLocalPath);
+            safeUnlink(songMp3Path);
+
+            return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: introText, audio_url: final_audio_url, source: "itunes" });
+          } catch (e2) {
+            const replyText = "Em không tìm thấy bài trên YouTube và iTunes. Anh nói lại tên bài + ca sĩ giúp em nha.";
+            const audio_url = await textToSpeechMp3Pi(replyText, "yt_fail");
+            return res.json({ status: "ok", transcript: text, label: "nhac", reply_text: replyText, audio_url });
+          }
         }
 
         // ✅ LONG VIDEO => transcript -> GPT punctuation -> podcast chunks
