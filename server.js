@@ -726,7 +726,7 @@ app.get("/getmyaudioanswer", (req, res) => {
 });
 
 // HTTP -> MQTT request bridge for pidog chat
-app.all("/pidog/chat/request", (req, res) => {
+app.all("/pidog/chat/request", async (req, res) => {
   const id = (req.query.Id || req.query.id || req.body?.id || "").toString().trim() || makePidogRequestId();
   const text = (
     req.body?.text ||
@@ -748,12 +748,43 @@ app.all("/pidog/chat/request", (req, res) => {
 
   if (!text) return res.status(400).json({ ok: false, error: "Missing text" });
 
-  const rawPayload = JSON.stringify({ id, text });
-  handlePidogChatRequest(rawPayload).catch((err) => {
-    console.error("PIDOG chat request error (HTTP):", err?.message || err);
-  });
+  try {
+    const cleaned = cleanTranscriptText(text);
+    const finalText = cleaned || text || "";
+    if (!finalText) return res.status(400).json({ ok: false, error: "empty_text" });
 
-  return res.json({ ok: true, id });
+    saveChatAnswer(id, { status: "processing" });
+    publishPidogChatStatus(id, "processing", { ok: true });
+
+    const userKey = `http_${id.slice(0, 8)}`;
+    const result = await handlePidogChatText({ text: finalText, userKey, memoryArr: [], wantWait: true });
+    saveChatAnswer(id, { status: "done", result, error: null });
+    publishPidogChatStatus(id, "done", { ok: true });
+
+    const wantJson = String(req.query.format || "").toLowerCase() === "json" || String(req.query.meta || "") === "1";
+    const wantMp3 = String(req.query.format || "").toLowerCase() === "mp3" ||
+      (req.headers["accept"] || "").includes("audio/mpeg");
+
+    if (wantJson && !wantMp3) {
+      return res.json({ ok: true, status: "done", id, ...(result || {}) });
+    }
+
+    const audioPath = resolveLocalAudioPath(result?.audio_url);
+    if (!audioPath) {
+      return res.json({ ok: true, status: "done", id, ...(result || {}), warning: "audio_file_missing" });
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Pidog-Status", "done");
+    res.setHeader("X-Pidog-Id", id);
+    return res.sendFile(audioPath);
+  } catch (err) {
+    const errMsg = err?.message || String(err);
+    saveChatAnswer(id, { status: "error", error: errMsg });
+    publishPidogChatStatus(id, "done", { ok: false, error: errMsg });
+    return res.status(500).json({ ok: false, status: "error", id, error: errMsg });
+  }
 });
 
 // Debug/compat: HTTP status check for pidog chat by id
