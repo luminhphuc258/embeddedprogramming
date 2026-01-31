@@ -237,18 +237,12 @@ mqttClient.on("connect", () => {
   mqttClient.subscribe("robot/gesture/sit");
   mqttClient.subscribe("robot/gesture/moveleft");
   mqttClient.subscribe("robot/moveright");
-  // debug: log any status traffic coming from client/broker
-  mqttClient.subscribe(`${PIDOG_CHAT_STATUS_PREFIX}/#`);
+  // status updates now handled via HTTP only (no MQTT publish)
 });
 
 mqttClient.on("message", (topic, message) => {
   try {
     const msg = message.toString();
-
-    if (topic.startsWith(`${PIDOG_CHAT_STATUS_PREFIX}/`)) {
-      console.log("📥 PIDOG_STATUS_TOPIC:", { topic, payload: msg.slice(0, 300) });
-      return;
-    }
 
     if (topic === PIDOG_CHAT_REQUEST_TOPIC) {
       handlePidogChatRequest(msg).catch((err) => {
@@ -1273,17 +1267,12 @@ function makePidogRequestId() {
 
 function publishPidogChatStatus(id, status = "done", extra = {}) {
   if (!id) return;
-  const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
-  const payload = JSON.stringify({ id, status, ...extra });
-  console.log("📤 PIDOG_STATUS_PUBLISH:", { topic, payload });
-  mqttClient.publish(topic, payload, { qos: 1, retain: true });
+  console.log("🧾 PIDOG_STATUS_UPDATE_HTTP_ONLY:", { id, status, ...extra });
 }
 
 function clearPidogChatStatus(id) {
   if (!id) return;
-  const topic = `${PIDOG_CHAT_STATUS_PREFIX}/${id}`;
-  console.log("🧹 PIDOG_STATUS_CLEAR:", { topic });
-  mqttClient.publish(topic, "", { qos: 1, retain: true });
+  console.log("🧹 PIDOG_STATUS_CLEAR_HTTP_ONLY:", { id });
 }
 
 async function handlePidogChatText({ text = "", userKey = "mqtt", memoryArr = [], wantWait = true } = {}) {
