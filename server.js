@@ -1101,9 +1101,21 @@ function looksLikeSongTitleOnly(userText = "") {
 function containsMusicIntent(text = "") {
   const t = stripDiacritics(text.toLowerCase());
   const keys = [
-    "nghe", "nghe nhac", "phat", "phat nhac", "mo", "mo nhac", "mo bai", "bat nhac",
-    "bai hat", "cho toi nghe", "mở", "bật", "phát",
-    "listen", "play song", "play music"
+    "toi muon nghe",
+    "cho toi nghe",
+    "cho toi nghe nhac",
+    "cho toi nghe bai",
+    "cho nghe nhac",
+    "nghe bai",
+    "nghe bai hat",
+    "nghe nhac",
+    "mo nhac",
+    "bat nhac",
+    "phat nhac",
+    "phat bai",
+    "choi bai",
+    "play song",
+    "play music",
   ];
   return keys.some((k) => t.includes(stripDiacritics(k)));
 }
@@ -1130,7 +1142,7 @@ function looksLikeMusicQuery(text = "") {
 }
 
 function shouldAutoSwitchToMusic(text = "") {
-  return containsMusicIntent(text) || looksLikeSongTitleOnly(text) || looksLikeMusicQuery(text);
+  return containsMusicIntent(text);
 }
 
 function detectStopPlayback(text = "") {
@@ -1190,7 +1202,26 @@ function overrideLabelByText(label, text) {
   if (question.some((k) => t.includes(k))) return "question";
 
   const rules = [
-    { keys: ["nhac", "music", "play", "nghe bai hat", "nghe", "phat nhac", "cho toi nghe", "bat nhac", "mo nhac"], out: "nhac" },
+    {
+      keys: [
+        "toi muon nghe",
+        "cho toi nghe",
+        "cho toi nghe nhac",
+        "cho toi nghe bai",
+        "cho nghe nhac",
+        "nghe bai",
+        "nghe bai hat",
+        "nghe nhac",
+        "mo nhac",
+        "bat nhac",
+        "phat nhac",
+        "phat bai",
+        "choi bai",
+        "play song",
+        "play music",
+      ],
+      out: "nhac",
+    },
     { keys: ["qua trai", "xoay trai", "ben trai"], out: "trai" },
     { keys: ["qua phai", "xoay phai", "ben phai"], out: "phai" },
     { keys: ["tien", "di len"], out: "tien" },
