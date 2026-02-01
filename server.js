@@ -1179,12 +1179,15 @@ function looksLikeSongTitleOnly(userText = "") {
 }
 
 function containsMusicIntent(text = "") {
-  const t = stripDiacritics(text.toLowerCase());
+  let t = stripDiacritics(text.toLowerCase());
+  // normalize common STT typos
+  t = t.replace(/\bphta\b/g, "phat");
   const keys = [
     "toi muon nghe",
     "cho toi nghe",
     "cho toi nghe nhac",
     "cho toi nghe bai",
+    "cho toi nghe bai hat",
     "cho nghe nhac",
     "nghe bai",
     "nghe bai hat",
@@ -1193,6 +1196,9 @@ function containsMusicIntent(text = "") {
     "bat nhac",
     "phat nhac",
     "phat bai",
+    "bat bai",
+    "mo bai",
+    "mo bai hat",
     "choi bai",
     "play song",
     "play music",
@@ -1222,7 +1228,7 @@ function looksLikeMusicQuery(text = "") {
 }
 
 function shouldAutoSwitchToMusic(text = "") {
-  return containsMusicIntent(text);
+  return containsMusicIntent(text) || looksLikeSongTitleOnly(text) || looksLikeMusicQuery(text);
 }
 
 function detectStopPlayback(text = "") {
