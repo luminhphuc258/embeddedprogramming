@@ -128,6 +128,9 @@ function run(cmd, args, { timeoutMs = 180000 } = {}) {
 ===========================================================================*/
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 25000);
+const YT_USER_AGENT =
+  process.env.YT_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // player clients retry list
 const YT_PLAYER_CLIENTS = (process.env.YT_PLAYER_CLIENTS || "web,ios,android")
@@ -137,6 +140,11 @@ const YT_PLAYER_CLIENTS = (process.env.YT_PLAYER_CLIENTS || "web,ios,android")
 
 function ytExtractorArgsForClient(client) {
   return ["--extractor-args", `youtube:player_client=${client}`];
+}
+
+function ytUserAgentArgs() {
+  const ua = String(YT_USER_AGENT || "").trim();
+  return ua ? ["--user-agent", ua] : [];
 }
 
 // ✅ Remote YT transcript server
@@ -867,6 +875,7 @@ async function ytdlpExtractMp3FromYoutube(url, outDir) {
       "--no-playlist",
       "--force-ipv4",
       ...ytExtractorArgsForClient(client),
+      ...ytUserAgentArgs(),
       "-x",
       "--audio-format", "mp3",
       "--audio-quality", "0",
@@ -970,6 +979,7 @@ async function ytdlpFetchCaptionVtt(url, outDir) {
     "--no-playlist",
     "--force-ipv4",
     ...ytExtractorArgsForClient("web"),
+    ...ytUserAgentArgs(),
     "--write-subs",
     "--write-auto-subs",
     "--sub-format", "vtt",
@@ -1235,8 +1245,17 @@ async function searchYouTubeTop1(query) {
   if (!q) return null;
 
   try {
-    const r = await yts(q);
-    const v = (r?.videos || [])[0];
+    let r = null;
+    try {
+      r = await yts({ query: q, category: "music" });
+    } catch (e) {
+      console.warn("YouTube Music search error, fallback to normal search:", e?.message || e);
+    }
+    let v = (r?.videos || [])[0];
+    if (!v?.url) {
+      r = await yts(q);
+      v = (r?.videos || [])[0];
+    }
     if (!v?.url) return null;
 
     return {
